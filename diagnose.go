@@ -8,13 +8,14 @@ import (
 type status string
 
 const (
-	statusReady         status = "ready"
-	statusNegativeCache status = "negative-cache-suspected"
-	statusNotYetIndexed status = "not-yet-indexed"
-	statusModuleUnknown status = "module-unknown"
-	statusSumdbLag      status = "sumdb-lag"
-	statusNetworkError  status = "network-error"
-	statusZipBuildError status = "zip-build-error"
+	statusReady               status = "ready"
+	statusNegativeCache       status = "negative-cache-suspected"
+	statusNotYetIndexed       status = "not-yet-indexed"
+	statusModuleUnknown       status = "module-unknown"
+	statusSumdbLag            status = "sumdb-lag"
+	statusNetworkError        status = "network-error"
+	statusZipBuildError       status = "zip-build-error"
+	statusModuleNegativeCache status = "module-negative-cache-suspected"
 )
 
 // isZipBuildError reports whether a proxy error body is one of
@@ -56,6 +57,14 @@ func diagnose(r report) diagnosis {
 	}
 
 	if !r.moduleKnown() {
+		if r.repoReachable != nil && *r.repoReachable {
+			return diagnosis{statusModuleNegativeCache, fmt.Sprintf(
+				"proxy.golang.org has no listing for %s (@latest and @v/list both 404), but https://%s is reachable and public right now. "+
+					"This is very likely the same negative-cache mechanism this tool detects at the per-version level (see the negative-cache-suspected status), just poisoning the whole module instead of one version — usually because the proxy tried to fetch it once while the repo was still private. "+
+					"Unlike the per-version case, there's no known trick that reliably clears it (cutting a new tag doesn't help here, since @latest itself is what's cached negative) and no documented SLA — see https://github.com/golang/go/issues/67958 for another report of the same thing. "+
+					"GOPROXY=direct works around it for your own local build but does not fix what other users or CI see from the shared proxy. Waiting is the only broadly-effective known fix.",
+				r.module, r.module)}
+		}
 		return diagnosis{statusModuleUnknown, "proxy.golang.org has never heard of this module (both @latest and @v/list failed). " +
 			"Check: is the repo public? does the module path in go.mod exactly match the repo (case matters)? " +
 			"is it covered by a GOPRIVATE/GONOSUMDB pattern that's intentionally excluding it from the public proxy?"}

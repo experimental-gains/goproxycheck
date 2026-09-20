@@ -142,6 +142,67 @@ func TestDiagnose_ModuleUnknown(t *testing.T) {
 	}
 }
 
+// TestDiagnose_ModuleNegativeCache reproduces the run #63 finding: a repo
+// that was queried by the proxy while private, then made public. @latest
+// and @v/list both keep 404ing (the module-level analog of the per-version
+// negative cache this tool otherwise detects), even though the repo itself
+// is live. Verified against the real proxy.golang.org and github.com/
+// experimental-gains/proxytest-pseudo before this test was written.
+func TestDiagnose_ModuleNegativeCache(t *testing.T) {
+	proxy := fakeProxy(t, map[string]int{
+		"/github.com/owner/repo/@latest":        http.StatusNotFound,
+		"/github.com/owner/repo/@v/list":        http.StatusNotFound,
+		"/github.com/owner/repo/@v/v0.1.0.info": http.StatusNotFound,
+	})
+	defer proxy.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/github.com/owner/repo@v0.1.0": http.StatusNotFound,
+	})
+	defer sum.Close()
+	repoCheck := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/owner/repo" {
+			t.Fatalf("unexpected repo-check request to %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer repoCheck.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, repoCheckBase: repoCheck.URL, client: proxy.Client()}
+	r := ep.probe("github.com/owner/repo", "v0.1.0")
+	got := diagnose(r)
+	if got.status != statusModuleNegativeCache {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusModuleNegativeCache, got.message)
+	}
+}
+
+// TestDiagnose_ModuleUnknown_GithubRepoAlsoUnreachable makes sure a genuine
+// typo/never-existed github.com path still gets the plain module-unknown
+// diagnosis, not the negative-cache one, when the repo-reachability check
+// also 404s.
+func TestDiagnose_ModuleUnknown_GithubRepoAlsoUnreachable(t *testing.T) {
+	proxy := fakeProxy(t, map[string]int{
+		"/github.com/owner/typo/@latest":        http.StatusNotFound,
+		"/github.com/owner/typo/@v/list":        http.StatusNotFound,
+		"/github.com/owner/typo/@v/v0.1.0.info": http.StatusNotFound,
+	})
+	defer proxy.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/github.com/owner/typo@v0.1.0": http.StatusNotFound,
+	})
+	defer sum.Close()
+	repoCheck := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer repoCheck.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, repoCheckBase: repoCheck.URL, client: proxy.Client()}
+	r := ep.probe("github.com/owner/typo", "v0.1.0")
+	got := diagnose(r)
+	if got.status != statusModuleUnknown {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusModuleUnknown, got.message)
+	}
+}
+
 func TestDiagnose_SumdbLag(t *testing.T) {
 	proxy := fakeProxy(t, map[string]int{
 		"/example.com/mod/@latest":        http.StatusOK,

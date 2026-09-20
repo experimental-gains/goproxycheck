@@ -5,29 +5,41 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 )
 
 const (
-	defaultProxyBase = "https://proxy.golang.org"
-	defaultSumBase   = "https://sum.golang.org"
+	defaultProxyBase     = "https://proxy.golang.org"
+	defaultSumBase       = "https://sum.golang.org"
+	defaultRepoCheckBase = "https://github.com"
 )
 
 // endpoints holds the base URLs so tests can point at an httptest server.
 type endpoints struct {
-	proxyBase string
-	sumBase   string
-	client    *http.Client
+	proxyBase     string
+	sumBase       string
+	repoCheckBase string
+	client        *http.Client
 }
 
 func defaultEndpoints() endpoints {
 	return endpoints{
-		proxyBase: defaultProxyBase,
-		sumBase:   defaultSumBase,
-		client:    &http.Client{Timeout: 15 * time.Second},
+		proxyBase:     defaultProxyBase,
+		sumBase:       defaultSumBase,
+		repoCheckBase: defaultRepoCheckBase,
+		client:        &http.Client{Timeout: 15 * time.Second},
 	}
 }
+
+// githubRepoPattern matches module paths rooted directly at github.com
+// (owner/repo, optionally with a nested/major-version subpath). Only this
+// shape gets the live-reachability check in probe(): for any other host
+// (gitlab.com, vanity import paths with a go-import redirect, etc.) there's
+// no reliable way to know how many path segments form the repo root without
+// following VCS discovery, which is out of scope here.
+var githubRepoPattern = regexp.MustCompile(`^github\.com/([^/]+)/([^/]+)`)
 
 // probeResult is the outcome of one HTTP GET against the proxy or sumdb.
 type probeResult struct {
@@ -59,12 +71,18 @@ type report struct {
 	list            probeResult
 	versionInfo     probeResult
 	sum             probeResult
+	// repoReachable is set only when latest/list both failed and the module
+	// path is rooted at github.com: it distinguishes "the proxy has really
+	// never heard of this" from "the repo is live and public right now, but
+	// the proxy's own module-level negative cache hasn't cleared" — see
+	// diagnose's statusModuleNegativeCache.
+	repoReachable *bool
 }
 
 func (e endpoints) probe(module, version string) report {
 	mod := escapePath(module)
 	ver := escapePath(version)
-	return report{
+	r := report{
 		module:      module,
 		version:     version,
 		latest:      e.get(fmt.Sprintf("%s/%s/@latest", e.proxyBase, mod)),
@@ -72,6 +90,13 @@ func (e endpoints) probe(module, version string) report {
 		versionInfo: e.get(fmt.Sprintf("%s/%s/@v/%s.info", e.proxyBase, mod, ver)),
 		sum:         e.get(fmt.Sprintf("%s/lookup/%s@%s", e.sumBase, mod, ver)),
 	}
+	if !r.moduleKnown() {
+		if m := githubRepoPattern.FindStringSubmatch(module); m != nil {
+			reachable := e.get(fmt.Sprintf("%s/%s/%s", e.repoCheckBase, m[1], m[2])).ok
+			r.repoReachable = &reachable
+		}
+	}
+	return r
 }
 
 // moduleKnown reports whether the proxy has heard of the module at all,

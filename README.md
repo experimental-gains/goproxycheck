@@ -20,6 +20,16 @@ outside but need completely different fixes:
   fetched while private has nothing to clear.
 - **The module proxy genuinely doesn't know the module** — wrong path
   case, repo still private, or intentionally excluded via `GOPRIVATE`.
+- **A module-level negative cache** — the same poisoning as above, but
+  hitting `@latest`/`@v/list` themselves instead of one version,
+  usually because the proxy tried the *whole module* once while the
+  repo was still private. It looks exactly like "the proxy has never
+  heard of this," except the repo is actually live and public right
+  now — and unlike the per-version case, there's no known trick (a new
+  tag doesn't help; `@latest` itself is what's cached) or documented
+  SLA to clear it. For `github.com`-hosted modules, `goproxycheck`
+  checks the repo's live reachability directly so it can tell the two
+  apart instead of pointing you at a typo that isn't there.
 - **sumdb lag** — the proxy has it but the checksum database hasn't
   caught up yet, usually seconds behind.
 
@@ -50,9 +60,13 @@ actually seeing:
   yet."
 - `git ls-remote -q origin ... exit status 128` / `could not read
   Username for 'https://github.com'` — this one bypasses the module
-  proxy protocol entirely (Go fell back to a direct VCS fetch); it
-  means the path is wrong, the repo's still private, or it never
-  existed. Not something `goproxycheck` or waiting longer will fix.
+  proxy protocol entirely (Go fell back to a direct VCS fetch). Usually
+  the path is wrong, the repo's still private, or it never existed —
+  but if you just made a previously-private `github.com` repo public
+  and are still seeing this, it can also be the module-level negative
+  cache above, which looks identical from this error alone.
+  `goproxycheck` checks the repo's live reachability to tell the two
+  apart instead of sending you looking for a typo that isn't there.
 - `create zip: ... case-insensitive file name collision` — the proxy
   built a checkout of your tag but couldn't turn it into a module zip.
   This is a permanent property of the tagged tree (two files that only
@@ -97,7 +111,7 @@ argument errors.
 ## Use as a GitHub Action
 
 ```yaml
-- uses: experimental-gains/goproxycheck@v0.1.3
+- uses: experimental-gains/goproxycheck@v0.1.4
   with:
     args: --wait --timeout 10m github.com/you/yourmodule@v1.2.3
 ```
@@ -115,6 +129,11 @@ fetchable.
 - `--wait`'s polling interval is fixed, not exponential backoff — fine
   for the minutes-scale waits this is meant for, not for hammering the
   proxy over hours.
+- The module-level negative-cache check only fires for `github.com`-
+  hosted module paths. Other hosts and vanity import paths (custom
+  domains with a `go-import` redirect) fall back to the plain
+  module-unknown diagnosis — there's no reliable way to know how many
+  path segments form the repo root without following VCS discovery.
 
 ## License
 
