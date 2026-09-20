@@ -49,6 +49,23 @@ func TestModuleFromGoMod_Quoted(t *testing.T) {
 	}
 }
 
+func TestModuleFromGoMod_TabSeparator(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "go.mod")
+	// go.mod's lexer treats any whitespace as a token separator, so a tab
+	// between "module" and the path is valid — `go list -m` parses it fine —
+	// even though gofmt always normalizes to a single space.
+	os.WriteFile(path, []byte("module\tgithub.com/foo/bar\n\ngo 1.24\n"), 0o644)
+
+	got, err := moduleFromGoMod(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "github.com/foo/bar"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
 func TestModuleFromGoMod_Missing(t *testing.T) {
 	if _, err := moduleFromGoMod(filepath.Join(t.TempDir(), "go.mod")); err == nil {
 		t.Fatal("expected an error for a missing go.mod")

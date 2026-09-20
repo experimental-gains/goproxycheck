@@ -107,8 +107,8 @@ func moduleFromGoMod(path string) (string, error) {
 	}
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "module ") {
-			return parseModulePath(strings.TrimSpace(strings.TrimPrefix(line, "module"))), nil
+		if rest, ok := strings.CutPrefix(line, "module"); ok && rest != "" && (rest[0] == ' ' || rest[0] == '\t') {
+			return parseModulePath(strings.TrimSpace(rest)), nil
 		}
 	}
 	return "", fmt.Errorf("no 'module' directive found in %s", path)
