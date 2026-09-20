@@ -41,6 +41,12 @@ from any CI system, a release script, or your own terminal.
 go install github.com/experimental-gains/goproxycheck@latest
 ```
 
+Or via Homebrew:
+
+```bash
+brew install experimental-gains/tap/goproxycheck
+```
+
 ## Usage
 
 ```bash
