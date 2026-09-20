@@ -15,12 +15,16 @@ runs:
   steps:
     - name: Install goproxycheck
       shell: bash
+      env:
+        GOPROXYCHECK_VERSION: ${{ inputs.version }}
       run: |
-        go install "github.com/experimental-gains/goproxycheck@${{ inputs.version }}"
+        go install "github.com/experimental-gains/goproxycheck@${GOPROXYCHECK_VERSION}"
         echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
     - name: Run goproxycheck
       shell: bash
-      run: goproxycheck ${{ inputs.args }}
+      env:
+        GOPROXYCHECK_ARGS: ${{ inputs.args }}
+      run: goproxycheck ${GOPROXYCHECK_ARGS}
 branding:
   icon: 'search'
   color: 'blue'
