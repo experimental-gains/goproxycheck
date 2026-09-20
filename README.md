@@ -35,6 +35,25 @@ warms the cache but only runs as a GitHub Action and doesn't diagnose
 *why* a version isn't ready. `goproxycheck` is a plain binary — usable
 from any CI system, a release script, or your own terminal.
 
+## If you're searching for one of these errors
+
+Verified against the real proxy, right now, so this matches what you're
+actually seeing:
+
+- `invalid version: unknown revision vX.Y.Z` — the version you just
+  tagged isn't showing up yet. Could be ordinary indexing lag (wait a
+  minute), could be the negative-cache poisoning described above (wait
+  won't fix it — you need a new tag). `goproxycheck` tells you which.
+- `module lookup disabled by GOPROXY=off` — not a proxy-availability
+  problem at all, your own `GOPROXY` is set to `off`. `goproxycheck`
+  reports this as a local config issue instead of a false "not ready
+  yet."
+- `git ls-remote -q origin ... exit status 128` / `could not read
+  Username for 'https://github.com'` — this one bypasses the module
+  proxy protocol entirely (Go fell back to a direct VCS fetch); it
+  means the path is wrong, the repo's still private, or it never
+  existed. Not something `goproxycheck` or waiting longer will fix.
+
 ## Install
 
 ```bash
