@@ -1,0 +1,26 @@
+name: 'goproxycheck'
+description: 'Diagnose why a Go module version is not yet fetchable via proxy.golang.org / sum.golang.org'
+author: 'experimental-gains'
+inputs:
+  args:
+    description: 'Arguments to pass to goproxycheck (e.g. module@version, --wait, --timeout)'
+    required: false
+    default: ''
+  version:
+    description: 'goproxycheck version to install'
+    required: false
+    default: 'latest'
+runs:
+  using: 'composite'
+  steps:
+    - name: Install goproxycheck
+      shell: bash
+      run: |
+        go install "github.com/experimental-gains/goproxycheck@${{ inputs.version }}"
+        echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+    - name: Run goproxycheck
+      shell: bash
+      run: goproxycheck ${{ inputs.args }}
+branding:
+  icon: 'search'
+  color: 'blue'

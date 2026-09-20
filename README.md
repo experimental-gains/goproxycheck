@@ -68,6 +68,18 @@ Exit code is `0` when the version is confirmed live on both the proxy
 and sumdb, `1` otherwise (including timeouts under `--wait`), `2` on
 argument errors.
 
+## Use as a GitHub Action
+
+```yaml
+- uses: experimental-gains/goproxycheck@v0.1.1
+  with:
+    args: --wait --timeout 10m github.com/you/yourmodule@v1.2.3
+```
+
+Handy right after a release step, to block the rest of a pipeline
+(e.g. an announcement or downstream build) until the tag is actually
+fetchable.
+
 ## What it doesn't do
 
 - Doesn't publish, tag, or push anything — read-only checks against
