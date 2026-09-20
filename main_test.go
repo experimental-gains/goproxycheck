@@ -21,6 +21,34 @@ func TestModuleFromGoMod(t *testing.T) {
 	}
 }
 
+func TestModuleFromGoMod_TrailingComment(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "go.mod")
+	os.WriteFile(path, []byte("module github.com/foo/bar // the main module\n\ngo 1.24\n"), 0o644)
+
+	got, err := moduleFromGoMod(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "github.com/foo/bar"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestModuleFromGoMod_Quoted(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "go.mod")
+	os.WriteFile(path, []byte(`module "github.com/foo/bar"`+"\n\ngo 1.24\n"), 0o644)
+
+	got, err := moduleFromGoMod(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "github.com/foo/bar"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
 func TestModuleFromGoMod_Missing(t *testing.T) {
 	if _, err := moduleFromGoMod(filepath.Join(t.TempDir(), "go.mod")); err == nil {
 		t.Fatal("expected an error for a missing go.mod")

@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -107,10 +108,26 @@ func moduleFromGoMod(path string) (string, error) {
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "module ") {
-			return strings.TrimSpace(strings.TrimPrefix(line, "module")), nil
+			return parseModulePath(strings.TrimSpace(strings.TrimPrefix(line, "module"))), nil
 		}
 	}
 	return "", fmt.Errorf("no 'module' directive found in %s", path)
+}
+
+// parseModulePath cleans up the raw text after "module " on a go.mod module
+// line: strips a trailing "//" line comment (valid go.mod syntax — `go list
+// -m` ignores it, but a naive TrimSpace would fold it straight into the
+// module path and send goproxycheck probing a bogus URL) and unquotes the
+// path if it's written as a quoted Go string literal (also valid go.mod
+// syntax, just rarer).
+func parseModulePath(s string) string {
+	if i := strings.Index(s, "//"); i >= 0 {
+		s = strings.TrimSpace(s[:i])
+	}
+	if unquoted, err := strconv.Unquote(s); err == nil {
+		return unquoted
+	}
+	return s
 }
 
 func gitDescribeTag() (string, error) {
