@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
@@ -45,5 +46,38 @@ func TestResolveTarget_BadArg(t *testing.T) {
 func TestResolveTarget_TooManyArgs(t *testing.T) {
 	if _, _, err := resolveTarget([]string{"a@1", "b@2"}); err == nil {
 		t.Fatal("expected an error for more than one argument")
+	}
+}
+
+func TestResolveTarget_FallbackToGoModAndGitTag(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	os.WriteFile("go.mod", []byte("module example.com/fallback\n\ngo 1.24\n"), 0o644)
+	run := func(name string, args ...string) {
+		t.Helper()
+		if out, err := exec.Command(name, args...).CombinedOutput(); err != nil {
+			t.Fatalf("%s %v: %v\n%s", name, args, err, out)
+		}
+	}
+	run("git", "init", "-q")
+	run("git", "config", "user.email", "test@example.com")
+	run("git", "config", "user.name", "test")
+	run("git", "add", "go.mod")
+	run("git", "commit", "-q", "-m", "init")
+	run("git", "tag", "v0.9.0")
+
+	module, version, err := resolveTarget(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if module != "example.com/fallback" || version != "v0.9.0" {
+		t.Errorf("got (%q, %q)", module, version)
+	}
+}
+
+func TestResolveTarget_NoGoMod(t *testing.T) {
+	t.Chdir(t.TempDir())
+	if _, _, err := resolveTarget(nil); err == nil {
+		t.Fatal("expected an error with no go.mod present")
 	}
 }

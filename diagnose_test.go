@@ -125,6 +125,25 @@ func TestDiagnose_SumdbLag(t *testing.T) {
 	}
 }
 
+func TestDiagnose_NetworkError(t *testing.T) {
+	r := report{
+		module:  "example.com/mod",
+		version: "v0.1.0",
+		latest:  probeResult{err: fmt.Errorf("dial tcp: connection refused")},
+	}
+	got := diagnose(r)
+	if got.status != statusNetworkError {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusNetworkError, got.message)
+	}
+}
+
+func TestDefaultEndpoints(t *testing.T) {
+	e := defaultEndpoints()
+	if e.proxyBase != defaultProxyBase || e.sumBase != defaultSumBase || e.client == nil {
+		t.Errorf("got %+v", e)
+	}
+}
+
 func TestDiagnose_NotYetIndexed(t *testing.T) {
 	// Module known (has other versions) but this version isn't in @v/list
 	// at all yet — ordinary indexing lag, distinct from negative-cache.
