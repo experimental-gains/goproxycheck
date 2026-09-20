@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -16,10 +17,10 @@ import (
 )
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr, defaultEndpoints()))
 }
 
-func run(args []string, stdout, stderr *os.File) int {
+func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 	fs := flag.NewFlagSet("goproxycheck", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	wait := fs.Bool("wait", false, "poll until the version is ready (or --timeout elapses) instead of checking once")
@@ -41,7 +42,6 @@ func run(args []string, stdout, stderr *os.File) int {
 		return 2
 	}
 
-	ep := defaultEndpoints()
 	deadline := time.Now().Add(*timeout)
 	var d diagnosis
 	for {
