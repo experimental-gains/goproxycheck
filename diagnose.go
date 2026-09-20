@@ -44,8 +44,15 @@ type diagnosis struct {
 // https://github.com/experimental-gains/modslop's v0.1.0/v0.1.1 history for
 // a real example this tool was built from.
 func diagnose(r report) diagnosis {
-	if r.latest.err != nil || r.list.err != nil {
-		return diagnosis{statusNetworkError, fmt.Sprintf("request to proxy.golang.org failed: %v", firstErr(r.latest.err, r.list.err))}
+	// A transport error (err set) is not the same as a clean non-2xx response
+	// (ok false, err nil) — the latter is meaningful proxy state, the former
+	// is "we don't actually know." Checking all four probes, not just
+	// latest/list, matters: an errored versionInfo or sum request used to
+	// fall through with ok=false and an empty body, which read exactly like
+	// a real 404 and got misdiagnosed as negative-cache-suspected or
+	// sumdb-lag — the tool's core diagnoses — on a plain network blip.
+	if err := firstErr(r.latest.err, r.list.err, r.versionInfo.err, r.sum.err); err != nil {
+		return diagnosis{statusNetworkError, fmt.Sprintf("request to proxy.golang.org or sum.golang.org failed: %v", err)}
 	}
 
 	if !r.moduleKnown() {

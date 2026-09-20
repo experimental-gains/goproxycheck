@@ -174,6 +174,39 @@ func TestDiagnose_NetworkError(t *testing.T) {
 	}
 }
 
+// A transport error on versionInfo or sum looks identical to a clean 404
+// (ok=false, empty body) unless err is checked too — it used to be
+// misdiagnosed as the tool's own negative-cache/sumdb-lag verdicts instead
+// of "we couldn't actually complete the request."
+func TestDiagnose_NetworkError_VersionInfo(t *testing.T) {
+	r := report{
+		module:      "example.com/mod",
+		version:     "v0.1.0",
+		latest:      probeResult{ok: true},
+		list:        probeResult{ok: true, body: "v0.1.0\n"},
+		versionInfo: probeResult{err: fmt.Errorf("dial tcp: i/o timeout")},
+	}
+	got := diagnose(r)
+	if got.status != statusNetworkError {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusNetworkError, got.message)
+	}
+}
+
+func TestDiagnose_NetworkError_Sum(t *testing.T) {
+	r := report{
+		module:      "example.com/mod",
+		version:     "v0.1.0",
+		latest:      probeResult{ok: true},
+		list:        probeResult{ok: true, body: "v0.1.0\n"},
+		versionInfo: probeResult{ok: true, body: `{"Version":"v0.1.0"}`},
+		sum:         probeResult{err: fmt.Errorf("dial tcp: connection refused")},
+	}
+	got := diagnose(r)
+	if got.status != statusNetworkError {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusNetworkError, got.message)
+	}
+}
+
 func TestDefaultEndpoints(t *testing.T) {
 	e := defaultEndpoints()
 	if e.proxyBase != defaultProxyBase || e.sumBase != defaultSumBase || e.client == nil {
