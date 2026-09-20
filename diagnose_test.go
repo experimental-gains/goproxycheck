@@ -85,6 +85,43 @@ func TestDiagnose_NegativeCache(t *testing.T) {
 	}
 }
 
+// TestDiagnose_ZipBuildError covers a real proxy.golang.org response found
+// by testing against github.com/torvalds/linux: @v/list includes the
+// version (it's a real, permanently tagged commit) but @v/<version>.info
+// 404s with a golang.org/x/mod/zip "create zip: ... case-insensitive file
+// name collision" error. The old code classified any @v/list-hit +
+// versionInfo-404 as the negative-cache bug and told the user to cut a new
+// tag — wrong advice here, since the zip will never build until the file
+// collision itself is fixed.
+func TestDiagnose_ZipBuildError(t *testing.T) {
+	listSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/example.com/mod/@latest":
+			w.WriteHeader(http.StatusNotFound)
+		case "/example.com/mod/@v/list":
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, "v1.0.0\n")
+		case "/example.com/mod/@v/v1.0.0.info":
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `not found: create zip: case-insensitive file name collision: "FOO.go" and "foo.go"`)
+		default:
+			t.Fatalf("unexpected request to %s", r.URL.Path)
+		}
+	}))
+	defer listSrv.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/example.com/mod@v1.0.0": http.StatusNotFound,
+	})
+	defer sum.Close()
+
+	ep := endpoints{proxyBase: listSrv.URL, sumBase: sum.URL, client: listSrv.Client()}
+	r := ep.probe("example.com/mod", "v1.0.0")
+	got := diagnose(r)
+	if got.status != statusZipBuildError {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusZipBuildError, got.message)
+	}
+}
+
 func TestDiagnose_ModuleUnknown(t *testing.T) {
 	proxy := fakeProxy(t, map[string]int{
 		"/example.com/nope/@latest":        http.StatusNotFound,

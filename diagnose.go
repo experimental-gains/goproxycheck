@@ -1,6 +1,9 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 type status string
 
@@ -11,7 +14,22 @@ const (
 	statusModuleUnknown status = "module-unknown"
 	statusSumdbLag      status = "sumdb-lag"
 	statusNetworkError  status = "network-error"
+	statusZipBuildError status = "zip-build-error"
 )
+
+// isZipBuildError reports whether a proxy error body is one of
+// golang.org/x/mod/zip's "create zip[...]" errors — raised when the proxy
+// can build a valid checkout of the tagged commit but can't turn it into a
+// module zip (a case-insensitive filename collision, a disallowed file
+// mode, a path outside the module, an oversized file, etc.). Confirmed
+// against the real proxy: github.com/torvalds/linux's tags all fail this
+// way, since the kernel tree has files that only differ by case
+// (xt_MARK.h vs xt_mark.h). Unlike the negative-cache case, this is a
+// permanent property of the tagged tree, not a poisoned cache entry — a
+// new tag only fixes it if the underlying file collision is fixed too.
+func isZipBuildError(body string) bool {
+	return strings.Contains(body, "create zip")
+}
 
 type diagnosis struct {
 	status  status
@@ -45,6 +63,13 @@ func diagnose(r report) diagnosis {
 			"sumdb usually catches up within a minute or two of the proxy; this is normal lag, not the negative-cache bug. Retry shortly."}
 	}
 
+	if isZipBuildError(r.versionInfo.body) {
+		return diagnosis{statusZipBuildError, fmt.Sprintf(
+			"%s@%s: the proxy can't build a module zip from this tag: %s. "+
+				"This is a permanent property of the tagged tree (a bad file name, an oversized file, a case-insensitive filename collision, or similar), not the negative-cache bug — cutting a new tag won't help unless it also fixes the underlying file problem.",
+			r.module, r.version, firstLine(r.versionInfo.body))}
+	}
+
 	// versionInfo failed but the module itself is known. Distinguish "never
 	// published" from "published but poisoned/not-yet-indexed" using @v/list.
 	for _, v := range r.listedVersions() {
@@ -60,6 +85,18 @@ func diagnose(r report) diagnosis {
 	return diagnosis{statusNotYetIndexed, fmt.Sprintf(
 		"%s is not in @v/list yet, so the proxy likely hasn't picked up this tag at all (rather than the negative-cache bug, which requires the version to already be listed). "+
 			"If you just pushed the tag, this is ordinary indexing lag — retry in a minute, or use --wait.", r.version)}
+}
+
+// firstLine returns the first line of a (possibly multi-line) proxy error
+// body, trimmed of surrounding whitespace. Zip-build errors can list one
+// line per offending file, which is useful in full but too long to inline
+// in a one-line diagnosis message.
+func firstLine(body string) string {
+	body = strings.TrimSpace(body)
+	if i := strings.IndexByte(body, '\n'); i >= 0 {
+		return body[:i]
+	}
+	return body
 }
 
 func firstErr(errs ...error) error {

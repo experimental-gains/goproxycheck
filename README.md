@@ -53,6 +53,13 @@ actually seeing:
   proxy protocol entirely (Go fell back to a direct VCS fetch); it
   means the path is wrong, the repo's still private, or it never
   existed. Not something `goproxycheck` or waiting longer will fix.
+- `create zip: ... case-insensitive file name collision` — the proxy
+  built a checkout of your tag but couldn't turn it into a module zip.
+  This is a permanent property of the tagged tree (two files that only
+  differ by case, an oversized file, a disallowed path), not the
+  negative-cache bug — a new tag won't fix it unless the underlying
+  file problem is fixed too. `goproxycheck` reports this separately
+  instead of telling you to just retag.
 
 ## Install
 
@@ -90,7 +97,7 @@ argument errors.
 ## Use as a GitHub Action
 
 ```yaml
-- uses: experimental-gains/goproxycheck@v0.1.1
+- uses: experimental-gains/goproxycheck@v0.1.2
   with:
     args: --wait --timeout 10m github.com/you/yourmodule@v1.2.3
 ```
