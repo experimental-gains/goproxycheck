@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -172,5 +174,25 @@ func TestLocalGoproxyOff(t *testing.T) {
 				t.Errorf("localGoproxyOff() with GOPROXY=%q = %v, want %v", c.proxy, got, c.want)
 			}
 		})
+	}
+}
+
+// TestDefaultFlagDurations pins the exact --timeout/--interval flag
+// defaults (found LIVED by mutation testing, run #127: every --wait
+// test explicitly overrides both flags, nothing exercised what happens
+// if a user passes --wait alone). Doesn't actually run a 5-minute poll
+// — an invalid flag makes fs.Parse fail before that, and flag's own
+// Usage/PrintDefaults renders the literal default values it was
+// constructed with into the error output, which is enough to pin them
+// without waiting.
+func TestDefaultFlagDurations(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	run([]string{"--this-flag-does-not-exist"}, &stdout, &stderr, defaultEndpoints())
+	out := stderr.String()
+	if !strings.Contains(out, "default 5m0s") {
+		t.Errorf("expected the --timeout default (5m0s) in usage output, got:\n%s", out)
+	}
+	if !strings.Contains(out, "default 15s") {
+		t.Errorf("expected the --interval default (15s) in usage output, got:\n%s", out)
 	}
 }

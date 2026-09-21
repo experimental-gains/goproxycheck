@@ -8,6 +8,9 @@ func TestEscapePath(t *testing.T) {
 		{"github.com/Azure/azure-sdk-for-go", "github.com/!azure/azure-sdk-for-go"},
 		{"v1.2.3", "v1.2.3"},
 		{"v0.1.0-BETA", "v0.1.0-!b!e!t!a"},
+		// Pins the `r <= 'Z'` boundary (found LIVED by mutation
+		// testing, run #127: no existing case has a literal 'Z').
+		{"github.com/foo/Zebra", "github.com/foo/!zebra"},
 	}
 	for _, c := range cases {
 		if got := escapePath(c.in); got != c.want {

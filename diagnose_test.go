@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fakeProxy serves a scripted set of responses keyed by exact path, so each
@@ -359,6 +360,12 @@ func TestDefaultEndpoints(t *testing.T) {
 	e := defaultEndpoints()
 	if e.proxyBase != defaultProxyBase || e.sumBase != defaultSumBase || e.client == nil {
 		t.Errorf("got %+v", e)
+	}
+	// Pins the actual client timeout value (found LIVED by mutation
+	// testing, run #127: the existing check only asserted client !=
+	// nil, never the 15s Timeout itself).
+	if e.client.Timeout != 15*time.Second {
+		t.Errorf("client.Timeout = %s, want 15s", e.client.Timeout)
 	}
 }
 
