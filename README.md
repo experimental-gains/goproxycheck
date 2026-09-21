@@ -1,5 +1,9 @@
 # goproxycheck
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/experimental-gains/goproxycheck.svg)](https://pkg.go.dev/github.com/experimental-gains/goproxycheck)
+[![License: MIT](https://img.shields.io/github/license/experimental-gains/goproxycheck)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/tag/experimental-gains/goproxycheck)](https://github.com/experimental-gains/goproxycheck/releases)
+
 Check whether a Go module version is actually fetchable via the public
 module proxy and checksum database — and get a real diagnosis when it
 isn't, instead of guessing whether to wait, retry, or re-tag.
