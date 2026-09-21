@@ -19,7 +19,7 @@ func fakeProxy(t *testing.T, routes map[string]int) *httptest.Server {
 		}
 		w.WriteHeader(code)
 		if code == http.StatusOK {
-			fmt.Fprint(w, `{"Version":"v0.1.0","Time":"2026-09-19T00:00:00Z"}`)
+			_, _ = fmt.Fprint(w, `{"Version":"v0.1.0","Time":"2026-09-19T00:00:00Z"}`)
 		}
 	}))
 	return srv
@@ -66,10 +66,10 @@ func TestDiagnose_NegativeCache(t *testing.T) {
 		switch r.URL.Path {
 		case "/example.com/mod/@latest":
 			w.WriteHeader(http.StatusOK)
-			fmt.Fprint(w, `{"Version":"v0.1.0"}`)
+			_, _ = fmt.Fprint(w, `{"Version":"v0.1.0"}`)
 		case "/example.com/mod/@v/list":
 			w.WriteHeader(http.StatusOK)
-			fmt.Fprint(w, "v0.1.0\n")
+			_, _ = fmt.Fprint(w, "v0.1.0\n")
 		case "/example.com/mod/@v/v0.1.0.info":
 			w.WriteHeader(http.StatusNotFound)
 		default:
@@ -101,10 +101,10 @@ func TestDiagnose_ZipBuildError(t *testing.T) {
 			w.WriteHeader(http.StatusNotFound)
 		case "/example.com/mod/@v/list":
 			w.WriteHeader(http.StatusOK)
-			fmt.Fprint(w, "v1.0.0\n")
+			_, _ = fmt.Fprint(w, "v1.0.0\n")
 		case "/example.com/mod/@v/v1.0.0.info":
 			w.WriteHeader(http.StatusNotFound)
-			fmt.Fprint(w, `not found: create zip: case-insensitive file name collision: "FOO.go" and "foo.go"`)
+			_, _ = fmt.Fprint(w, `not found: create zip: case-insensitive file name collision: "FOO.go" and "foo.go"`)
 		default:
 			t.Fatalf("unexpected request to %s", r.URL.Path)
 		}
@@ -335,10 +335,10 @@ func TestDiagnose_NotYetIndexed(t *testing.T) {
 		switch r.URL.Path {
 		case "/example.com/mod/@latest":
 			w.WriteHeader(http.StatusOK)
-			fmt.Fprint(w, `{"Version":"v0.0.9"}`)
+			_, _ = fmt.Fprint(w, `{"Version":"v0.0.9"}`)
 		case "/example.com/mod/@v/list":
 			w.WriteHeader(http.StatusOK)
-			fmt.Fprint(w, "v0.0.9\n")
+			_, _ = fmt.Fprint(w, "v0.0.9\n")
 		case "/example.com/mod/@v/v0.1.0.info":
 			w.WriteHeader(http.StatusNotFound)
 		default:

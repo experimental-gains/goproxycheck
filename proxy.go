@@ -54,7 +54,7 @@ func (e endpoints) get(url string) probeResult {
 	if err != nil {
 		return probeResult{err: err}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	return probeResult{
 		ok:         resp.StatusCode == http.StatusOK,

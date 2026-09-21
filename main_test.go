@@ -10,7 +10,7 @@ import (
 func TestModuleFromGoMod(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "go.mod")
-	os.WriteFile(path, []byte("module github.com/experimental-gains/goproxycheck\n\ngo 1.24\n"), 0o644)
+	_ = os.WriteFile(path, []byte("module github.com/experimental-gains/goproxycheck\n\ngo 1.24\n"), 0o644)
 
 	got, err := moduleFromGoMod(path)
 	if err != nil {
@@ -24,7 +24,7 @@ func TestModuleFromGoMod(t *testing.T) {
 func TestModuleFromGoMod_TrailingComment(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "go.mod")
-	os.WriteFile(path, []byte("module github.com/foo/bar // the main module\n\ngo 1.24\n"), 0o644)
+	_ = os.WriteFile(path, []byte("module github.com/foo/bar // the main module\n\ngo 1.24\n"), 0o644)
 
 	got, err := moduleFromGoMod(path)
 	if err != nil {
@@ -38,7 +38,7 @@ func TestModuleFromGoMod_TrailingComment(t *testing.T) {
 func TestModuleFromGoMod_Quoted(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "go.mod")
-	os.WriteFile(path, []byte(`module "github.com/foo/bar"`+"\n\ngo 1.24\n"), 0o644)
+	_ = os.WriteFile(path, []byte(`module "github.com/foo/bar"`+"\n\ngo 1.24\n"), 0o644)
 
 	got, err := moduleFromGoMod(path)
 	if err != nil {
@@ -55,7 +55,7 @@ func TestModuleFromGoMod_TabSeparator(t *testing.T) {
 	// go.mod's lexer treats any whitespace as a token separator, so a tab
 	// between "module" and the path is valid — `go list -m` parses it fine —
 	// even though gofmt always normalizes to a single space.
-	os.WriteFile(path, []byte("module\tgithub.com/foo/bar\n\ngo 1.24\n"), 0o644)
+	_ = os.WriteFile(path, []byte("module\tgithub.com/foo/bar\n\ngo 1.24\n"), 0o644)
 
 	got, err := moduleFromGoMod(path)
 	if err != nil {
@@ -97,7 +97,7 @@ func TestResolveTarget_TooManyArgs(t *testing.T) {
 func TestResolveTarget_FallbackToGoModAndGitTag(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
-	os.WriteFile("go.mod", []byte("module example.com/fallback\n\ngo 1.24\n"), 0o644)
+	_ = os.WriteFile("go.mod", []byte("module example.com/fallback\n\ngo 1.24\n"), 0o644)
 	run := func(name string, args ...string) {
 		t.Helper()
 		if out, err := exec.Command(name, args...).CombinedOutput(); err != nil {

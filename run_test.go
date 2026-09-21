@@ -13,7 +13,7 @@ func readyEndpoints(t *testing.T) endpoints {
 	t.Helper()
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"Version":"v0.1.0"}`))
+		_, _ = w.Write([]byte(`{"Version":"v0.1.0"}`))
 	}))
 	t.Cleanup(proxy.Close)
 	sum := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -42,10 +42,10 @@ func notYetIndexedEndpoints(t *testing.T) endpoints {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/@latest"):
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(`{"Version":"v0.0.9"}`))
+			_, _ = w.Write([]byte(`{"Version":"v0.0.9"}`))
 		case strings.HasSuffix(r.URL.Path, "/@v/list"):
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("v0.0.9\n"))
+			_, _ = w.Write([]byte("v0.0.9\n"))
 		default: // .info, sum lookup
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -114,18 +114,18 @@ func TestRun_WaitPollsUntilReady(t *testing.T) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/@latest"):
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(`{"Version":"v0.1.0"}`))
+			_, _ = w.Write([]byte(`{"Version":"v0.1.0"}`))
 		case strings.HasSuffix(r.URL.Path, "/@v/list"):
 			w.WriteHeader(http.StatusOK)
 			if ready {
-				w.Write([]byte("v0.1.0\n"))
+				_, _ = w.Write([]byte("v0.1.0\n"))
 			} else {
-				w.Write([]byte("v0.0.9\n"))
+				_, _ = w.Write([]byte("v0.0.9\n"))
 			}
 		default: // .info, sum lookup
 			if ready {
 				w.WriteHeader(http.StatusOK)
-				w.Write([]byte(`{"Version":"v0.1.0"}`))
+				_, _ = w.Write([]byte(`{"Version":"v0.1.0"}`))
 			} else {
 				w.WriteHeader(http.StatusNotFound)
 			}

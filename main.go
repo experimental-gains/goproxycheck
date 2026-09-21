@@ -29,8 +29,8 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 	interval := fs.Duration("interval", 15*time.Second, "how often to poll when --wait is set")
 	jsonOut := fs.Bool("json", false, "print the diagnosis as JSON instead of text")
 	fs.Usage = func() {
-		fmt.Fprintln(stderr, "usage: goproxycheck [flags] [module@version]")
-		fmt.Fprintln(stderr, "  with no argument, reads the module path from ./go.mod and the version from `git describe --tags`")
+		_, _ = fmt.Fprintln(stderr, "usage: goproxycheck [flags] [module@version]")
+		_, _ = fmt.Fprintln(stderr, "  with no argument, reads the module path from ./go.mod and the version from `git describe --tags`")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -39,7 +39,7 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 
 	module, version, err := resolveTarget(fs.Args())
 	if err != nil {
-		fmt.Fprintln(stderr, "goproxycheck:", err)
+		_, _ = fmt.Fprintln(stderr, "goproxycheck:", err)
 		return 2
 	}
 
@@ -74,14 +74,18 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 	if *jsonOut {
 		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
-		enc.Encode(map[string]string{
+		if err := enc.Encode(map[string]string{
 			"module":  module,
 			"version": version,
 			"status":  string(d.status),
 			"message": d.message,
-		})
-	} else {
-		fmt.Fprintf(stdout, "%s@%s: %s\n%s\n", module, version, d.status, d.message)
+		}); err != nil {
+			_, _ = fmt.Fprintln(stderr, "goproxycheck:", err)
+			return 2
+		}
+	} else if _, err := fmt.Fprintf(stdout, "%s@%s: %s\n%s\n", module, version, d.status, d.message); err != nil {
+		_, _ = fmt.Fprintln(stderr, "goproxycheck:", err)
+		return 2
 	}
 
 	if d.status == statusReady {
