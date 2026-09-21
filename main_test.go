@@ -66,6 +66,23 @@ func TestModuleFromGoMod_TabSeparator(t *testing.T) {
 	}
 }
 
+// TestModuleFromGoMod_CommentOnlyValue is a regression test for a real
+// bug found via mutation testing (run #125): a "module" line whose
+// entire value is a "//" comment (e.g. "module //oops", no actual path
+// before it) used to parse to an empty string and return (nil, "") —
+// silently succeeding instead of erroring, which would have sent a
+// probe request for an empty module path downstream.
+func TestModuleFromGoMod_CommentOnlyValue(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "go.mod")
+	_ = os.WriteFile(path, []byte("module //oops, no path here\n\ngo 1.24\n"), 0o644)
+
+	got, err := moduleFromGoMod(path)
+	if err == nil {
+		t.Fatalf("expected an error for a comment-only module line, got module %q with no error", got)
+	}
+}
+
 func TestModuleFromGoMod_Missing(t *testing.T) {
 	if _, err := moduleFromGoMod(filepath.Join(t.TempDir(), "go.mod")); err == nil {
 		t.Fatal("expected an error for a missing go.mod")

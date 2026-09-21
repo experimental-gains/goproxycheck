@@ -129,7 +129,17 @@ func moduleFromGoMod(path string) (string, error) {
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if rest, ok := strings.CutPrefix(line, "module"); ok && rest != "" && (rest[0] == ' ' || rest[0] == '\t') {
-			return parseModulePath(strings.TrimSpace(rest)), nil
+			mod := parseModulePath(strings.TrimSpace(rest))
+			if mod == "" {
+				// e.g. a "module" line whose entire value is a "//"
+				// comment (found via mutation testing, run #125: the
+				// comment-stripping boundary at index 0 is exercised,
+				// but nothing checked what it produces). Silently
+				// probing an empty module path would send a malformed
+				// request to the proxy instead of a clear error.
+				return "", fmt.Errorf("%s has a 'module' directive with no path: %q", path, line)
+			}
+			return mod, nil
 		}
 	}
 	return "", fmt.Errorf("no 'module' directive found in %s", path)
