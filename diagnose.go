@@ -8,16 +8,34 @@ import (
 type status string
 
 const (
-	statusReady               status = "ready"
-	statusNegativeCache       status = "negative-cache-suspected"
-	statusNotYetIndexed       status = "not-yet-indexed"
-	statusModuleUnknown       status = "module-unknown"
-	statusSumdbLag            status = "sumdb-lag"
-	statusNetworkError        status = "network-error"
-	statusZipBuildError       status = "zip-build-error"
-	statusModuleNegativeCache status = "module-negative-cache-suspected"
-	statusGoproxyOffLocally   status = "goproxy-off-locally"
+	statusReady                status = "ready"
+	statusNegativeCache        status = "negative-cache-suspected"
+	statusNotYetIndexed        status = "not-yet-indexed"
+	statusModuleUnknown        status = "module-unknown"
+	statusSumdbLag             status = "sumdb-lag"
+	statusNetworkError         status = "network-error"
+	statusZipBuildError        status = "zip-build-error"
+	statusModuleNegativeCache  status = "module-negative-cache-suspected"
+	statusGoproxyOffLocally    status = "goproxy-off-locally"
+	statusBlocklistedMalicious status = "blocklisted-malicious"
 )
+
+// blocklistMarker is the distinctive substring proxy.golang.org includes
+// in the plain-text body of a 403 response when it has flagged a specific
+// module as malicious and refuses to serve it — confirmed live against
+// three real, independently documented malicious modules (github.com/
+// shopsprint/decimal, github.com/boltdb-go/bolt, github.com/xinfeisoft/
+// crypto, 2026-09). This is permanent proxy state, not the negative-cache
+// or not-yet-indexed conditions the rest of this file exists to diagnose —
+// without this check, a blocked module fell through to statusModuleUnknown
+// (or statusModuleNegativeCache if the repo happened to still be
+// reachable), telling the caller to check for a typo or wait for indexing
+// lag when the real answer is "this was deliberately blocked, don't use it."
+const blocklistMarker = "considers this module to be malicious"
+
+func isBlocklistedMalicious(body string) bool {
+	return strings.Contains(body, blocklistMarker)
+}
 
 // isZipBuildError reports whether a proxy error body is one of
 // golang.org/x/mod/zip's "create zip[...]" errors — raised when the proxy
@@ -68,6 +86,13 @@ func diagnose(r report) diagnosis {
 	// sumdb-lag — the tool's core diagnoses — on a plain network blip.
 	if err := firstErr(r.latest.err, r.list.err, r.versionInfo.err, r.sum.err); err != nil {
 		return diagnosis{statusNetworkError, fmt.Sprintf("request to proxy.golang.org or sum.golang.org failed: %v", err)}
+	}
+
+	if isBlocklistedMalicious(r.latest.body) || isBlocklistedMalicious(r.list.body) {
+		return diagnosis{statusBlocklistedMalicious, fmt.Sprintf(
+			"proxy.golang.org has explicitly flagged %s as malicious and refuses to serve it. "+
+				"This is a permanent security block, not a caching or indexing problem — do not use this module, and don't expect --wait or a new tag to change the outcome.",
+			r.module)}
 	}
 
 	if !r.moduleKnown() {

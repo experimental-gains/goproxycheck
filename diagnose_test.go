@@ -123,6 +123,40 @@ func TestDiagnose_ZipBuildError(t *testing.T) {
 	}
 }
 
+// TestDiagnose_BlocklistedMalicious is the regression for a real, verified
+// misdiagnosis (run #122): proxy.golang.org returns 403 with a distinctive
+// plain-text body when it has flagged a specific module as malicious.
+// Before this fix, that 403 fell straight through to statusModuleUnknown
+// ("check: is the repo public? does the path match?"), which is actively
+// wrong guidance for a module the Go security team deliberately blocked —
+// there's no typo to fix and nothing to wait out. Verified live against
+// three real modules that return exactly this body: github.com/shopsprint/
+// decimal, github.com/boltdb-go/bolt, github.com/xinfeisoft/crypto.
+func TestDiagnose_BlocklistedMalicious(t *testing.T) {
+	const blockedBody = "SECURITY ERROR\nThe module proxy considers this module to be malicious\nand will not serve it."
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/github.com/shopsprint/decimal/@latest", "/github.com/shopsprint/decimal/@v/list", "/github.com/shopsprint/decimal/@v/v1.3.3.info":
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = fmt.Fprint(w, blockedBody)
+		default:
+			t.Fatalf("unexpected request to %s", r.URL.Path)
+		}
+	}))
+	defer proxy.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/github.com/shopsprint/decimal@v1.3.3": http.StatusForbidden,
+	})
+	defer sum.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, client: proxy.Client()}
+	r := ep.probe("github.com/shopsprint/decimal", "v1.3.3")
+	got := diagnose(r)
+	if got.status != statusBlocklistedMalicious {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusBlocklistedMalicious, got.message)
+	}
+}
+
 func TestDiagnose_ModuleUnknown(t *testing.T) {
 	proxy := fakeProxy(t, map[string]int{
 		"/example.com/nope/@latest":        http.StatusNotFound,

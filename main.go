@@ -64,7 +64,7 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 		for {
 			r := ep.probe(module, version)
 			d = diagnose(r)
-			if !*wait || d.status == statusReady || d.status == statusModuleUnknown || time.Now().After(deadline) {
+			if !*wait || d.status == statusReady || d.status == statusModuleUnknown || d.status == statusBlocklistedMalicious || time.Now().After(deadline) {
 				break
 			}
 			time.Sleep(*interval)
