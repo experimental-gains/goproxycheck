@@ -321,6 +321,24 @@ func TestDiagnose_NetworkError_Sum(t *testing.T) {
 	}
 }
 
+// TestFirstLine covers firstLine directly — no existing test calls it other
+// than indirectly through full diagnose() fixtures. Note: a body with a
+// leading newline can't reach the i == 0 case in the IndexByte check below,
+// since strings.TrimSpace (called first) always strips a leading newline
+// along with the rest of the whitespace prefix.
+func TestFirstLine(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"single line", "single line"},
+		{"  padded  ", "padded"},
+		{"first\nsecond\nthird", "first"},
+	}
+	for _, c := range cases {
+		if got := firstLine(c.in); got != c.want {
+			t.Errorf("firstLine(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestDefaultEndpoints(t *testing.T) {
 	e := defaultEndpoints()
 	if e.proxyBase != defaultProxyBase || e.sumBase != defaultSumBase || e.client == nil {

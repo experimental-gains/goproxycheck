@@ -49,6 +49,24 @@ func TestModuleFromGoMod_Quoted(t *testing.T) {
 	}
 }
 
+// TestParseModulePath covers parseModulePath directly, including the i >= 0
+// boundary when the "//" comment marker sits at index 0 (an empty path,
+// comment-only line) — TestModuleFromGoMod_TrailingComment above only
+// exercises "//" appearing partway through the line.
+func TestParseModulePath(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"github.com/foo/bar", "github.com/foo/bar"},
+		{`"github.com/foo/bar"`, "github.com/foo/bar"},
+		{"github.com/foo/bar // the main module", "github.com/foo/bar"},
+		{"// comment only, no path", ""},
+	}
+	for _, c := range cases {
+		if got := parseModulePath(c.in); got != c.want {
+			t.Errorf("parseModulePath(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestModuleFromGoMod_TabSeparator(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "go.mod")

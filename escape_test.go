@@ -8,6 +8,9 @@ func TestEscapePath(t *testing.T) {
 		{"github.com/Azure/azure-sdk-for-go", "github.com/!azure/azure-sdk-for-go"},
 		{"v1.2.3", "v1.2.3"},
 		{"v0.1.0-BETA", "v0.1.0-!b!e!t!a"},
+		// 'Z' is the exact upper boundary of the escaped range (r <= 'Z') —
+		// none of the cases above exercise it specifically.
+		{"Z", "!z"},
 	}
 	for _, c := range cases {
 		if got := escapePath(c.in); got != c.want {
