@@ -82,6 +82,17 @@ actually seeing:
   negative-cache bug — a new tag won't fix it unless the underlying
   file problem is fixed too. `goproxycheck` reports this separately
   instead of telling you to just retag.
+- A `403` with `... considers this module to be malicious ...` in the
+  body — `proxy.golang.org` has explicitly blocklisted this exact
+  module path and permanently refuses to serve it. This is not a
+  typo or a private-repo issue; the proxy operator has already
+  identified the module as malicious. `goproxycheck` reports this as
+  a distinct `blocklisted-malicious` diagnosis instead of folding it
+  into generic "module unknown" guidance (which would otherwise send
+  you looking for a typo that isn't there). Verified live against real,
+  publicly reported malicious Go modules, including a
+  `shopspring/decimal` typosquat and a `boltdb/bolt` typosquat carrying
+  an RCE backdoor.
 
 ## Install
 
