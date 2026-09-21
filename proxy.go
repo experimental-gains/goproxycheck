@@ -77,6 +77,17 @@ type report struct {
 	// the proxy's own module-level negative cache hasn't cleared" — see
 	// diagnose's statusModuleNegativeCache.
 	repoReachable *bool
+	// repoCheckedNestedPath is true when repoReachable was only able to
+	// confirm the github.com/owner/repo root, not the exact module path —
+	// true for any module with path segments past owner/repo (a major-
+	// version subdirectory like /v2, a multi-module-repo subpackage, or a
+	// plain typo). GitHub's bare (non-/tree/) URLs 404 for *any* such
+	// nested path regardless of whether the segment is real, including the
+	// common major-version-on-a-branch layout (e.g. github.com/redis/
+	// go-redis/v9 lives at the repo root, not a /v9 subdirectory) — so
+	// there's no reliable way to verify the nested segment itself here,
+	// only the repo root. See diagnose's statusModuleNegativeCache.
+	repoCheckedNestedPath bool
 }
 
 func (e endpoints) probe(module, version string) report {
@@ -94,6 +105,7 @@ func (e endpoints) probe(module, version string) report {
 		if m := githubRepoPattern.FindStringSubmatch(module); m != nil {
 			reachable := e.get(fmt.Sprintf("%s/%s/%s", e.repoCheckBase, m[1], m[2])).ok
 			r.repoReachable = &reachable
+			r.repoCheckedNestedPath = m[0] != module
 		}
 	}
 	return r

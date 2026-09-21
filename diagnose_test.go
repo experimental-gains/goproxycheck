@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -172,6 +173,58 @@ func TestDiagnose_ModuleNegativeCache(t *testing.T) {
 	got := diagnose(r)
 	if got.status != statusModuleNegativeCache {
 		t.Fatalf("status = %s, want %s; message: %s", got.status, statusModuleNegativeCache, got.message)
+	}
+	if strings.Contains(got.message, "extra path segments") {
+		t.Fatalf("plain owner/repo module message shouldn't carry the nested-path caveat: %s", got.message)
+	}
+}
+
+// TestDiagnose_ModuleNegativeCache_NestedPath is a real-world-testing find
+// (not from a fixture): probing github.com/gin-gonic/gin/nonexistentsubpath
+// live against proxy.golang.org and github.com returns exactly this shape —
+// module unknown to the proxy, but the *repo root* (github.com/gin-gonic/
+// gin) reachable — and the tool reported it as module-negative-cache-
+// suspected with no hedge, even though the true cause here is a bogus
+// nested module path, not poisoning. The repoReachable check can only ever
+// confirm the repo root: GitHub's bare (non-/tree/) URLs 404 on any nested
+// path whether or not it's real, including the common major-version-on-a-
+// branch layout (github.com/redis/go-redis/v9 lives at the repo root, not
+// a /v9 directory) — so a nested module path can't be verified either way,
+// and the message needs to say so instead of asserting the specific nested
+// URL was itself confirmed reachable.
+func TestDiagnose_ModuleNegativeCache_NestedPath(t *testing.T) {
+	proxy := fakeProxy(t, map[string]int{
+		"/github.com/owner/repo/sub/@latest":        http.StatusNotFound,
+		"/github.com/owner/repo/sub/@v/list":        http.StatusNotFound,
+		"/github.com/owner/repo/sub/@v/v0.1.0.info": http.StatusNotFound,
+	})
+	defer proxy.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/github.com/owner/repo/sub@v0.1.0": http.StatusNotFound,
+	})
+	defer sum.Close()
+	repoCheck := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/owner/repo" {
+			t.Fatalf("unexpected repo-check request to %s (should check the repo root, not the nested path)", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer repoCheck.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, repoCheckBase: repoCheck.URL, client: proxy.Client()}
+	r := ep.probe("github.com/owner/repo/sub", "v0.1.0")
+	got := diagnose(r)
+	if got.status != statusModuleNegativeCache {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusModuleNegativeCache, got.message)
+	}
+	if !strings.Contains(got.message, "https://github.com/owner/repo is reachable") {
+		t.Fatalf("message should credit the repo *root* as what was checked, not the nested module path: %s", got.message)
+	}
+	if strings.Contains(got.message, "https://github.com/owner/repo/sub is reachable") {
+		t.Fatalf("message must not claim the nested path itself was confirmed reachable — it wasn't checked: %s", got.message)
+	}
+	if !strings.Contains(got.message, "double-check the module path") {
+		t.Fatalf("message should hedge that the nested module path itself could be wrong: %s", got.message)
 	}
 }
 

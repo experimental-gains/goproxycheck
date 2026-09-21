@@ -58,6 +58,14 @@ func diagnose(r report) diagnosis {
 
 	if !r.moduleKnown() {
 		if r.repoReachable != nil && *r.repoReachable {
+			if r.repoCheckedNestedPath {
+				repoRoot := githubRepoRoot(r.module)
+				return diagnosis{statusModuleNegativeCache, fmt.Sprintf(
+					"proxy.golang.org has no listing for %s (@latest and @v/list both 404). The repo root https://%s is reachable and public right now, but %s has extra path segments past the repo root, which GitHub's plain URLs 404 on whether or not they're real (this is also true for the common major-version-on-a-branch layout, e.g. a module published as .../v9 straight from the repo root with no /v9 directory) — so this check only confirms the repo exists, not that %s itself is a real module path. "+
+						"If the module path is right, this is very likely the same negative-cache mechanism this tool detects at the per-version level (see the negative-cache-suspected status), just poisoning the whole module instead of one version — usually because the proxy tried to fetch it once while the repo was still private; there's no known trick that reliably clears it and no documented SLA (see https://github.com/golang/go/issues/67958). "+
+						"But double-check the module path itself first (typo, moved import path, or a nested subdirectory that was never created) — that failure mode looks identical from here and waiting won't fix it.",
+					r.module, repoRoot, r.module, r.module)}
+			}
 			return diagnosis{statusModuleNegativeCache, fmt.Sprintf(
 				"proxy.golang.org has no listing for %s (@latest and @v/list both 404), but https://%s is reachable and public right now. "+
 					"This is very likely the same negative-cache mechanism this tool detects at the per-version level (see the negative-cache-suspected status), just poisoning the whole module instead of one version — usually because the proxy tried to fetch it once while the repo was still private. "+
@@ -101,6 +109,14 @@ func diagnose(r report) diagnosis {
 	return diagnosis{statusNotYetIndexed, fmt.Sprintf(
 		"%s is not in @v/list yet, so the proxy likely hasn't picked up this tag at all (rather than the negative-cache bug, which requires the version to already be listed). "+
 			"If you just pushed the tag, this is ordinary indexing lag — retry in a minute, or use --wait.", r.version)}
+}
+
+// githubRepoRoot returns the github.com/owner/repo prefix of a module path
+// that matches githubRepoPattern (only called when it already has). Used to
+// report exactly what repoReachable actually checked, which is the repo
+// root and not necessarily the full module path.
+func githubRepoRoot(module string) string {
+	return githubRepoPattern.FindString(module)
 }
 
 // firstLine returns the first line of a (possibly multi-line) proxy error
