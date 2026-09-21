@@ -126,3 +126,34 @@ func TestResolveTarget_NoGoMod(t *testing.T) {
 		t.Fatal("expected an error with no go.mod present")
 	}
 }
+
+// TestLocalGoproxyOff covers localGoproxyOff's parsing of `go env GOPROXY`
+// output, including the comma/pipe list case: confirmed live against the
+// real `go` command that "off" only disables lookup when it's the *first*
+// entry (GOPROXY=off,direct and off|direct both fail with "module lookup
+// disabled by GOPROXY=off"; GOPROXY=direct,off succeeds via direct and
+// never reaches the off entry). t.Setenv is safe here — exec.Command
+// inherits the process environment, and `go env` reads the env var over
+// any GOENV-persisted value.
+func TestLocalGoproxyOff(t *testing.T) {
+	cases := []struct {
+		name  string
+		proxy string
+		want  bool
+	}{
+		{"off", "off", true},
+		{"off then direct, comma", "off,direct", true},
+		{"off then direct, pipe", "off|direct", true},
+		{"direct then off", "direct,off", false},
+		{"default", "https://proxy.golang.org,direct", false},
+		{"direct only", "direct", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("GOPROXY", c.proxy)
+			if got := localGoproxyOff(); got != c.want {
+				t.Errorf("localGoproxyOff() with GOPROXY=%q = %v, want %v", c.proxy, got, c.want)
+			}
+		})
+	}
+}

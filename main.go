@@ -43,15 +43,32 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 		return 2
 	}
 
-	deadline := time.Now().Add(*timeout)
 	var d diagnosis
-	for {
-		r := ep.probe(module, version)
-		d = diagnose(r)
-		if !*wait || d.status == statusReady || d.status == statusModuleUnknown || time.Now().After(deadline) {
-			break
+	if localGoproxyOff() {
+		// Verified live: with GOPROXY=off (or its first comma/pipe-separated
+		// entry), `go install`/`go mod download` refuse to fetch anything at
+		// all — "module lookup disabled by GOPROXY=off" — regardless of what
+		// proxy.golang.org itself has. Probing the public proxy in this case
+		// would report a false "ready" (it did, before this check existed:
+		// goproxycheck said `golang.org/x/mod@v0.30.0` was ready with
+		// GOPROXY=off set, while the real `go install` in that exact
+		// environment failed outright). Short-circuit instead of probing.
+		d = diagnosis{statusGoproxyOffLocally, fmt.Sprintf(
+			"your local `GOPROXY` is set to `off` (via env var or `go env -w`), so `go install`/`go get` will refuse to fetch %s@%s here at all — "+
+				"that's your machine's own config, not a proxy-availability problem. Unset `GOPROXY` or point it at a real source "+
+				"(e.g. `GOPROXY=https://proxy.golang.org,direct`) to install normally. This skips probing the proxy entirely: if %s@%s is "+
+				"already sitting in your local module cache, `go install` can still succeed despite GOPROXY=off, since that bypasses the network fetch.",
+			module, version, module, version)}
+	} else {
+		deadline := time.Now().Add(*timeout)
+		for {
+			r := ep.probe(module, version)
+			d = diagnose(r)
+			if !*wait || d.status == statusReady || d.status == statusModuleUnknown || time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(*interval)
 		}
-		time.Sleep(*interval)
 	}
 
 	if *jsonOut {
@@ -128,6 +145,30 @@ func parseModulePath(s string) string {
 		return unquoted
 	}
 	return s
+}
+
+// localGoproxyOff reports whether the local `go` command's effective
+// GOPROXY disables module downloads outright. Reads it via `go env GOPROXY`
+// rather than os.Getenv("GOPROXY") directly, so a value persisted with `go
+// env -w GOPROXY=off` is picked up too, not just an explicit env var — `go
+// env` is the authoritative source either way.
+//
+// GOPROXY may be a comma- or pipe-separated list of sources tried in order,
+// but only the *first* entry matters here: "off" is a definitive stop with
+// no fallback to later entries, confirmed live — GOPROXY=off,direct and
+// GOPROXY=off|direct both fail immediately with "module lookup disabled by
+// GOPROXY=off", while GOPROXY=direct,off succeeds via direct and never
+// reaches the off entry at all.
+func localGoproxyOff() bool {
+	out, err := exec.Command("go", "env", "GOPROXY").Output()
+	if err != nil {
+		return false // best-effort: don't block the real check on this
+	}
+	proxy := strings.TrimSpace(string(out))
+	if i := strings.IndexAny(proxy, ",|"); i >= 0 {
+		proxy = proxy[:i]
+	}
+	return proxy == "off"
 }
 
 func gitDescribeTag() (string, error) {

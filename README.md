@@ -55,9 +55,13 @@ actually seeing:
   minute), could be the negative-cache poisoning described above (wait
   won't fix it — you need a new tag). `goproxycheck` tells you which.
 - `module lookup disabled by GOPROXY=off` — not a proxy-availability
-  problem at all, your own `GOPROXY` is set to `off`. `goproxycheck`
-  reports this as a local config issue instead of a false "not ready
-  yet."
+  problem at all, your own `GOPROXY` is set to `off` (checked via `go env
+  GOPROXY`, so this also catches a value persisted with `go env -w`, not
+  just an explicit env var). `goproxycheck` checks this *before* probing
+  the proxy and reports it as a local config issue instead of a false
+  "ready" — confirmed live that without this check it would otherwise say
+  a module@version is ready to install while the real `go install` in
+  that same environment fails outright.
 - `git ls-remote -q origin ... exit status 128` / `could not read
   Username for 'https://github.com'` — this one bypasses the module
   proxy protocol entirely (Go fell back to a direct VCS fetch). Usually
@@ -111,7 +115,7 @@ argument errors.
 ## Use as a GitHub Action
 
 ```yaml
-- uses: experimental-gains/goproxycheck@v0.1.6
+- uses: experimental-gains/goproxycheck@v0.1.8
   with:
     args: --wait --timeout 10m github.com/you/yourmodule@v1.2.3
 ```

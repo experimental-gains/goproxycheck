@@ -16,6 +16,7 @@ const (
 	statusNetworkError        status = "network-error"
 	statusZipBuildError       status = "zip-build-error"
 	statusModuleNegativeCache status = "module-negative-cache-suspected"
+	statusGoproxyOffLocally   status = "goproxy-off-locally"
 )
 
 // isZipBuildError reports whether a proxy error body is one of
@@ -28,6 +29,19 @@ const (
 // (xt_MARK.h vs xt_mark.h). Unlike the negative-cache case, this is a
 // permanent property of the tagged tree, not a poisoned cache entry — a
 // new tag only fixes it if the underlying file collision is fixed too.
+//
+// Known limitation, confirmed live against github.com/torvalds/linux: the
+// proxy's own response for the *same* module@version isn't deterministic
+// across requests — repeated .info fetches were observed alternating
+// between the real "create zip: ... case-insensitive file name
+// collision: ..." body (detected here) and a plain "fetch timed out" body
+// (which contains no "create zip" and so falls through to
+// statusNegativeCache instead), likely because a large-repo zip build is
+// re-attempted synchronously per request and sometimes exceeds the
+// proxy's own internal timeout before finishing. There's no reliable way
+// to tell that apart from an ordinary negative-cache 404 on a single
+// probe; a caller who gets negative-cache-suspected here should be aware
+// a retry might reveal the real (permanent) zip-build-error instead.
 func isZipBuildError(body string) bool {
 	return strings.Contains(body, "create zip")
 }

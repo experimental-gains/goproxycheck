@@ -148,6 +148,27 @@ func TestRun_WaitPollsUntilReady(t *testing.T) {
 	}
 }
 
+// TestRun_LocalGoproxyOff verifies run() short-circuits on a local
+// GOPROXY=off before ever probing the proxy/sumdb — passing endpoints{}
+// (a nil client) means any attempt to actually probe would panic, so a
+// clean, non-crashing statusGoproxyOffLocally result proves the probe
+// loop was skipped entirely. This is the fix for a real bug found via
+// live-toolchain differential testing: goproxycheck used to report
+// "ready" for a module@version while GOPROXY=off was set, when the real
+// `go install` in that exact environment fails outright with "module
+// lookup disabled by GOPROXY=off".
+func TestRun_LocalGoproxyOff(t *testing.T) {
+	t.Setenv("GOPROXY", "off")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, endpoints{})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "goproxy-off-locally") {
+		t.Errorf("stdout = %q, want it to mention goproxy-off-locally", stdout.String())
+	}
+}
+
 func TestRun_WaitTimesOut(t *testing.T) {
 	ep := notYetIndexedEndpoints(t)
 	var stdout, stderr bytes.Buffer
