@@ -109,7 +109,7 @@ func diagnose(r report) diagnosis {
 				"proxy.golang.org has no listing for %s (@latest and @v/list both 404), but https://%s is reachable and public right now. "+
 					"This is very likely the same negative-cache mechanism this tool detects at the per-version level (see the negative-cache-suspected status), just poisoning the whole module instead of one version — usually because the proxy tried to fetch it once while the repo was still private. "+
 					"Unlike the per-version case, there's no known trick that reliably clears it (cutting a new tag doesn't help here, since @latest itself is what's cached negative) and no documented SLA — see https://github.com/golang/go/issues/67958 for another report of the same thing. "+
-					"GOPROXY=direct works around it for your own local build but does not fix what other users or CI see from the shared proxy. Waiting is the only broadly-effective known fix.",
+					"GOPROXY=direct works around it for your own local build but does not fix what other users or CI see from the shared proxy — and only if your GOVCS setting allows a direct fetch for this module (the default does; a custom GOVCS restriction can still block it with its own 'GOVCS disallows' error). Waiting is the only broadly-effective known fix.",
 				r.module, r.module)}
 		}
 		return diagnosis{statusModuleUnknown, "proxy.golang.org has never heard of this module (both @latest and @v/list failed). " +
