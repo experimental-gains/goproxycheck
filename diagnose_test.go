@@ -158,6 +158,46 @@ func TestDiagnose_BlocklistedMalicious(t *testing.T) {
 	}
 }
 
+// TestDiagnose_BlocklistedMaliciousVersionOnly covers the case
+// TestDiagnose_BlocklistedMalicious doesn't: a block scoped to one
+// version, not the whole module. @latest and @v/list are healthy (the
+// module has other, unblocked versions), but the specific version's
+// @v/<version>.info returns the same 403 blocklist body. Before this fix,
+// isBlocklistedMalicious only ever looked at r.latest.body/r.list.body, so
+// this case fell through to statusZipBuildError or statusNegativeCache
+// instead — both tell the user to retry or cut a new tag, which is wrong
+// for a version the Go security team deliberately and permanently blocked.
+func TestDiagnose_BlocklistedMaliciousVersionOnly(t *testing.T) {
+	const blockedBody = "SECURITY ERROR\nThe module proxy considers this module to be malicious\nand will not serve it."
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/example.com/mod/@latest":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, `{"Version":"v1.4.0","Time":"2026-09-19T00:00:00Z"}`)
+		case "/example.com/mod/@v/list":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "v1.0.0\nv1.3.3\nv1.4.0\n")
+		case "/example.com/mod/@v/v1.3.3.info":
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = fmt.Fprint(w, blockedBody)
+		default:
+			t.Fatalf("unexpected request to %s", r.URL.Path)
+		}
+	}))
+	defer proxy.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/example.com/mod@v1.3.3": http.StatusForbidden,
+	})
+	defer sum.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, client: proxy.Client()}
+	r := ep.probe("example.com/mod", "v1.3.3")
+	got := diagnose(r)
+	if got.status != statusBlocklistedMalicious {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusBlocklistedMalicious, got.message)
+	}
+}
+
 func TestDiagnose_ModuleUnknown(t *testing.T) {
 	proxy := fakeProxy(t, map[string]int{
 		"/example.com/nope/@latest":        http.StatusNotFound,

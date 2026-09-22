@@ -154,6 +154,24 @@ func diagnose(r report) diagnosis {
 			displayTarget(r), firstLine(r.versionInfo.body))}
 	}
 
+	// The blocklist check above only sees @latest/@v/list, which catches a
+	// module blocked outright. The Go security team can also block a single
+	// malicious version while leaving the rest of the module (and @latest,
+	// if it doesn't resolve to the bad version) untouched — a realistic
+	// shape for a supply-chain compromise where only one published version
+	// is bad. Without this, that 403 fell through to statusZipBuildError
+	// (isZipBuildError doesn't match this body) or statusNegativeCache (if
+	// the version is still listed in @v/list), both of which tell the user
+	// to cut a new tag or wait — actively wrong for a version that was
+	// deliberately and permanently blocked.
+	if isBlocklistedMalicious(r.versionInfo.body) {
+		return diagnosis{statusBlocklistedMalicious, fmt.Sprintf(
+			"proxy.golang.org has explicitly flagged %s as malicious and refuses to serve it. "+
+				"This is a permanent security block, not a caching or indexing problem — do not use this version, and don't expect --wait or a new tag pointing at the same code to change the outcome. "+
+				"(@latest and @v/list are otherwise healthy, so this block is scoped to this specific version, not the whole module — an older or newer version may still be safe to use.)",
+			displayTarget(r))}
+	}
+
 	// versionInfo failed but the module itself is known. Distinguish "never
 	// published" from "published but poisoned/not-yet-indexed" using @v/list.
 	// Compare against checkVersion(), not the raw r.version: for a "latest"
