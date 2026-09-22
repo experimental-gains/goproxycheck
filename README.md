@@ -112,6 +112,9 @@ brew install experimental-gains/tap/goproxycheck
 # check one version explicitly
 goproxycheck github.com/you/yourmodule@v1.2.3
 
+# same "latest" query `go install` accepts — resolved to the real version first
+goproxycheck github.com/you/yourmodule@latest
+
 # or, from inside the module's repo right after tagging:
 # reads the module path from ./go.mod and the version from `git describe --tags`
 goproxycheck
@@ -130,7 +133,7 @@ argument errors.
 ## Use as a GitHub Action
 
 ```yaml
-- uses: experimental-gains/goproxycheck@v0.1.13
+- uses: experimental-gains/goproxycheck@v0.1.14
   with:
     args: --wait --timeout 10m github.com/you/yourmodule@v1.2.3
 ```

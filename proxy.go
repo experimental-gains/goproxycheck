@@ -100,19 +100,44 @@ type report struct {
 	// realistic way to hit that limit. See diagnose's
 	// statusRepoCheckInconclusive.
 	repoCheckStatusCode int
+	// resolvedVersion is set when version == "latest" and the proxy
+	// resolved it to a real tagged version (or pseudo-version) via @latest.
+	// The module proxy protocol has no @v/latest.info endpoint — "latest"
+	// is a version *query*, resolved only through @latest — so versionInfo
+	// and sum below are probed against this resolved version, not the
+	// literal string "latest". See probe().
+	resolvedVersion string
 }
 
 func (e endpoints) probe(module, version string) report {
 	mod := escapePath(module)
-	ver := escapePath(version)
 	r := report{
-		module:      module,
-		version:     version,
-		latest:      e.get(fmt.Sprintf("%s/%s/@latest", e.proxyBase, mod)),
-		list:        e.get(fmt.Sprintf("%s/%s/@v/list", e.proxyBase, mod)),
-		versionInfo: e.get(fmt.Sprintf("%s/%s/@v/%s.info", e.proxyBase, mod, ver)),
-		sum:         e.get(fmt.Sprintf("%s/lookup/%s@%s", e.sumBase, mod, ver)),
+		module:  module,
+		version: version,
+		latest:  e.get(fmt.Sprintf("%s/%s/@latest", e.proxyBase, mod)),
+		list:    e.get(fmt.Sprintf("%s/%s/@v/list", e.proxyBase, mod)),
 	}
+
+	checkVersion := version
+	if version == "latest" && r.latest.ok {
+		// Confirmed live: `goproxycheck somemodule@latest` — the natural
+		// invocation by analogy to `go install somemodule@latest`, the
+		// standard Go idiom — used to probe @v/latest.info literally, which
+		// the real proxy 404s with "invalid version" even for a perfectly
+		// healthy module (verified against golang.org/x/mod@latest). That
+		// misdiagnosed a completely ready module as statusNotYetIndexed and
+		// told the user to retry or --wait, which would poll until timeout
+		// since the literal string "latest" never appears in @v/list.
+		if info, err := parseVersionInfo(r.latest.body); err == nil && info.Version != "" {
+			checkVersion = info.Version
+			r.resolvedVersion = info.Version
+		}
+	}
+
+	ver := escapePath(checkVersion)
+	r.versionInfo = e.get(fmt.Sprintf("%s/%s/@v/%s.info", e.proxyBase, mod, ver))
+	r.sum = e.get(fmt.Sprintf("%s/lookup/%s@%s", e.sumBase, mod, ver))
+
 	if !r.moduleKnown() {
 		if m := githubRepoPattern.FindStringSubmatch(module); m != nil {
 			checkResult := e.get(fmt.Sprintf("%s/%s/%s", e.repoCheckBase, m[1], m[2]))
@@ -134,6 +159,16 @@ func (r report) moduleKnown() bool {
 	// @v/list returns 200 with an empty body for a module with zero
 	// tagged releases, so any 200 counts even if list.body is empty.
 	return r.list.ok
+}
+
+// checkVersion is the concrete version actually probed against @v/<version>.info
+// and sum.golang.org/lookup — the literal argument, unless it was a "latest"
+// query resolved to a real version (see probe()).
+func (r report) checkVersion() string {
+	if r.resolvedVersion != "" {
+		return r.resolvedVersion
+	}
+	return r.version
 }
 
 func (r report) listedVersions() []string {

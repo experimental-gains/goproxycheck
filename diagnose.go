@@ -138,7 +138,7 @@ func diagnose(r report) diagnosis {
 	}
 
 	if r.versionInfo.ok && r.sum.ok {
-		return diagnosis{statusReady, fmt.Sprintf("%s@%s is live on both proxy.golang.org and sum.golang.org — a plain `go install` will work.", r.module, r.version)}
+		return diagnosis{statusReady, fmt.Sprintf("%s is live on both proxy.golang.org and sum.golang.org — a plain `go install` will work.", displayTarget(r))}
 	}
 
 	if r.versionInfo.ok && !r.sum.ok {
@@ -148,26 +148,41 @@ func diagnose(r report) diagnosis {
 
 	if isZipBuildError(r.versionInfo.body) {
 		return diagnosis{statusZipBuildError, fmt.Sprintf(
-			"%s@%s: the proxy can't build a module zip from this tag: %s. "+
+			"%s: the proxy can't build a module zip from this tag: %s. "+
 				"This is a permanent property of the tagged tree (a bad file name, an oversized file, a case-insensitive filename collision, or similar), not the negative-cache bug — cutting a new tag won't help unless it also fixes the underlying file problem.",
-			r.module, r.version, firstLine(r.versionInfo.body))}
+			displayTarget(r), firstLine(r.versionInfo.body))}
 	}
 
 	// versionInfo failed but the module itself is known. Distinguish "never
 	// published" from "published but poisoned/not-yet-indexed" using @v/list.
+	// Compare against checkVersion(), not the raw r.version: for a "latest"
+	// query, r.version is the literal string "latest", which never appears
+	// in @v/list — the resolved concrete version is what was actually
+	// probed and would show up there.
+	checkVersion := r.checkVersion()
 	for _, v := range r.listedVersions() {
-		if v == r.version {
+		if v == checkVersion {
 			return diagnosis{statusNegativeCache, fmt.Sprintf(
 				"%s is in @v/list (so it was tagged and the proxy has seen the module) but @v/%s.info still 404s. "+
 					"This is the per-version negative-cache pattern: the proxy tried to fetch this exact version once — often while the repo was still private — and cached that failure separately from @latest/@v/list. "+
 					"It has been observed not to clear on its own within 30+ minutes. Fix: cut a new patch tag (no code change needed) rather than waiting; a version that was never fetched while private has nothing poisoned to clear.",
-				r.version, escapePath(r.version))}
+				checkVersion, escapePath(checkVersion))}
 		}
 	}
 
 	return diagnosis{statusNotYetIndexed, fmt.Sprintf(
 		"%s is not in @v/list yet, so the proxy likely hasn't picked up this tag at all (rather than the negative-cache bug, which requires the version to already be listed). "+
-			"If you just pushed the tag, this is ordinary indexing lag — retry in a minute, or use --wait.", r.version)}
+			"If you just pushed the tag, this is ordinary indexing lag — retry in a minute, or use --wait.", displayTarget(r))}
+}
+
+// displayTarget renders module@version for a diagnosis message, adding the
+// resolved concrete version when the argument was a "latest" query — so the
+// message says what was actually checked, not just the literal input.
+func displayTarget(r report) string {
+	if r.resolvedVersion != "" {
+		return fmt.Sprintf("%s@%s (resolved to %s)", r.module, r.version, r.resolvedVersion)
+	}
+	return fmt.Sprintf("%s@%s", r.module, r.version)
 }
 
 // githubRepoRoot returns the github.com/owner/repo prefix of a module path
