@@ -153,6 +153,12 @@ fetchable.
   domains with a `go-import` redirect) fall back to the plain
   module-unknown diagnosis — there's no reliable way to know how many
   path segments form the repo root without following VCS discovery.
+- The `github.com` reachability check is an unauthenticated scrape
+  request, which GitHub can rate-limit (403) or throttle (429)
+  independently of whether the repo actually exists — most likely if
+  this runs frequently in CI. When that happens you get
+  `repo-check-inconclusive` instead of a real answer; retry later or
+  check the repo in a browser.
 
 ## License
 

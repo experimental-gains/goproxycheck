@@ -8,17 +8,29 @@ import (
 type status string
 
 const (
-	statusReady                status = "ready"
-	statusNegativeCache        status = "negative-cache-suspected"
-	statusNotYetIndexed        status = "not-yet-indexed"
-	statusModuleUnknown        status = "module-unknown"
-	statusSumdbLag             status = "sumdb-lag"
-	statusNetworkError         status = "network-error"
-	statusZipBuildError        status = "zip-build-error"
-	statusModuleNegativeCache  status = "module-negative-cache-suspected"
-	statusGoproxyOffLocally    status = "goproxy-off-locally"
-	statusBlocklistedMalicious status = "blocklisted-malicious"
+	statusReady                 status = "ready"
+	statusNegativeCache         status = "negative-cache-suspected"
+	statusNotYetIndexed         status = "not-yet-indexed"
+	statusModuleUnknown         status = "module-unknown"
+	statusSumdbLag              status = "sumdb-lag"
+	statusNetworkError          status = "network-error"
+	statusZipBuildError         status = "zip-build-error"
+	statusModuleNegativeCache   status = "module-negative-cache-suspected"
+	statusGoproxyOffLocally     status = "goproxy-off-locally"
+	statusBlocklistedMalicious  status = "blocklisted-malicious"
+	statusRepoCheckInconclusive status = "repo-check-inconclusive"
 )
+
+// isRepoCheckRateLimited reports whether a repo-reachability probe status
+// code is GitHub rate-limiting or blocking the request itself, rather than
+// answering "the repo doesn't exist." Unauthenticated GETs to github.com
+// (not the api.github.com REST API, which has its own separate limits) can
+// get a 403 from secondary rate limiting or a 429 under sustained load —
+// both look exactly like a 404 through repoReachable's plain bool, but mean
+// "we don't know" instead of "no."
+func isRepoCheckRateLimited(statusCode int) bool {
+	return statusCode == 403 || statusCode == 429
+}
 
 // blocklistMarker is the distinctive substring proxy.golang.org includes
 // in the plain-text body of a 403 response when it has flagged a specific
@@ -111,6 +123,14 @@ func diagnose(r report) diagnosis {
 					"Unlike the per-version case, there's no known trick that reliably clears it (cutting a new tag doesn't help here, since @latest itself is what's cached negative) and no documented SLA — see https://github.com/golang/go/issues/67958 for another report of the same thing. "+
 					"GOPROXY=direct works around it for your own local build but does not fix what other users or CI see from the shared proxy — and only if your GOVCS setting allows a direct fetch for this module (the default does; a custom GOVCS restriction can still block it with its own 'GOVCS disallows' error). Waiting is the only broadly-effective known fix.",
 				r.module, r.module)}
+		}
+		if r.repoReachable != nil && isRepoCheckRateLimited(r.repoCheckStatusCode) {
+			repoRoot := githubRepoRoot(r.module)
+			return diagnosis{statusRepoCheckInconclusive, fmt.Sprintf(
+				"proxy.golang.org has never heard of %s (both @latest and @v/list failed), and checking whether https://%s is reachable got HTTP %d instead of a clear answer. "+
+					"That status means GitHub itself rate-limited or blocked this tool's unauthenticated check — not that the repo doesn't exist. This is a known way for the check to be inconclusive when run frequently in CI (e.g. via the shipped GitHub Action). "+
+					"Check https://%s in a browser, or retry this check in a few minutes; don't treat this the same as a confirmed module-unknown.",
+				r.module, repoRoot, r.repoCheckStatusCode, repoRoot)}
 		}
 		return diagnosis{statusModuleUnknown, "proxy.golang.org has never heard of this module (both @latest and @v/list failed). " +
 			"Check: is the repo public? does the module path in go.mod exactly match the repo (case matters)? " +

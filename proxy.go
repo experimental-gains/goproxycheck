@@ -88,6 +88,18 @@ type report struct {
 	// there's no reliable way to verify the nested segment itself here,
 	// only the repo root. See diagnose's statusModuleNegativeCache.
 	repoCheckedNestedPath bool
+	// repoCheckStatusCode is the raw HTTP status of the repoReachable probe
+	// (0 if no check was made, e.g. a transport error or a non-github.com
+	// module path). A plain 404 means GitHub itself said the repo/path
+	// doesn't exist; a 403 or 429 means the unauthenticated scrape request
+	// this tool makes got rate-limited or blocked by GitHub's own abuse
+	// protection, which looks identical to "not reachable" via .ok but
+	// means the check is inconclusive, not a real negative answer. This
+	// matters most when goproxycheck runs as the shipped GitHub Action: CI
+	// runners doing frequent unauthenticated github.com GETs are a
+	// realistic way to hit that limit. See diagnose's
+	// statusRepoCheckInconclusive.
+	repoCheckStatusCode int
 }
 
 func (e endpoints) probe(module, version string) report {
@@ -103,9 +115,11 @@ func (e endpoints) probe(module, version string) report {
 	}
 	if !r.moduleKnown() {
 		if m := githubRepoPattern.FindStringSubmatch(module); m != nil {
-			reachable := e.get(fmt.Sprintf("%s/%s/%s", e.repoCheckBase, m[1], m[2])).ok
+			checkResult := e.get(fmt.Sprintf("%s/%s/%s", e.repoCheckBase, m[1], m[2]))
+			reachable := checkResult.ok
 			r.repoReachable = &reachable
 			r.repoCheckedNestedPath = m[0] != module
+			r.repoCheckStatusCode = checkResult.statusCode
 		}
 	}
 	return r

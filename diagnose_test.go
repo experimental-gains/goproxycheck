@@ -291,6 +291,73 @@ func TestDiagnose_ModuleUnknown_GithubRepoAlsoUnreachable(t *testing.T) {
 	}
 }
 
+// TestDiagnose_RepoCheckRateLimited is a real-world-testing find: an
+// unauthenticated GET to github.com (the repo-reachability check) can get a
+// 403 from GitHub's own secondary rate limiting or a 429 under load — most
+// realistically when this tool runs frequently as the shipped GitHub
+// Action, doing that GET from CI on every push. Before this fix that status
+// code was indistinguishable from a genuine 404 through repoReachable's
+// bool, so a rate-limited check produced the same "check: is the repo
+// public?" module-unknown message as a real typo/never-existed module,
+// even though the true answer is "we don't know, GitHub blocked our
+// check" — actively misleading, not just imprecise.
+func TestDiagnose_RepoCheckRateLimited(t *testing.T) {
+	proxy := fakeProxy(t, map[string]int{
+		"/github.com/owner/repo/@latest":        http.StatusNotFound,
+		"/github.com/owner/repo/@v/list":        http.StatusNotFound,
+		"/github.com/owner/repo/@v/v0.1.0.info": http.StatusNotFound,
+	})
+	defer proxy.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/github.com/owner/repo@v0.1.0": http.StatusNotFound,
+	})
+	defer sum.Close()
+	repoCheck := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer repoCheck.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, repoCheckBase: repoCheck.URL, client: proxy.Client()}
+	r := ep.probe("github.com/owner/repo", "v0.1.0")
+	got := diagnose(r)
+	if got.status != statusRepoCheckInconclusive {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusRepoCheckInconclusive, got.message)
+	}
+	if strings.Contains(got.message, "is the repo public") {
+		t.Fatalf("rate-limited repo check must not read like a confirmed module-unknown answer: %s", got.message)
+	}
+	if !strings.Contains(got.message, "403") {
+		t.Fatalf("message should surface the actual status code that made the check inconclusive: %s", got.message)
+	}
+}
+
+// TestDiagnose_RepoCheckTooManyRequests covers the 429 variant of the same
+// inconclusive-check case (sustained load rather than GitHub's specific
+// secondary-rate-limit 403).
+func TestDiagnose_RepoCheckTooManyRequests(t *testing.T) {
+	proxy := fakeProxy(t, map[string]int{
+		"/github.com/owner/repo/@latest":        http.StatusNotFound,
+		"/github.com/owner/repo/@v/list":        http.StatusNotFound,
+		"/github.com/owner/repo/@v/v0.1.0.info": http.StatusNotFound,
+	})
+	defer proxy.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/github.com/owner/repo@v0.1.0": http.StatusNotFound,
+	})
+	defer sum.Close()
+	repoCheck := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer repoCheck.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, repoCheckBase: repoCheck.URL, client: proxy.Client()}
+	r := ep.probe("github.com/owner/repo", "v0.1.0")
+	got := diagnose(r)
+	if got.status != statusRepoCheckInconclusive {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusRepoCheckInconclusive, got.message)
+	}
+}
+
 func TestDiagnose_SumdbLag(t *testing.T) {
 	proxy := fakeProxy(t, map[string]int{
 		"/example.com/mod/@latest":        http.StatusOK,
