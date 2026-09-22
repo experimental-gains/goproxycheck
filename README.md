@@ -66,6 +66,15 @@ actually seeing:
   "ready" — confirmed live that without this check it would otherwise say
   a module@version is ready to install while the real `go install` in
   that same environment fails outright.
+- You're checking a module that's covered by your own `GOPRIVATE` (or
+  `GONOPROXY`) config — confirmed live with `go mod download -x` that a
+  matching module is fetched directly from its VCS host and never touches
+  `proxy.golang.org` at all, so a proxy/sumdb check is meaningless for it
+  either way. `goproxycheck` checks this *before* probing (via `go env
+  GONOPROXY`, which already resolves the `GOPRIVATE` fallback) and reports
+  it as a `private-module-locally` diagnosis instead of a false
+  `module-unknown` — the public proxy genuinely has never heard of it, by
+  design, regardless of whether `go install` works fine right now.
 - `git ls-remote -q origin ... exit status 128` / `could not read
   Username for 'https://github.com'` — this one bypasses the module
   proxy protocol entirely (Go fell back to a direct VCS fetch). Usually

@@ -177,6 +177,42 @@ func TestLocalGoproxyOff(t *testing.T) {
 	}
 }
 
+// TestLocalModulePrivate covers localModulePrivate's parsing of `go env
+// GONOPROXY` output — including the GOPRIVATE-fallback case (GONOPROXY
+// unset, GOPRIVATE set: `go env GONOPROXY` already resolves to GOPRIVATE's
+// value, confirmed live) and an explicit GONOPROXY override taking
+// precedence over an unrelated GOPRIVATE.
+func TestLocalModulePrivate(t *testing.T) {
+	cases := []struct {
+		name             string
+		gonoproxy        string
+		goprivate        string
+		module           string
+		wantMatch        bool
+		wantPatternIsSet bool
+	}{
+		{"no config", "", "", "github.com/myorg/foo", false, false},
+		{"GOPRIVATE fallback, match", "", "github.com/myorg/*", "github.com/myorg/foo", true, true},
+		{"GOPRIVATE fallback, no match", "", "github.com/myorg/*", "github.com/otherorg/foo", false, false},
+		{"explicit GONOPROXY, match", "github.com/myorg/*", "", "github.com/myorg/foo", true, true},
+		{"explicit GONOPROXY overrides unrelated GOPRIVATE", "github.com/myorg/*", "example.com/other", "github.com/myorg/foo", true, true},
+		{"multiple patterns", "example.com/a,github.com/myorg/*", "", "github.com/myorg/foo", true, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("GONOPROXY", c.gonoproxy)
+			t.Setenv("GOPRIVATE", c.goprivate)
+			gotMatch, gotPattern := localModulePrivate(c.module)
+			if gotMatch != c.wantMatch {
+				t.Errorf("localModulePrivate(%q) match = %v, want %v", c.module, gotMatch, c.wantMatch)
+			}
+			if (gotPattern != "") != c.wantPatternIsSet {
+				t.Errorf("localModulePrivate(%q) pattern = %q, want non-empty=%v", c.module, gotPattern, c.wantPatternIsSet)
+			}
+		})
+	}
+}
+
 // TestDefaultFlagDurations pins the exact --timeout/--interval flag
 // defaults (found LIVED by mutation testing, run #127: every --wait
 // test explicitly overrides both flags, nothing exercised what happens

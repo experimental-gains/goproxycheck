@@ -44,7 +44,26 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 	}
 
 	var d diagnosis
-	if localGoproxyOff() {
+	if priv, pattern := localModulePrivate(module); priv {
+		// Verified live: with GOPRIVATE (or GONOPROXY directly) set to a
+		// pattern matching this module, `go install`/`go get`/`go mod
+		// download` never contact proxy.golang.org at all for it — they
+		// fetch directly from the VCS host instead (confirmed with `go mod
+		// download -x`: a matching module shows a `git ls-remote` trace and
+		// no proxy.golang.org request whatsoever, where the same module
+		// without the match shows only proxy.golang.org GETs). Probing the
+		// public proxy for a module like this would report false
+		// module-unknown/not-yet-indexed verdicts — the proxy genuinely has
+		// never heard of it, by design, regardless of whether the real `go
+		// install` would succeed fine via direct VCS fetch right now.
+		// Mirrors the existing GOPROXY=off short-circuit below: local
+		// config makes the whole proxy probe moot, so skip it instead of
+		// reporting on a system `go` itself won't consult.
+		d = diagnosis{statusPrivateModuleLocally, fmt.Sprintf(
+			"your local `GOPRIVATE`/`GONOPROXY` config matches %s via the pattern %q, so `go install`/`go get` will fetch it directly from its VCS host here, never through proxy.golang.org — "+
+				"that's your machine's own config, not a proxy-availability problem, and this tool's proxy/sumdb checks don't apply to it. If you meant to check a *public* module instead, verify the module path doesn't accidentally match your GOPRIVATE pattern.",
+			module, pattern)}
+	} else if localGoproxyOff() {
 		// Verified live: with GOPROXY=off (or its first comma/pipe-separated
 		// entry), `go install`/`go mod download` refuse to fetch anything at
 		// all — "module lookup disabled by GOPROXY=off" — regardless of what
@@ -183,6 +202,28 @@ func localGoproxyOff() bool {
 		proxy = proxy[:i]
 	}
 	return proxy == "off"
+}
+
+// localModulePrivate reports whether module matches the local `go`
+// command's effective GONOPROXY pattern list, returning the specific
+// pattern that matched. GONOPROXY defaults to GOPRIVATE's value when not
+// set explicitly (confirmed live: `GOPRIVATE=x go env GONOPROXY` prints
+// x, with no GONOPROXY set at all) — `go env GONOPROXY` reports that
+// already-resolved effective value either way, so reading it alone covers
+// both GOPRIVATE and an explicit GONOPROXY override without needing to
+// check both separately.
+func localModulePrivate(module string) (bool, string) {
+	out, err := exec.Command("go", "env", "GONOPROXY").Output()
+	if err != nil {
+		return false, "" // best-effort: don't block the real check on this
+	}
+	patterns := splitPatterns(strings.TrimSpace(string(out)))
+	for _, p := range patterns {
+		if matchesPrefixPattern(p, module) {
+			return true, p
+		}
+	}
+	return false, ""
 }
 
 func gitDescribeTag() (string, error) {

@@ -169,6 +169,29 @@ func TestRun_LocalGoproxyOff(t *testing.T) {
 	}
 }
 
+// TestRun_LocalModulePrivate verifies run() short-circuits on a local
+// GOPRIVATE/GONOPROXY match before ever probing the proxy/sumdb — passing
+// endpoints{} means any attempt to actually probe would panic, so a clean,
+// non-crashing statusPrivateModuleLocally result proves the probe loop was
+// skipped entirely. This is the fix for a real bug found by live-toolchain
+// differential testing: with GOPRIVATE set to a pattern matching the target
+// module, `go install`/`go mod download` fetch it directly from its VCS
+// host and never contact proxy.golang.org at all (confirmed with `go mod
+// download -x`), so probing the public proxy for it would report false
+// module-unknown/not-yet-indexed verdicts regardless of whether the real
+// install actually works right now.
+func TestRun_LocalModulePrivate(t *testing.T) {
+	t.Setenv("GOPRIVATE", "example.com/*")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, endpoints{})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "private-module-locally") {
+		t.Errorf("stdout = %q, want it to mention private-module-locally", stdout.String())
+	}
+}
+
 // TestRun_LatestQueryResolves is the fix for a real bug found by mirroring
 // the standard `go install module@latest` idiom: the module proxy protocol
 // has no @v/latest.info endpoint (confirmed live against

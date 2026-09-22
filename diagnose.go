@@ -17,6 +17,7 @@ const (
 	statusZipBuildError         status = "zip-build-error"
 	statusModuleNegativeCache   status = "module-negative-cache-suspected"
 	statusGoproxyOffLocally     status = "goproxy-off-locally"
+	statusPrivateModuleLocally  status = "private-module-locally"
 	statusBlocklistedMalicious  status = "blocklisted-malicious"
 	statusRepoCheckInconclusive status = "repo-check-inconclusive"
 )
