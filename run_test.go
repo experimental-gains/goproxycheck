@@ -192,6 +192,72 @@ func TestRun_LocalModulePrivate(t *testing.T) {
 	}
 }
 
+// TestRun_LocalGoproxyDirect verifies run() short-circuits when the local
+// GOPROXY resolves to "direct" before ever probing the proxy/sumdb — same
+// panic-if-reached proof as TestRun_LocalGoproxyOff. This is the fix for a
+// real bug found via live-toolchain differential testing: with
+// GOPROXY=direct, `go mod download` fetches straight from the module's VCS
+// host and never contacts proxy.golang.org at all (confirmed live with `go
+// mod download -x`, which showed only a `git ls-remote` trace and no
+// proxy.golang.org request), so probing the public proxy in this case
+// answers a question `go install` never asks.
+func TestRun_LocalGoproxyDirect(t *testing.T) {
+	t.Setenv("GOPROXY", "direct")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, endpoints{})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "goproxy-direct-locally") {
+		t.Errorf("stdout = %q, want it to mention goproxy-direct-locally", stdout.String())
+	}
+}
+
+// TestRun_LocalGoproxyCustom verifies run() short-circuits when the local
+// GOPROXY resolves to a custom (non-public) proxy URL before ever probing
+// proxy.golang.org — same panic-if-reached proof as TestRun_LocalGoproxyOff.
+// This is the fix for a real bug found via live-toolchain differential
+// testing: with GOPROXY pointed at a working private/custom proxy (Athens,
+// Artifactory, goproxy.cn, and similar are all in real, common use) serving
+// a module the public proxy has never heard of, `go mod download` succeeds
+// in that exact environment (confirmed live against a hand-built
+// file://-proxy fixture) while goproxycheck, before this fix, unconditionally
+// probed proxy.golang.org and reported a false "module-unknown" telling the
+// user to check for a typo — nothing was wrong, it was just asking the
+// wrong proxy.
+func TestRun_LocalGoproxyCustom(t *testing.T) {
+	t.Setenv("GOPROXY", "https://goproxy.example.com,direct")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, endpoints{})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "goproxy-custom-locally") {
+		t.Errorf("stdout = %q, want it to mention goproxy-custom-locally", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "https://goproxy.example.com") {
+		t.Errorf("stdout = %q, want it to name the custom proxy", stdout.String())
+	}
+}
+
+// TestRun_DefaultGoproxyStillProbes is a sanity guard for the
+// localGoproxyNonPublic short-circuit above: the ordinary default GOPROXY
+// (the public proxy followed by direct fallback) must still take the
+// normal probing path, not get misclassified as "custom" just because the
+// full value isn't a bare "https://proxy.golang.org" string.
+func TestRun_DefaultGoproxyStillProbes(t *testing.T) {
+	t.Setenv("GOPROXY", "https://proxy.golang.org,direct")
+	ep := readyEndpoints(t)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, ep)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "ready") {
+		t.Errorf("stdout = %q, want it to mention ready", stdout.String())
+	}
+}
+
 // TestRun_LatestQueryResolves is the fix for a real bug found by mirroring
 // the standard `go install module@latest` idiom: the module proxy protocol
 // has no @v/latest.info endpoint (confirmed live against

@@ -78,6 +78,21 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 				"(e.g. `GOPROXY=https://proxy.golang.org,direct`) to install normally. This skips probing the proxy entirely: if %s@%s is "+
 				"already sitting in your local module cache, `go install` can still succeed despite GOPROXY=off, since that bypasses the network fetch.",
 			module, version, module, version)}
+	} else if kind, custom := localGoproxyNonPublic(); kind == "direct" {
+		// See localGoproxyNonPublic's doc comment. Same short-circuit shape
+		// as the private-module/GOPROXY=off cases above: the public-proxy
+		// probe below is moot when `go install` never talks to a proxy at
+		// all for this fetch.
+		d = diagnosis{statusGoproxyDirectLocally, fmt.Sprintf(
+			"your local `GOPROXY` resolves to `direct` (via env var or `go env -w`), so `go install`/`go get` will fetch %s@%s straight from its VCS host here, never through proxy.golang.org — "+
+				"that's your machine's own config, not a proxy-availability problem, and this tool's proxy/sumdb checks don't apply to it. A real failure here (auth, an unreachable host, a GOVCS restriction) would show up as its own error straight from `go`, not from this tool.",
+			module, version)}
+	} else if kind == "custom" {
+		d = diagnosis{statusGoproxyCustomLocally, fmt.Sprintf(
+			"your local `GOPROXY` is set to %q (via env var or `go env -w`), not the public proxy.golang.org — so `go install`/`go get` will fetch %s@%s from that proxy here, not the one this tool checks. "+
+				"This tool only knows how to probe the public proxy.golang.org/sum.golang.org anonymously over plain HTTP; it has no way to know your custom proxy's auth or protocol quirks, so it can't tell you whether %[2]s@%[3]s is actually ready there. "+
+				"If you're chasing a real failure, check your proxy's own logs/status instead of trusting this tool's result — or temporarily set GOPROXY=https://proxy.golang.org,direct to check against the public proxy specifically.",
+			custom, module, version)}
 	} else {
 		deadline := time.Now().Add(*timeout)
 		for {
@@ -180,28 +195,72 @@ func parseModulePath(s string) string {
 	return s
 }
 
-// localGoproxyOff reports whether the local `go` command's effective
-// GOPROXY disables module downloads outright. Reads it via `go env GOPROXY`
+// firstGoproxyEntry returns the first comma/pipe-separated entry of the
+// local `go` command's effective GOPROXY. Reads it via `go env GOPROXY`
 // rather than os.Getenv("GOPROXY") directly, so a value persisted with `go
-// env -w GOPROXY=off` is picked up too, not just an explicit env var — `go
+// env -w GOPROXY=...` is picked up too, not just an explicit env var — `go
 // env` is the authoritative source either way.
 //
 // GOPROXY may be a comma- or pipe-separated list of sources tried in order,
-// but only the *first* entry matters here: "off" is a definitive stop with
-// no fallback to later entries, confirmed live — GOPROXY=off,direct and
-// GOPROXY=off|direct both fail immediately with "module lookup disabled by
-// GOPROXY=off", while GOPROXY=direct,off succeeds via direct and never
-// reaches the off entry at all.
-func localGoproxyOff() bool {
+// but only the *first* entry matters for both callers below: confirmed live
+// that "off" is a definitive stop with no fallback to later entries
+// (GOPROXY=off,direct and GOPROXY=off|direct both fail immediately with
+// "module lookup disabled by GOPROXY=off", while GOPROXY=direct,off
+// succeeds via direct and never reaches the off entry at all), and a
+// comma-separated list only falls through to a later entry when the
+// earlier one 404s/410s (a pipe-separated list falls through on any
+// error) — either way, the first entry is what `go install` tries first
+// and is what determines whether this tool's proxy.golang.org probe below
+// even applies.
+func firstGoproxyEntry() string {
 	out, err := exec.Command("go", "env", "GOPROXY").Output()
 	if err != nil {
-		return false // best-effort: don't block the real check on this
+		return "" // best-effort: don't block the real check on this
 	}
 	proxy := strings.TrimSpace(string(out))
 	if i := strings.IndexAny(proxy, ",|"); i >= 0 {
 		proxy = proxy[:i]
 	}
-	return proxy == "off"
+	return proxy
+}
+
+// localGoproxyOff reports whether the local `go` command's effective
+// GOPROXY disables module downloads outright (its first entry is "off").
+func localGoproxyOff() bool {
+	return firstGoproxyEntry() == "off"
+}
+
+// localGoproxyNonPublic reports whether the local `go` command's effective
+// GOPROXY resolves to something other than the public proxy.golang.org this
+// tool actually probes — either "direct" (skip the proxy protocol
+// entirely and fetch straight from the VCS host) or a custom proxy URL (a
+// private mirror: Athens, Artifactory, and regional mirrors like
+// goproxy.cn are all in real, common use). Returns ("", "") when the first
+// entry is the public proxy (the default, "https://proxy.golang.org,direct")
+// or empty/unreadable, in which case the normal probe below applies as-is.
+//
+// Confirmed live: with GOPROXY pointed at a working custom proxy serving a
+// module the public proxy has never heard of, `go mod download` (the same
+// operation `go install`/`go get` depend on) succeeds in that environment,
+// while probing proxy.golang.org unconditionally — what this tool did
+// before this check existed — reported a false "module-unknown" telling
+// the user to check for a typo, when nothing was wrong at all; it was just
+// asking the wrong proxy. Mirrors the localGoproxyOff/localModulePrivate
+// short-circuits above: local config makes the public-proxy probe not
+// reflect what `go install` will actually do, so this reports that
+// honestly instead of guessing at a private proxy's own auth/protocol
+// (which this tool has no way to know).
+func localGoproxyNonPublic() (kind, value string) {
+	switch first := firstGoproxyEntry(); first {
+	case "", "off":
+		return "", "" // "" (unreadable): fall through to the normal probe; "off" is handled separately above
+	case defaultProxyBase, defaultProxyBase + "/":
+		return "", ""
+	case "direct":
+		return "direct", ""
+	default:
+		return "custom", first
+	}
 }
 
 // localModulePrivate reports whether module matches the local `go`

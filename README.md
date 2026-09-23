@@ -75,6 +75,20 @@ actually seeing:
   it as a `private-module-locally` diagnosis instead of a false
   `module-unknown` — the public proxy genuinely has never heard of it, by
   design, regardless of whether `go install` works fine right now.
+- Your local `GOPROXY` is set to `direct`, or to a private/custom proxy
+  (an Athens or Artifactory mirror, a regional mirror like `goproxy.cn`,
+  etc.) instead of the public `proxy.golang.org` — `goproxycheck` only
+  ever probes the public proxy, so its result doesn't reflect what
+  `go install`/`go get` will actually do here. Checked via `go env
+  GOPROXY` (its first comma/pipe-separated entry, matching how `go`
+  itself only tries later entries on a failure) *before* probing, and
+  reported as a `goproxy-direct-locally`/`goproxy-custom-locally`
+  diagnosis instead of a false verdict — confirmed live with a
+  hand-built custom proxy serving a module the public proxy has never
+  heard of: `go mod download` succeeds in that environment while probing
+  `proxy.golang.org` unconditionally (what this tool did before this
+  check existed) reported a false `module-unknown`, telling you to check
+  for a typo when nothing was wrong at all.
 - `git ls-remote -q origin ... exit status 128` / `could not read
   Username for 'https://github.com'` — this one bypasses the module
   proxy protocol entirely (Go fell back to a direct VCS fetch). Usually
@@ -142,7 +156,7 @@ argument errors.
 ## Use as a GitHub Action
 
 ```yaml
-- uses: experimental-gains/goproxycheck@v0.1.16
+- uses: experimental-gains/goproxycheck@v0.1.17
   with:
     args: --wait --timeout 10m github.com/you/yourmodule@v1.2.3
 ```

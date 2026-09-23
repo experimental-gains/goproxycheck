@@ -177,6 +177,43 @@ func TestLocalGoproxyOff(t *testing.T) {
 	}
 }
 
+// TestLocalGoproxyNonPublic covers localGoproxyNonPublic's classification
+// of `go env GOPROXY` output — the fix for a real bug found via
+// live-toolchain differential testing: goproxycheck unconditionally probed
+// the hardcoded public proxy.golang.org regardless of the local `go`
+// command's actual effective GOPROXY, so a "direct" or custom-proxy
+// environment (private mirrors like Athens/Artifactory/goproxy.cn are all
+// in real, common use) got a diagnosis based on a proxy `go install` never
+// even talks to.
+func TestLocalGoproxyNonPublic(t *testing.T) {
+	cases := []struct {
+		name      string
+		proxy     string
+		wantKind  string
+		wantValue string
+	}{
+		{"default", "https://proxy.golang.org,direct", "", ""},
+		{"default no fallback", "https://proxy.golang.org", "", ""},
+		{"default trailing slash", "https://proxy.golang.org/", "", ""},
+		{"off", "off", "", ""}, // handled separately by localGoproxyOff
+		{"direct only", "direct", "direct", ""},
+		{"direct then public", "direct,https://proxy.golang.org", "direct", ""},
+		{"custom then direct", "https://goproxy.example.com,direct", "custom", "https://goproxy.example.com"},
+		{"custom pipe direct", "https://goproxy.example.com|direct", "custom", "https://goproxy.example.com"},
+		{"file proxy", "file:///tmp/fileproxy,off", "custom", "file:///tmp/fileproxy"},
+		{"empty", "", "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("GOPROXY", c.proxy)
+			gotKind, gotValue := localGoproxyNonPublic()
+			if gotKind != c.wantKind || gotValue != c.wantValue {
+				t.Errorf("localGoproxyNonPublic() with GOPROXY=%q = (%q, %q), want (%q, %q)", c.proxy, gotKind, gotValue, c.wantKind, c.wantValue)
+			}
+		})
+	}
+}
+
 // TestLocalModulePrivate covers localModulePrivate's parsing of `go env
 // GONOPROXY` output — including the GOPRIVATE-fallback case (GONOPROXY
 // unset, GOPRIVATE set: `go env GONOPROXY` already resolves to GOPRIVATE's
