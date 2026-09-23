@@ -312,3 +312,97 @@ func TestRun_WaitTimesOut(t *testing.T) {
 		t.Errorf("stdout = %q, want it to mention not-yet-indexed", stdout.String())
 	}
 }
+
+// sumdbLagEndpoints simulates the module proxy already having the version
+// (@latest/@v/list/.info all 200) while sum.golang.org hasn't caught up yet
+// (lookup 404) — the same shape TestDiagnose_SumdbLag uses at the diagnose()
+// level, reused here for full run()-level end-to-end tests.
+func sumdbLagEndpoints(t *testing.T) endpoints {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v0.1.0"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("v0.1.0\n"))
+		case strings.HasSuffix(r.URL.Path, "/@v/v0.1.0.info"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v0.1.0"}`))
+		default: // sum lookup
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return endpoints{proxyBase: srv.URL, sumBase: srv.URL, client: srv.Client()}
+}
+
+// TestRun_SumdbLagDefault pins the pre-existing behavior (no local sumdb
+// exemption configured): still reports sumdb-lag, not ready. Guards against
+// the GOSUMDB=off/GONOSUMDB fix below over-firing for the ordinary case.
+func TestRun_SumdbLagDefault(t *testing.T) {
+	t.Setenv("GOSUMDB", "")
+	t.Setenv("GONOSUMDB", "")
+	t.Setenv("GOPRIVATE", "")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, sumdbLagEndpoints(t))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s", code, stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "sumdb-lag") {
+		t.Errorf("stdout = %q, want it to mention sumdb-lag", stdout.String())
+	}
+}
+
+// TestRun_SumdbLagWithGosumdbOff is the fix for a real bug found via
+// live-toolchain differential testing: confirmed with `go mod download -x`
+// against the real golang.org/x/mod module in an isolated GOMODCACHE that
+// GOSUMDB=off makes `go install`/`go mod download` skip contacting
+// sum.golang.org entirely (no sum.golang.org or
+// proxy.golang.org/sumdb/... request appears in the trace at all, where the
+// default config clearly shows both). Before this fix, goproxycheck
+// reported statusSumdbLag ("retry shortly") for a module@version whose
+// proxy listing was already live, purely because the fake sum server here
+// (standing in for a real sumdb-lag window) hadn't caught up — actively
+// wrong advice for a GOSUMDB=off environment, where a plain `go install`
+// already succeeds right now.
+func TestRun_SumdbLagWithGosumdbOff(t *testing.T) {
+	t.Setenv("GOSUMDB", "off")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, sumdbLagEndpoints(t))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout: %s", code, stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "ready") {
+		t.Errorf("stdout = %q, want it to mention ready", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "GOSUMDB=off") {
+		t.Errorf("stdout = %q, want it to explain the GOSUMDB=off reason", stdout.String())
+	}
+}
+
+// TestRun_SumdbLagWithGonosumdbPattern covers the narrower, GOPRIVATE-free
+// case: confirmed live the same way (`go mod download -x` with only
+// GONOSUMDB set, no GOPRIVATE/GONOPROXY) that a matching GONOSUMDB pattern
+// still fetches the module normally through proxy.golang.org (unlike
+// GOPRIVATE/GONOPROXY, which skip the proxy entirely and are already
+// handled by localModulePrivate's short-circuit before this code is ever
+// reached) — only the sum.golang.org lookup for that module is skipped, so
+// this needs its own check independent of localModulePrivate.
+func TestRun_SumdbLagWithGonosumdbPattern(t *testing.T) {
+	t.Setenv("GOSUMDB", "")
+	t.Setenv("GOPRIVATE", "")
+	t.Setenv("GONOSUMDB", "example.com/*")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, sumdbLagEndpoints(t))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout: %s", code, stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "ready") {
+		t.Errorf("stdout = %q, want it to mention ready", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "GONOSUMDB pattern") {
+		t.Errorf("stdout = %q, want it to explain the GONOSUMDB reason", stdout.String())
+	}
+}
