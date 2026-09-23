@@ -100,12 +100,12 @@ type report struct {
 	// realistic way to hit that limit. See diagnose's
 	// statusRepoCheckInconclusive.
 	repoCheckStatusCode int
-	// resolvedVersion is set when version == "latest" and the proxy
-	// resolved it to a real tagged version (or pseudo-version) via @latest.
-	// The module proxy protocol has no @v/latest.info endpoint — "latest"
-	// is a version *query*, resolved only through @latest — so versionInfo
-	// and sum below are probed against this resolved version, not the
-	// literal string "latest". See probe().
+	// resolvedVersion is set when version was a query (e.g. "latest", a
+	// partial version like "v0.19", a comparison like "<v1.2.3", or a
+	// revision identifier such as a branch name or commit hash — see
+	// go.dev/ref/mod#version-queries) that the proxy resolved to a
+	// concrete, canonical version. sum is probed against this resolved
+	// version, not the literal query string. See probe().
 	resolvedVersion string
 }
 
@@ -134,9 +134,36 @@ func (e endpoints) probe(module, version string) report {
 		}
 	}
 
-	ver := escapePath(checkVersion)
-	r.versionInfo = e.get(fmt.Sprintf("%s/%s/@v/%s.info", e.proxyBase, mod, ver))
-	r.sum = e.get(fmt.Sprintf("%s/lookup/%s@%s", e.sumBase, mod, ver))
+	r.versionInfo = e.get(fmt.Sprintf("%s/%s/@v/%s.info", e.proxyBase, mod, escapePath(checkVersion)))
+
+	// Unlike "latest" (handled above, since it has no @v/latest.info
+	// endpoint at all), other documented version queries — a partial
+	// version like "v0.19", a comparison like "<v1.2.3", or a revision
+	// identifier such as a branch name or commit hash — DO resolve
+	// directly against @v/<query>.info: confirmed live that
+	// proxy.golang.org accepts the literal query there and returns the
+	// resolved canonical version in the response body (e.g. querying
+	// .../@v/v0.19.info for golang.org/x/mod returns
+	// {"Version":"v0.19.0",...}; .../@v/master.info similarly resolves to
+	// whatever the current tip tag is). sum.golang.org's lookup endpoint,
+	// unlike the proxy, only accepts a canonical version and returns 400
+	// for a query string — so without this, any such query got a
+	// permanently-failing sum.golang.org probe misdiagnosed as
+	// statusSumdbLag ("retry shortly", and under --wait, polls to
+	// timeout), when the module was actually fully ready right now via
+	// its resolved canonical version. Verified live end-to-end: `go get
+	// golang.org/x/mod@v0.19` and `go get golang.org/x/mod@master` both
+	// succeed immediately, and their -x traces show the sum.golang.org
+	// lookup made against the *resolved* canonical version, never the
+	// literal query string.
+	if r.versionInfo.ok && checkVersion == version {
+		if info, err := parseVersionInfo(r.versionInfo.body); err == nil && info.Version != "" && info.Version != checkVersion {
+			checkVersion = info.Version
+			r.resolvedVersion = info.Version
+		}
+	}
+
+	r.sum = e.get(fmt.Sprintf("%s/lookup/%s@%s", e.sumBase, mod, escapePath(checkVersion)))
 
 	if !r.moduleKnown() {
 		if m := githubRepoPattern.FindStringSubmatch(module); m != nil {

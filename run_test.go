@@ -301,6 +301,52 @@ func TestRun_LatestQueryResolves(t *testing.T) {
 	}
 }
 
+// TestRun_PartialVersionQueryResolves is the fix for a real bug found by
+// testing goproxycheck against real documented Go version-query forms beyond
+// "latest" (go.dev/ref/mod#version-queries): a partial version like "v0.19"
+// or a revision identifier like a branch name. Confirmed live against
+// proxy.golang.org that, unlike "latest", these DO resolve directly against
+// @v/<query>.info (returning the resolved canonical version in the body),
+// but sum.golang.org's lookup endpoint only accepts a canonical version and
+// 400s on the literal query string — so before this fix, `goproxycheck
+// mod@v0.19` (or `mod@master`) misdiagnosed a fully ready module as
+// sumdb-lag forever, since the literal query never resolves via sum lookup.
+// This server only serves the sum lookup for the resolved v0.5.0, not the
+// literal "v0.19" queried.
+func TestRun_PartialVersionQueryResolves(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v0.5.0"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("v0.5.0\n"))
+		case strings.HasSuffix(r.URL.Path, "/@v/v0.19.info"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v0.5.0"}`))
+		case strings.Contains(r.URL.Path, "/lookup/") && strings.HasSuffix(r.URL.Path, "@v0.5.0"):
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	ep := endpoints{proxyBase: srv.URL, sumBase: srv.URL, client: srv.Client()}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.19"}, &stdout, &stderr, ep)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "ready") {
+		t.Errorf("stdout = %q, want it to mention ready", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "resolved to v0.5.0") {
+		t.Errorf("stdout = %q, want it to mention the resolved version", stdout.String())
+	}
+}
+
 func TestRun_WaitTimesOut(t *testing.T) {
 	ep := notYetIndexedEndpoints(t)
 	var stdout, stderr bytes.Buffer
