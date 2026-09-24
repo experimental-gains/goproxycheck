@@ -31,6 +31,7 @@ func TestDiagnose_Ready(t *testing.T) {
 		"/example.com/mod/@latest":        http.StatusOK,
 		"/example.com/mod/@v/list":        http.StatusOK,
 		"/example.com/mod/@v/v0.1.0.info": http.StatusOK,
+		"/example.com/mod/@v/v0.1.0.mod":  http.StatusOK,
 	})
 	defer proxy.Close()
 	sum := fakeProxy(t, map[string]int{
@@ -403,6 +404,7 @@ func TestDiagnose_SumdbLag(t *testing.T) {
 		"/example.com/mod/@latest":        http.StatusOK,
 		"/example.com/mod/@v/list":        http.StatusOK,
 		"/example.com/mod/@v/v0.1.0.info": http.StatusOK,
+		"/example.com/mod/@v/v0.1.0.mod":  http.StatusOK,
 	})
 	defer proxy.Close()
 	sum := fakeProxy(t, map[string]int{
@@ -415,6 +417,103 @@ func TestDiagnose_SumdbLag(t *testing.T) {
 	got := diagnose(r)
 	if got.status != statusSumdbLag {
 		t.Fatalf("status = %s, want %s", got.status, statusSumdbLag)
+	}
+}
+
+// TestDiagnose_CanonicalModuleMismatch is the regression for issue #2
+// (github.com/experimental-gains/goproxycheck/issues/2, filed by an
+// external user): the proxy resolves @latest/@v/list/@v/<version>.info by
+// VCS origin discovery against the requested import path, not by checking
+// the module directive in that version's go.mod — so an old/renamed import
+// path (modeled here on the real github.com/grpc/grpc-go, whose go.mod has
+// declared "module google.golang.org/grpc" since it moved off that path)
+// reports fully "ready" with no other signal that `go install` will
+// actually fail with "module declares its path as: ..." (confirmed live,
+// 2026-09-24, against the real proxy and a real `go install`). The .mod
+// fetch this test exercises is the only way to catch that.
+func TestDiagnose_CanonicalModuleMismatch(t *testing.T) {
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/github.com/grpc/grpc-go/@latest":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, `{"Version":"v1.84.0","Time":"2026-09-17T20:03:25Z"}`)
+		case "/github.com/grpc/grpc-go/@v/list":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "v1.84.0\n")
+		case "/github.com/grpc/grpc-go/@v/v1.84.0.info":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, `{"Version":"v1.84.0","Time":"2026-09-17T20:03:25Z"}`)
+		case "/github.com/grpc/grpc-go/@v/v1.84.0.mod":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "module google.golang.org/grpc\n\ngo 1.25.0\n")
+		default:
+			t.Fatalf("unexpected request to %s", r.URL.Path)
+		}
+	}))
+	defer proxy.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/github.com/grpc/grpc-go@v1.84.0": http.StatusOK,
+	})
+	defer sum.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, client: proxy.Client()}
+	r := ep.probe("github.com/grpc/grpc-go", "v1.84.0")
+	got := diagnose(r)
+	// Not statusReady: proxy.golang.org and sum.golang.org both being
+	// healthy under this import path (sum is 200 here too) doesn't mean `go
+	// install` will actually work — it fails at the go.mod parse step
+	// regardless, so this needs to be its own non-zero-exit status, not a
+	// footnote on a "ready" verdict a CI script would read as success.
+	if got.status != statusWrongImportPath {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusWrongImportPath, got.message)
+	}
+	if !strings.Contains(got.message, `declares its module path as "google.golang.org/grpc"`) {
+		t.Fatalf("expected the canonical-path explanation, got: %s", got.message)
+	}
+	if !strings.Contains(got.message, "module declares its path as: google.golang.org/grpc\n\tbut was required as: github.com/grpc/grpc-go") {
+		t.Fatalf("expected the message to quote go's own real failure text verbatim, got: %s", got.message)
+	}
+}
+
+// TestDiagnose_CanonicalModuleMatch is the counterpart to
+// TestDiagnose_CanonicalModuleMismatch: when the go.mod at the resolved
+// version declares the same path that was checked (the overwhelmingly
+// common case), no note should be added.
+func TestDiagnose_CanonicalModuleMatch(t *testing.T) {
+	proxy := fakeProxy(t, map[string]int{
+		"/example.com/mod/@latest":        http.StatusOK,
+		"/example.com/mod/@v/list":        http.StatusOK,
+		"/example.com/mod/@v/v0.1.0.info": http.StatusOK,
+	})
+	defer proxy.Close()
+	// fakeProxy doesn't let us script a distinct body for one path, so use a
+	// dedicated handler serving a real go.mod body for the .mod fetch.
+	modSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/example.com/mod/@latest", "/example.com/mod/@v/list", "/example.com/mod/@v/v0.1.0.info":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, `{"Version":"v0.1.0","Time":"2026-09-19T00:00:00Z"}`)
+		case "/example.com/mod/@v/v0.1.0.mod":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "module example.com/mod\n\ngo 1.21\n")
+		default:
+			t.Fatalf("unexpected request to %s", r.URL.Path)
+		}
+	}))
+	defer modSrv.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/example.com/mod@v0.1.0": http.StatusOK,
+	})
+	defer sum.Close()
+
+	ep := endpoints{proxyBase: modSrv.URL, sumBase: sum.URL, client: modSrv.Client()}
+	r := ep.probe("example.com/mod", "v0.1.0")
+	got := diagnose(r)
+	if got.status != statusReady {
+		t.Fatalf("status = %s, want ready; message: %s", got.status, got.message)
+	}
+	if strings.Contains(got.message, "declares its module path as") {
+		t.Fatalf("matching module path shouldn't produce a canonical-path note: %s", got.message)
 	}
 }
 

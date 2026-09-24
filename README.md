@@ -116,6 +116,20 @@ actually seeing:
   publicly reported malicious Go modules, including a
   `shopspring/decimal` typosquat and a `boltdb/bolt` typosquat carrying
   an RCE backdoor.
+- `module declares its path as: X` / `but was required as: Y` — the
+  import path you checked resolves fine through `proxy.golang.org` and
+  `sum.golang.org` (so nothing else in this list applies), but the go.mod
+  at that version declares a *different* canonical module path — usually
+  because the module moved (a real example: `github.com/grpc/grpc-go`
+  still resolves `@latest`/`@v/list`/`@v/<version>.info` identically to
+  its current canonical path, `google.golang.org/grpc`, since the proxy
+  resolves those by VCS origin discovery, not by checking the module
+  directive). `goproxycheck` fetches the actual go.mod for the resolved
+  version and reports this as a distinct `wrong-import-path` diagnosis
+  (not `ready`) — without this check, every other signal this tool has
+  says the module is fine, and it would report `ready` on exactly the
+  import path a plain `go install` fails on. Reported by an external
+  user, [issue #2](https://github.com/experimental-gains/goproxycheck/issues/2).
 
 ## Install
 

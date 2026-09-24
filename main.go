@@ -112,7 +112,7 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 						displayTarget(r), reason)}
 				}
 			}
-			if !*wait || d.status == statusReady || d.status == statusModuleUnknown || d.status == statusBlocklistedMalicious || time.Now().After(deadline) {
+			if !*wait || d.status == statusReady || d.status == statusModuleUnknown || d.status == statusBlocklistedMalicious || d.status == statusWrongImportPath || time.Now().After(deadline) {
 				break
 			}
 			time.Sleep(*interval)
@@ -184,7 +184,20 @@ func moduleFromGoMod(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	mod, err := moduleDirective(string(data))
+	if err != nil {
+		return "", fmt.Errorf("%s %w", path, err)
+	}
+	return mod, nil
+}
+
+// moduleDirective extracts the module path from a go.mod-format body's
+// `module` directive line. Shared by moduleFromGoMod (reading the local
+// ./go.mod) and canonicalModuleNote in diagnose.go (reading the go.mod the
+// proxy serves for a resolved version) — same file format, same parsing
+// rules, so one implementation covers both instead of drifting apart.
+func moduleDirective(data string) (string, error) {
+	for _, line := range strings.Split(data, "\n") {
 		line = strings.TrimSpace(line)
 		if rest, ok := strings.CutPrefix(line, "module"); ok && rest != "" && (rest[0] == ' ' || rest[0] == '\t') {
 			mod := parseModulePath(strings.TrimSpace(rest))
@@ -195,12 +208,12 @@ func moduleFromGoMod(path string) (string, error) {
 				// but nothing checked what it produces). Silently
 				// probing an empty module path would send a malformed
 				// request to the proxy instead of a clear error.
-				return "", fmt.Errorf("%s has a 'module' directive with no path: %q", path, line)
+				return "", fmt.Errorf("has a 'module' directive with no path: %q", line)
 			}
 			return mod, nil
 		}
 	}
-	return "", fmt.Errorf("no 'module' directive found in %s", path)
+	return "", fmt.Errorf("has no 'module' directive")
 }
 
 // parseModulePath cleans up the raw text after "module " on a go.mod module

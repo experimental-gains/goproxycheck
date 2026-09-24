@@ -22,6 +22,7 @@ const (
 	statusPrivateModuleLocally  status = "private-module-locally"
 	statusBlocklistedMalicious  status = "blocklisted-malicious"
 	statusRepoCheckInconclusive status = "repo-check-inconclusive"
+	statusWrongImportPath       status = "wrong-import-path"
 )
 
 // isRepoCheckRateLimited reports whether a repo-reachability probe status
@@ -140,6 +141,19 @@ func diagnose(r report) diagnosis {
 			"is it covered by a GOPRIVATE/GONOSUMDB pattern that's intentionally excluding it from the public proxy?"}
 	}
 
+	// Checked ahead of the ready/sumdb-lag verdicts below (both require
+	// r.versionInfo.ok, same as this): a canonical-path mismatch makes `go
+	// install` fail outright regardless of sumdb state, so it isn't a
+	// milder "ready, but note this" case — it's a different failure this
+	// tool would otherwise miss entirely. See canonicalModulePath's doc
+	// comment.
+	if canonical, mismatched := canonicalModulePath(r); mismatched {
+		return diagnosis{statusWrongImportPath, fmt.Sprintf(
+			"%s resolves through proxy.golang.org and sum.golang.org under this import path, but the go.mod at this version declares its module path as %q, not %q — a plain `go install`/`go get` will fail outright with \"module declares its path as: %s\n\tbut was required as: %s\". "+
+				"This isn't a proxy-availability problem `--wait` or a retry can fix: use %s instead of %s.",
+			displayTarget(r), canonical, r.module, canonical, r.module, canonical, r.module)}
+	}
+
 	if r.versionInfo.ok && r.sum.ok {
 		return diagnosis{statusReady, fmt.Sprintf("%s is live on both proxy.golang.org and sum.golang.org — a plain `go install` will work.", displayTarget(r))}
 	}
@@ -194,6 +208,38 @@ func diagnose(r report) diagnosis {
 	return diagnosis{statusNotYetIndexed, fmt.Sprintf(
 		"%s is not in @v/list yet, so the proxy likely hasn't picked up this tag at all (rather than the negative-cache bug, which requires the version to already be listed). "+
 			"If you just pushed the tag, this is ordinary indexing lag — retry in a minute, or use --wait.", displayTarget(r))}
+}
+
+// canonicalModulePath reports whether the go.mod the proxy serves for the
+// resolved version declares a different module path than the one that was
+// checked, returning that canonical path when it does.
+//
+// This is invisible to every other check in this file: @latest, @v/list,
+// @v/<version>.info, and sum.golang.org/lookup all key off the import path
+// given to them and the VCS origin it resolves to, not the module
+// directive inside go.mod — so a module that moved its canonical path
+// (the real-world case this was built from: github.com/grpc/grpc-go
+// renamed to google.golang.org/grpc, but the proxy still resolves
+// @latest/@v/list/@v/<version>.info identically under the old path)
+// reports fully "ready" under either path with no other signal that one
+// of them is wrong. Confirmed live (2026-09-24): `go install
+// github.com/grpc/grpc-go@v1.84.0` fails outright with "module declares
+// its path as: google.golang.org/grpc\n\tbut was required as:
+// github.com/grpc/grpc-go" — a real, tool-breaking gap this closes.
+// Reported by an external user, https://github.com/experimental-gains/
+// goproxycheck/issues/2.
+//
+// Only meaningful once r.versionInfo.ok is true — see probe()'s modFile
+// fetch, which is gated on the same condition.
+func canonicalModulePath(r report) (canonical string, mismatched bool) {
+	if !r.modFile.ok {
+		return "", false
+	}
+	canonical, err := moduleDirective(r.modFile.body)
+	if err != nil || canonical == "" || canonical == r.module {
+		return "", false
+	}
+	return canonical, true
 }
 
 // displayTarget renders module@version for a diagnosis message, adding the

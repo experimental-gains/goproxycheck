@@ -71,6 +71,10 @@ type report struct {
 	list            probeResult
 	versionInfo     probeResult
 	sum             probeResult
+	// modFile is the go.mod file body the proxy serves for the resolved
+	// version (@v/<version>.mod), fetched only when versionInfo is a
+	// confirmed 200 — see canonicalModuleNote in diagnose.go for why.
+	modFile probeResult
 	// repoReachable is set only when latest/list both failed and the module
 	// path is rooted at github.com: it distinguishes "the proxy has really
 	// never heard of this" from "the repo is live and public right now, but
@@ -164,6 +168,19 @@ func (e endpoints) probe(module, version string) report {
 	}
 
 	r.sum = e.get(fmt.Sprintf("%s/lookup/%s@%s", e.sumBase, mod, escapePath(checkVersion)))
+
+	if r.versionInfo.ok {
+		// The proxy resolves @latest/@v/<version>.info by VCS origin
+		// discovery against the requested import path, not by checking
+		// the module directive in that version's go.mod — confirmed live
+		// (2026-09) that github.com/grpc/grpc-go/@latest and
+		// google.golang.org/grpc/@latest return the identical
+		// Version/Origin, even though grpc-go's go.mod has declared
+		// "module google.golang.org/grpc" since it moved off the
+		// github.com path. Fetching the actual .mod file here is the only
+		// way to catch that: see canonicalModuleNote.
+		r.modFile = e.get(fmt.Sprintf("%s/%s/@v/%s.mod", e.proxyBase, mod, escapePath(checkVersion)))
+	}
 
 	if !r.moduleKnown() {
 		if m := githubRepoPattern.FindStringSubmatch(module); m != nil {

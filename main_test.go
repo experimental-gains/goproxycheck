@@ -320,6 +320,7 @@ func TestRun_GoproxyFallbackChain(t *testing.T) {
 		"/example.com/mod/@latest":        http.StatusOK,
 		"/example.com/mod/@v/list":        http.StatusOK,
 		"/example.com/mod/@v/v0.1.0.info": http.StatusOK,
+		"/example.com/mod/@v/v0.1.0.mod":  http.StatusOK,
 	})
 	defer proxy.Close()
 	sum := fakeProxy(t, map[string]int{
