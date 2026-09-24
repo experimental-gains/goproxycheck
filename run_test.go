@@ -428,6 +428,52 @@ func TestRun_SumdbLagWithGosumdbOff(t *testing.T) {
 	}
 }
 
+// TestRun_SumdbLagWithCustomGosumdb is the fix for a real bug found by
+// checking whether the run #253 goprivaudit fix (custom multi-field GOSUMDB
+// form, e.g. "name+key url") had been ported to this tool too — it hadn't.
+// Confirmed live with a local HTTP server logging every request: pointing
+// GOSUMDB at a custom name+key+URL made every sumdb request go to that
+// server, none to sum.golang.org at all — same "public sumdb state is
+// irrelevant" situation as GOSUMDB=off, just naming a different database
+// instead of no database. Before this fix, goproxycheck reported
+// statusSumdbLag ("retry shortly") based purely on the fake sum server here
+// (standing in for a real sumdb-lag window) never having caught up, even
+// though a real `go install` in this exact environment would never consult
+// it at all.
+func TestRun_SumdbLagWithCustomGosumdb(t *testing.T) {
+	t.Setenv("GOSUMDB", "mycompany.example+abc123 https://sumdb.mycompany.example")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, sumdbLagEndpoints(t))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout: %s", code, stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "ready") {
+		t.Errorf("stdout = %q, want it to mention ready", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), `custom GOSUMDB "mycompany.example"`) {
+		t.Errorf("stdout = %q, want it to explain the custom-GOSUMDB reason", stdout.String())
+	}
+}
+
+// TestRun_SumdbLagWithGoogleCnAlias pins that the documented
+// "sum.golang.google.cn" alias (a China-reachable mirror of the *same*
+// public sum.golang.org tree, not a different database — cmd/go's own
+// dbDial rewrites it internally before ever dialing) is NOT treated as a
+// custom database: sumdb-lag should still be reported, since a real `go`
+// under this config still consults the same underlying tree the fake sum
+// server here stands in for.
+func TestRun_SumdbLagWithGoogleCnAlias(t *testing.T) {
+	t.Setenv("GOSUMDB", "sum.golang.google.cn")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, sumdbLagEndpoints(t))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s", code, stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "sumdb-lag") {
+		t.Errorf("stdout = %q, want it to mention sumdb-lag", stdout.String())
+	}
+}
+
 // TestRun_SumdbLagWithGonosumdbPattern covers the narrower, GOPRIVATE-free
 // case: confirmed live the same way (`go mod download -x` with only
 // GONOSUMDB set, no GOPRIVATE/GONOPROXY) that a matching GONOSUMDB pattern

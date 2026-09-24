@@ -402,3 +402,28 @@ func TestDefaultFlagDurations(t *testing.T) {
 		t.Errorf("expected the --interval default (15s) in usage output, got:\n%s", out)
 	}
 }
+
+// TestSumdbName pins sumdbName's field-splitting and the
+// "sum.golang.google.cn" alias special case against real cmd/go behavior
+// (confirmed against modfetch/sumdb.go's dbDial: it rewrites that literal
+// alias to "sum.golang.org https://sum.golang.google.cn" before parsing,
+// since it's a China-reachable mirror of the same public tree, not a
+// different database).
+func TestSumdbName(t *testing.T) {
+	cases := []struct {
+		gosumdb string
+		want    string
+	}{
+		{"", "sum.golang.org"},
+		{"sum.golang.org", "sum.golang.org"},
+		{"sum.golang.google.cn", "sum.golang.org"},
+		{"sum.golang.org+033de0ae+Ac4zctda0e5eza+HJyk9SxEdh+s3Ux18htTTAD8OuAn8", "sum.golang.org"},
+		{"mycompany.example+abc123 https://sumdb.mycompany.example", "mycompany.example"},
+		{"mycompany.example", "mycompany.example"},
+	}
+	for _, c := range cases {
+		if got := sumdbName(c.gosumdb); got != c.want {
+			t.Errorf("sumdbName(%q) = %q, want %q", c.gosumdb, got, c.want)
+		}
+	}
+}

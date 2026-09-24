@@ -398,33 +398,69 @@ func localModulePrivate(module string) (bool, string) {
 	return false, ""
 }
 
+// sumdbName extracts the checksum-database name a raw GOSUMDB value
+// resolves to, mirroring the parsing cmd/go itself does in
+// modfetch/sumdb.go's dbDial before it ever opens a connection: $GOSUMDB is
+// "off", a bare name, or "name[+key] [url]" (see `go help goproxy`) — the
+// optional key/url fields say *how* to reach/verify the database, not
+// *which* one it is, so only the first field (before the first space, then
+// before the first "+") matters for identifying it. "sum.golang.google.cn"
+// is a documented special case cmd/go rewrites internally to "sum.golang.org
+// https://sum.golang.google.cn" (a China-reachable mirror of the *same*
+// public tree, not a different database) before this same field-splitting
+// — confirmed against modfetch/sumdb.go's dbDial source — so it resolves to
+// "sum.golang.org" here too, matching real behavior instead of being
+// mistaken for an unrelated custom database.
+func sumdbName(gosumdb string) string {
+	if gosumdb == "" || gosumdb == "sum.golang.google.cn" {
+		return "sum.golang.org"
+	}
+	name, _, _ := strings.Cut(gosumdb, " ")
+	name, _, _ = strings.Cut(name, "+")
+	return name
+}
+
 // localSumdbSkipped reports whether the local `go` command's effective
-// config means it will never consult sum.golang.org for module at all —
-// either GOSUMDB is explicitly set to "off" (globally disables checksum
+// config means it will never consult the public sum.golang.org for module
+// at all — GOSUMDB is explicitly set to "off" (globally disables checksum
 // database verification, a real setting used by CI/corporate environments
-// that trust their proxy or run fully offline), or GONOSUMDB (which
-// defaults to GOPRIVATE's value when unset, confirmed live the same way
-// GONOPROXY does) has a pattern matching module.
+// that trust their proxy or run fully offline), GOSUMDB names a custom
+// checksum database instead of the public one (a real, documented setting
+// — e.g. an org running its own sumdb to avoid leaking module paths/
+// versions to Google — see sumdbName), or GONOSUMDB (which defaults to
+// GOPRIVATE's value when unset, confirmed live the same way GONOPROXY does)
+// has a pattern matching module.
 //
 // Confirmed live with `go mod download -x` in an isolated GOMODCACHE: with
 // GOSUMDB=off, no sum.golang.org (or proxy.golang.org/sumdb/...) request
 // appears in the trace at all, where the default config clearly shows both.
-// With GONOSUMDB matching a module and GOPRIVATE left unset, the module is
-// still fetched normally through proxy.golang.org (confirmed live: the
-// .info/.zip fetches go through proxy.golang.org as usual) — only the sumdb
-// lookup is skipped. That's different from localModulePrivate (which
-// mirrors GONOPROXY and already short-circuits the whole proxy probe
-// earlier in run()): a GONOSUMDB-only match still needs the normal
-// proxy-reachability check, it just means a sumdb-lag verdict from this
-// tool wouldn't actually block a real `go install` in this environment,
-// since sum.golang.org's state is irrelevant once the local config has
-// already decided not to consult it. Without this, goproxycheck told a
-// GOSUMDB=off user to "retry shortly" for a module that was already
-// installable right now.
+// With a custom GOSUMDB (a valid verifier key naming a different database,
+// plus an explicit URL — confirmed with a local HTTP server logging every
+// request), every sumdb request went to the custom server; none went to
+// sum.golang.org at all, so a sumdb-lag verdict from the public database
+// is exactly as meaningless here as under GOSUMDB=off — it's naming a
+// different database, not an absent one, but the public one's state still
+// can't block a real `go install` in this environment. With GONOSUMDB
+// matching a module and GOPRIVATE left unset, the module is still fetched
+// normally through proxy.golang.org (confirmed live: the .info/.zip
+// fetches go through proxy.golang.org as usual) — only the sumdb lookup is
+// skipped. That's different from localModulePrivate (which mirrors
+// GONOPROXY and already short-circuits the whole proxy probe earlier in
+// run()): a GONOSUMDB-only match still needs the normal proxy-reachability
+// check, it just means a sumdb-lag verdict from this tool wouldn't
+// actually block a real `go install` in this environment, since
+// sum.golang.org's state is irrelevant once the local config has already
+// decided not to consult it. Without this, goproxycheck told a
+// GOSUMDB=off (or custom-GOSUMDB) user to "retry shortly" for a module
+// that was already installable right now.
 func localSumdbSkipped(module string) (skipped bool, reason string) {
 	if out, err := exec.Command("go", "env", "GOSUMDB").Output(); err == nil {
-		if strings.TrimSpace(string(out)) == "off" {
+		gosumdb := strings.TrimSpace(string(out))
+		if gosumdb == "off" {
 			return true, "GOSUMDB=off"
+		}
+		if name := sumdbName(gosumdb); name != "sum.golang.org" {
+			return true, fmt.Sprintf("custom GOSUMDB %q", name)
 		}
 	}
 	out, err := exec.Command("go", "env", "GONOSUMDB").Output()
