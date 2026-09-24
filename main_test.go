@@ -167,6 +167,13 @@ func TestLocalGoproxyOff(t *testing.T) {
 		{"direct then off", "direct,off", false},
 		{"default", "https://proxy.golang.org,direct", false},
 		{"direct only", "direct", false},
+		// Empty entries (stray/leading separators, e.g. from
+		// `GOPROXY="$UNSET_VAR,off"`) don't count as an entry — verified
+		// live that real `go` skips them and evaluates the first
+		// *non-empty* entry, not the blank ahead of it.
+		{"leading empty comma", ",off", true},
+		{"leading empty pipe", "|off", true},
+		{"leading empty then direct", ",direct", false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

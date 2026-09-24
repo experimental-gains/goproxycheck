@@ -236,16 +236,24 @@ func parseModulePath(s string) string {
 // error) — either way, the first entry is what `go install` tries first
 // and is what determines whether this tool's proxy.golang.org probe below
 // even applies.
+//
+// Delegates to parseGoproxyChain (below) rather than re-splitting the raw
+// string itself: a naive "split on the first ,/|" used to treat a
+// leading/interior empty entry (e.g. `GOPROXY="$UNSET_VAR,off"`) as the
+// first entry being "", never reaching "off" at all — verified live that
+// real `go` skips blank entries instead, so `GOPROXY=",off"` disables
+// lookups exactly like `GOPROXY=off` does, and this tool used to
+// misreport such a config as fully working.
 func firstGoproxyEntry() string {
 	out, err := exec.Command("go", "env", "GOPROXY").Output()
 	if err != nil {
 		return "" // best-effort: don't block the real check on this
 	}
-	proxy := strings.TrimSpace(string(out))
-	if i := strings.IndexAny(proxy, ",|"); i >= 0 {
-		proxy = proxy[:i]
+	entries, _ := parseGoproxyChain(strings.TrimSpace(string(out)))
+	if len(entries) == 0 {
+		return ""
 	}
-	return proxy
+	return entries[0]
 }
 
 // localGoproxyOff reports whether the local `go` command's effective
