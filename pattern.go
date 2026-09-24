@@ -53,11 +53,30 @@ func matchesAnyPattern(modulePath string, patterns []string) bool {
 }
 
 // splitPatterns splits a GOPRIVATE/GONOPROXY/GONOSUMDB-style comma
-// separated env value into its individual patterns, dropping empties.
+// separated env value into its individual patterns, dropping empty
+// entries — but, matching golang.org/x/mod/module.MatchPrefixPatterns
+// exactly (the real algorithm `go` itself applies here, confirmed against
+// that source across x/mod v0.19.0 through v0.41.0 and the go1.24/go1.27
+// vendored copies: none of them ever call strings.TrimSpace on an
+// individual glob, only strings.TrimSuffix(glob, "/")), deliberately NOT
+// trimming surrounding whitespace from each pattern.
+//
+// This used to TrimSpace each entry, which silently accepted a config
+// style real `go` does not: GOPRIVATE="nomatch/*, golang.org/x/text" (a
+// space after the comma — a natural way to write a comma list by hand)
+// makes the second glob " golang.org/x/text", leading space included: an
+// actual module path never starts with a space, so real `go` never
+// matches it and fetches that module through the normal public proxy —
+// confirmed live with `go mod download -x golang.org/x/text@v0.14.0`
+// under that exact GOPRIVATE value, which shows ordinary
+// proxy.golang.org GETs, not a git ls-remote/fetch direct-VCS trace (the
+// same command with no leading space goes direct, as expected). This
+// tool's own trimming made it treat golang.org/x/text as private anyway,
+// reporting a false private-module-locally and skipping the real
+// proxy/sumdb check `go install` will actually perform.
 func splitPatterns(v string) []string {
 	var out []string
 	for _, p := range strings.Split(v, ",") {
-		p = strings.TrimSpace(p)
 		if p != "" {
 			out = append(out, p)
 		}

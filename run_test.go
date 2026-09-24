@@ -192,6 +192,36 @@ func TestRun_LocalModulePrivate(t *testing.T) {
 	}
 }
 
+// TestRun_LocalModulePrivate_LeadingSpaceDoesNotMatch is the run()-level
+// regression case for the splitPatterns leading-space bug (see
+// pattern_test.go's TestSplitPatterns_LeadingSpaceBreaksMatch for the
+// live-toolchain verification): GOPRIVATE="nomatch/*, example.com/mod" has
+// a space before the second pattern — a natural way to write a comma list
+// by hand — which real `go` never matches against the unspaced module
+// path "example.com/mod" (confirmed live with `go mod download -x`
+// against the analogous golang.org/x/text case: it fetches through
+// proxy.golang.org rather than going direct to VCS). Before the fix,
+// goproxycheck's own trimming matched it anyway and short-circuited with a
+// false private-module-locally, skipping the real proxy/sumdb probe
+// entirely. This test uses readyEndpoints (not the panic-if-reached
+// endpoints{} the true-positive tests above use) specifically to prove the
+// probe *did* run.
+func TestRun_LocalModulePrivate_LeadingSpaceDoesNotMatch(t *testing.T) {
+	t.Setenv("GOPRIVATE", "nomatch/*, example.com/mod")
+	ep := readyEndpoints(t)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, ep)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stdout.String(), "private-module-locally") {
+		t.Errorf("stdout = %q, want it NOT to short-circuit as private-module-locally (the leading-space pattern shouldn't match)", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "ready") {
+		t.Errorf("stdout = %q, want it to mention ready (the probe should have run)", stdout.String())
+	}
+}
+
 // TestRun_LocalGoproxyDirect verifies run() short-circuits when the local
 // GOPROXY resolves to "direct" before ever probing the proxy/sumdb — same
 // panic-if-reached proof as TestRun_LocalGoproxyOff. This is the fix for a
