@@ -87,7 +87,7 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 			"your local `GOPROXY` resolves to `direct` (via env var or `go env -w`), so `go install`/`go get` will fetch %s@%s straight from its VCS host here, never through proxy.golang.org — "+
 				"that's your machine's own config, not a proxy-availability problem, and this tool's proxy/sumdb checks don't apply to it. A real failure here (auth, an unreachable host, a GOVCS restriction) would show up as its own error straight from `go`, not from this tool.",
 			module, version)}
-	} else if kind == "custom" {
+	} else if precedingCustom, anyErrorFallback, fallbackOK := publicProxyFallback(); kind == "custom" && !fallbackOK {
 		d = diagnosis{statusGoproxyCustomLocally, fmt.Sprintf(
 			"your local `GOPROXY` is set to %q (via env var or `go env -w`), not the public proxy.golang.org — so `go install`/`go get` will fetch %s@%s from that proxy here, not the one this tool checks. "+
 				"This tool only knows how to probe the public proxy.golang.org/sum.golang.org anonymously over plain HTTP; it has no way to know your custom proxy's auth or protocol quirks, so it can't tell you whether %[2]s@%[3]s is actually ready there. "+
@@ -116,6 +116,16 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 				break
 			}
 			time.Sleep(*interval)
+		}
+		if kind == "custom" && fallbackOK {
+			// See publicProxyFallback's doc comment: the chain reaches the
+			// public proxy after one or more custom entries, so the probe
+			// above is real and relevant, but only conditionally — prefix
+			// the diagnosis with that caveat instead of either silently
+			// omitting it (misleadingly presenting the result as
+			// unconditional) or bailing out entirely (the old behavior,
+			// which threw away a real, checkable answer).
+			d.message = fallbackCaveat(precedingCustom, anyErrorFallback) + " " + d.message
 		}
 	}
 
@@ -275,6 +285,95 @@ func localGoproxyNonPublic() (kind, value string) {
 	default:
 		return "custom", first
 	}
+}
+
+// parseGoproxyChain replicates cmd/go's own GOPROXY-list walk (proxyList in
+// cmd/go/internal/modfetch/proxy.go, verified directly against that source)
+// far enough to recover entry positions and separators: "," and "|" both
+// separate entries ("|" meaning "fall back to the next entry on *any*
+// error," not just 404/410), and both "off" and "direct" terminate the walk
+// outright — real go's own comment says it ignores every entry after either
+// "for forward-compatibility," so an entry placed after one is never
+// actually reachable. seps[i] is the separator that precedes entries[i+1].
+func parseGoproxyChain(raw string) (entries []string, seps []byte) {
+	pending := raw
+	for pending != "" {
+		var url string
+		var trailingSep byte
+		if i := strings.IndexAny(pending, ",|"); i >= 0 {
+			url, trailingSep, pending = pending[:i], pending[i], pending[i+1:]
+		} else {
+			url, pending = pending, ""
+		}
+		url = strings.TrimSpace(url)
+		if url == "" {
+			continue
+		}
+		entries = append(entries, url)
+		if url == "off" || url == "direct" {
+			break
+		}
+		if pending != "" {
+			seps = append(seps, trailingSep)
+		}
+	}
+	return entries, seps
+}
+
+// publicProxyFallback reports whether the local `go` command's effective
+// GOPROXY reaches the public proxy.golang.org this tool actually probes as
+// a *later* entry in the chain, rather than the first — the officially
+// documented "https://corp.example.com,https://proxy.golang.org" pattern
+// (go.dev/ref/mod#goproxy-protocol's own worked example): a company proxy
+// for private modules, falling back to the public proxy for everything
+// else. Before this existed, localGoproxyNonPublic only ever inspected the
+// chain's first entry (see firstGoproxyEntry's doc comment), so this exact
+// documented and common pattern made the tool claim total ignorance ("it
+// has no way to know... can't tell you whether it's ready there") even
+// though the public-proxy probe is still exactly the right thing to check
+// — confirmed live: with a stand-in proxy that 404s on everything as the
+// first entry and real proxy.golang.org as the second, `go mod download -x`
+// falls straight through (404 on the first entry, per go's own documented
+// rule) and succeeds via the public entry, for an ordinary public module.
+//
+// Returns ok=false when the public proxy isn't reachable via the chain at
+// all (not present, or only present after an "off"/"direct" that already
+// terminates the walk first) — that case keeps the existing "custom,
+// can't check" behavior. precedingCustom lists the entries tried before
+// reaching the public proxy (for the caveat message); anyErrorFallback is
+// true when the separator immediately before the public entry is "|"
+// (fallback on any error) rather than "," (fallback only on 404/410).
+func publicProxyFallback() (precedingCustom []string, anyErrorFallback, ok bool) {
+	out, err := exec.Command("go", "env", "GOPROXY").Output()
+	if err != nil {
+		return nil, false, false
+	}
+	entries, seps := parseGoproxyChain(strings.TrimSpace(string(out)))
+	for i, url := range entries {
+		if url != defaultProxyBase && url != defaultProxyBase+"/" {
+			continue
+		}
+		if i == 0 {
+			return nil, false, false // first entry is already public; not this case
+		}
+		return entries[:i], seps[i-1] == '|', true
+	}
+	return nil, false, false
+}
+
+// fallbackCaveat builds the explanatory prefix used when the public proxy
+// is only reachable in the local GOPROXY chain after one or more custom
+// entries (see publicProxyFallback) — it describes exactly what condition
+// has to hold for the probe result that follows to actually apply.
+func fallbackCaveat(precedingCustom []string, anyErrorFallback bool) string {
+	trigger := "reports the module not found there (404/410)"
+	if anyErrorFallback {
+		trigger = "fails for any reason (a `|` separator precedes proxy.golang.org in your chain, so any error triggers fallback there, not just 404/410)"
+	}
+	return fmt.Sprintf(
+		"Note: your local `GOPROXY` tries %s before proxy.golang.org, in that order — the documented go.dev/ref/mod#goproxy-protocol fallback-chain pattern (e.g. a company proxy for private modules, falling back to the public proxy for everything else). "+
+			"This tool can only check proxy.golang.org directly, not your own %s, so the result below only applies once every entry ahead of it %s.",
+		strings.Join(precedingCustom, ", "), strings.Join(precedingCustom, ", "), trigger)
 }
 
 // localModulePrivate reports whether module matches the local `go`

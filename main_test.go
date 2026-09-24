@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -211,6 +212,138 @@ func TestLocalGoproxyNonPublic(t *testing.T) {
 				t.Errorf("localGoproxyNonPublic() with GOPROXY=%q = (%q, %q), want (%q, %q)", c.proxy, gotKind, gotValue, c.wantKind, c.wantValue)
 			}
 		})
+	}
+}
+
+// TestParseGoproxyChain covers parseGoproxyChain's replication of cmd/go's
+// own GOPROXY-list walk (cmd/go/internal/modfetch/proxy.go's proxyList,
+// verified directly against that source): "," and "|" both separate
+// entries (with "|" recorded so callers can tell it means "fall back on
+// any error," not just 404/410), and both "off" and "direct" terminate the
+// walk outright — an entry placed after either is never actually reachable
+// so must not appear in the returned chain.
+func TestParseGoproxyChain(t *testing.T) {
+	cases := []struct {
+		name        string
+		raw         string
+		wantEntries []string
+		wantSeps    string // one byte per separator, as a string for readability
+	}{
+		{"empty", "", nil, ""},
+		{"single", "https://proxy.golang.org", []string{"https://proxy.golang.org"}, ""},
+		{"comma chain", "https://a.example,https://b.example", []string{"https://a.example", "https://b.example"}, ","},
+		{"pipe chain", "https://a.example|https://b.example", []string{"https://a.example", "https://b.example"}, "|"},
+		{"mixed", "https://a.example,https://b.example|https://c.example", []string{"https://a.example", "https://b.example", "https://c.example"}, ",|"},
+		{"off truncates", "https://a.example,off,https://b.example", []string{"https://a.example", "off"}, ","},
+		{"direct truncates", "https://a.example,direct,https://b.example", []string{"https://a.example", "direct"}, ","},
+		{"off first", "off,direct", []string{"off"}, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			entries, seps := parseGoproxyChain(c.raw)
+			if strings.Join(entries, ",") != strings.Join(c.wantEntries, ",") {
+				t.Errorf("entries = %v, want %v", entries, c.wantEntries)
+			}
+			if string(seps) != c.wantSeps {
+				t.Errorf("seps = %q, want %q", seps, c.wantSeps)
+			}
+		})
+	}
+}
+
+// TestPublicProxyFallback covers publicProxyFallback's detection of the
+// documented go.dev/ref/mod#goproxy-protocol fallback-chain pattern
+// (GOPROXY=https://corp.example.com,https://proxy.golang.org — that page's
+// own worked example): a real bug fix. Before this existed, a GOPROXY chain
+// like this made goproxycheck bail out claiming it had "no way to know...
+// can't tell you whether it's ready there," even though `go mod download`
+// itself falls straight through to the public proxy this tool actually
+// probes whenever the earlier custom entry 404s/410s — confirmed live
+// against the real go toolchain (a stand-in proxy that 404s everything,
+// then real proxy.golang.org, succeeded end to end for an ordinary public
+// module).
+func TestPublicProxyFallback(t *testing.T) {
+	cases := []struct {
+		name              string
+		proxy             string
+		wantPrecedingJoin string // "" means wantOK == false
+		wantAnyError      bool
+		wantOK            bool
+	}{
+		{"public first, default", "https://proxy.golang.org,direct", "", false, false},
+		{"public only", "https://proxy.golang.org", "", false, false},
+		{"custom then public, comma", "https://corp.example.com,https://proxy.golang.org", "https://corp.example.com", false, true},
+		{"custom then public, pipe", "https://corp.example.com|https://proxy.golang.org", "https://corp.example.com", true, true},
+		{"two custom then public", "https://a.example,https://b.example,https://proxy.golang.org", "https://a.example,https://b.example", false, true},
+		{"custom only, no public in chain", "https://corp.example.com,direct", "", false, false},
+		{"custom then off, public never reached", "https://corp.example.com,off", "", false, false},
+		{"custom then direct then public, public unreachable", "https://corp.example.com,direct,https://proxy.golang.org", "", false, false},
+		{"trailing slash public", "https://corp.example.com,https://proxy.golang.org/", "https://corp.example.com", false, true},
+		{"empty", "", "", false, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("GOPROXY", c.proxy)
+			preceding, anyErr, ok := publicProxyFallback()
+			if ok != c.wantOK {
+				t.Fatalf("ok = %v, want %v (preceding=%v anyErr=%v)", ok, c.wantOK, preceding, anyErr)
+			}
+			if !ok {
+				return
+			}
+			if got := strings.Join(preceding, ","); got != c.wantPrecedingJoin {
+				t.Errorf("preceding = %q, want %q", got, c.wantPrecedingJoin)
+			}
+			if anyErr != c.wantAnyError {
+				t.Errorf("anyErrorFallback = %v, want %v", anyErr, c.wantAnyError)
+			}
+		})
+	}
+}
+
+// TestRun_GoproxyFallbackChain is an end-to-end regression test for the
+// same bug TestPublicProxyFallback covers at the run() level: with a
+// GOPROXY chain that reaches the public proxy only after a custom entry,
+// the tool must still perform (and report) the real probe against the
+// public proxy — via the injected fake endpoints, standing in for
+// proxy.golang.org — rather than bailing out as if it were an opaque
+// custom proxy it can't check at all.
+func TestRun_GoproxyFallbackChain(t *testing.T) {
+	proxy := fakeProxy(t, map[string]int{
+		"/example.com/mod/@latest":        http.StatusOK,
+		"/example.com/mod/@v/list":        http.StatusOK,
+		"/example.com/mod/@v/v0.1.0.info": http.StatusOK,
+	})
+	defer proxy.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/example.com/mod@v0.1.0": http.StatusOK,
+	})
+	defer sum.Close()
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, client: proxy.Client()}
+
+	// The detection side (publicProxyFallback) reads the literal local
+	// `go env GOPROXY`, independent of the fake endpoints above standing in
+	// for the actual probe target — same decoupling the pre-existing
+	// "custom"/"direct" tests rely on.
+	t.Setenv("GOPROXY", "https://corp.example.com,https://proxy.golang.org")
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, ep)
+	if code != 0 {
+		t.Fatalf("run() = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "ready") {
+		t.Errorf("expected a ready status, got:\n%s", out)
+	}
+	if !strings.Contains(out, "https://corp.example.com") {
+		t.Errorf("expected the caveat to name the preceding custom entry, got:\n%s", out)
+	}
+	if !strings.Contains(out, "404/410") {
+		t.Errorf("expected the caveat to explain the comma-separated 404/410 fallback trigger, got:\n%s", out)
+	}
+	if strings.Contains(out, "can't tell you") {
+		t.Errorf("expected the real probe result, not the old unconditional bail-out message, got:\n%s", out)
 	}
 }
 
