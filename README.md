@@ -179,17 +179,20 @@ Handy right after a release step, to block the rest of a pipeline
 (e.g. an announcement or downstream build) until the tag is actually
 fetchable.
 
-## Use as a Claude Code plugin
+## Use as a Claude Code / Copilot CLI plugin
 
 goproxycheck also ships as a skill in the
 [`supplychain-guard`](https://github.com/experimental-gains/claude-plugins)
-Claude Code plugin, so an agent diagnoses an ambiguous `go get`/`go build`
+plugin, so an agent diagnoses an ambiguous `go get`/`go build`
 proxy failure instead of guessing whether to wait, retry, or re-tag:
 
 ```
 claude plugin marketplace add experimental-gains/claude-plugins
 claude plugin install supplychain-guard@experimental-gains-plugins
 ```
+
+Works the same way with GitHub Copilot CLI (`copilot plugin marketplace add
+experimental-gains/claude-plugins`, same install command with `copilot`).
 
 ## What it doesn't do
 
