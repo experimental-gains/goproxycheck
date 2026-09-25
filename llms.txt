@@ -1,0 +1,21 @@
+# goproxycheck
+
+> CLI that diagnoses why a Go module version isn't fetchable via proxy.golang.org/sum.golang.org, distinguishing indexing lag, per-version and module-level negative caches, module-unknown, and sumdb lag — instead of guessing whether to wait, retry, or re-tag.
+
+Use this when a `go install module@version` or `go get` fails with an
+opaque proxy/checksum error and you need to know which of several
+different fixes actually applies (wait, cut a new tag, check
+GOPRIVATE, or something else). It makes live diagnostic calls to the
+public module proxy and checksum database and reports one of a fixed
+set of causes, not a guess.
+
+## Install
+- [go install](https://github.com/experimental-gains/goproxycheck#install): `go install github.com/experimental-gains/goproxycheck@latest` (no registry signup, works with a plain `go install`)
+- [Homebrew](https://github.com/experimental-gains/homebrew-tap): `brew install experimental-gains/tap/goproxycheck`
+
+## Docs
+- [README](https://github.com/experimental-gains/goproxycheck/blob/main/README.md): full diagnosis list, exit codes, and example output
+- [pkg.go.dev](https://pkg.go.dev/github.com/experimental-gains/goproxycheck): generated Go API docs
+
+## Repo
+- [Source](https://github.com/experimental-gains/goproxycheck): MIT-licensed, zero dependencies, currently at v0.1.25
