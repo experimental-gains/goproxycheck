@@ -74,6 +74,12 @@ func TestDiagnose_NegativeCache(t *testing.T) {
 			_, _ = fmt.Fprint(w, "v0.1.0\n")
 		case "/example.com/mod/@v/v0.1.0.info":
 			w.WriteHeader(http.StatusNotFound)
+		case "/example.com/mod/@v/v0.1.0.mod":
+			// probe() fetches @latest's own .mod unconditionally to check
+			// for retract directives (see retraction() in retract.go); this
+			// test isn't about that, so serve a plain, unretracted go.mod.
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "module example.com/mod\n")
 		default:
 			t.Fatalf("unexpected request to %s", r.URL.Path)
 		}
@@ -181,6 +187,11 @@ func TestDiagnose_BlocklistedMaliciousVersionOnly(t *testing.T) {
 		case "/example.com/mod/@v/v1.3.3.info":
 			w.WriteHeader(http.StatusForbidden)
 			_, _ = fmt.Fprint(w, blockedBody)
+		case "/example.com/mod/@v/v1.4.0.mod":
+			// probe() fetches @latest's own .mod unconditionally to check
+			// for retract directives; this test isn't about that.
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "module example.com/mod\n")
 		default:
 			t.Fatalf("unexpected request to %s", r.URL.Path)
 		}
@@ -517,6 +528,100 @@ func TestDiagnose_CanonicalModuleMatch(t *testing.T) {
 	}
 }
 
+// TestDiagnose_Retracted is modeled on a real, live-verified case:
+// github.com/mattn/go-sqlite3's go.mod (at its latest tag, v1.14.52)
+// retracts the version range [v2.0.0+incompatible, v2.0.7+incompatible]
+// with the rationale "Accidental; no major changes or features." Confirmed
+// live (2026-09-25) that proxy.golang.org and sum.golang.org both serve
+// v2.0.3+incompatible cleanly, and `go mod download
+// github.com/mattn/go-sqlite3@v2.0.3+incompatible` succeeds outright with
+// no warning anywhere in its trace — retraction never blocks a fetch, only
+// `go list -m -u` surfaces it. Before this diagnosis existed, goproxycheck
+// reported exactly this version as plain statusReady.
+func TestDiagnose_Retracted(t *testing.T) {
+	const module = "github.com/mattn/go-sqlite3"
+	const version = "v2.0.3+incompatible"
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/" + module + "/@latest":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, `{"Version":"v1.14.52","Time":"2026-06-05T00:00:00Z"}`)
+		case "/" + module + "/@v/list":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, "%s\nv1.14.52\n", version)
+		case "/" + module + "/@v/" + version + ".info":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2020-01-28T10:25:19Z"}`, version)
+		case "/" + module + "/@v/" + version + ".mod":
+			// Confirmed live: a pre-modules +incompatible tag like this one
+			// has no go.mod of its own — the proxy synthesizes this exact
+			// bare one-liner. The retraction is NOT visible here; it only
+			// shows up in the module's actual latest release below, which
+			// is why probe() fetches that separately as latestModFile.
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "module github.com/mattn/go-sqlite3\n")
+		case "/" + module + "/@v/v1.14.52.mod":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "module github.com/mattn/go-sqlite3\n\ngo 1.21\n\nretract (\n\t[v2.0.0+incompatible, v2.0.7+incompatible] // Accidental; no major changes or features.\n)\n")
+		default:
+			t.Fatalf("unexpected request to %s", r.URL.Path)
+		}
+	}))
+	defer proxy.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/" + module + "@" + version: http.StatusOK,
+	})
+	defer sum.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, client: proxy.Client()}
+	r := ep.probe(module, version)
+	got := diagnose(r)
+	if got.status != statusRetracted {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusRetracted, got.message)
+	}
+	if !strings.Contains(got.message, `rationale given: "Accidental; no major changes or features."`) {
+		t.Fatalf("expected the retraction rationale to be quoted, got: %s", got.message)
+	}
+	if !strings.Contains(got.message, "go install") {
+		t.Fatalf("expected the message to note `go install` still succeeds despite the retraction, got: %s", got.message)
+	}
+}
+
+// TestDiagnose_RetractedRangeDoesNotCoverVersion checks the negative case:
+// a go.mod with a retract directive that exists but doesn't cover the
+// checked version (the common case for any module with retractions at
+// all, e.g. the same go-sqlite3 go.mod checked against its own v1.14.52
+// latest tag, which isn't in the retracted v2.x range) reports plain
+// statusReady, not a false positive.
+func TestDiagnose_RetractedRangeDoesNotCoverVersion(t *testing.T) {
+	const module = "github.com/mattn/go-sqlite3"
+	const version = "v1.14.52"
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/" + module + "/@latest", "/" + module + "/@v/list", "/" + module + "/@v/" + version + ".info":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2026-06-05T00:00:00Z"}`, version)
+		case "/" + module + "/@v/" + version + ".mod":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "module github.com/mattn/go-sqlite3\n\ngo 1.21\n\nretract (\n\t[v2.0.0+incompatible, v2.0.7+incompatible] // Accidental; no major changes or features.\n)\n")
+		default:
+			t.Fatalf("unexpected request to %s", r.URL.Path)
+		}
+	}))
+	defer proxy.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/" + module + "@" + version: http.StatusOK,
+	})
+	defer sum.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, client: proxy.Client()}
+	r := ep.probe(module, version)
+	got := diagnose(r)
+	if got.status != statusReady {
+		t.Fatalf("status = %s, want ready (retract range doesn't cover this version); message: %s", got.status, got.message)
+	}
+}
+
 func TestDiagnose_NetworkError(t *testing.T) {
 	r := report{
 		module:  "example.com/mod",
@@ -588,6 +693,11 @@ func TestDiagnose_NotYetIndexed(t *testing.T) {
 			_, _ = fmt.Fprint(w, "v0.0.9\n")
 		case "/example.com/mod/@v/v0.1.0.info":
 			w.WriteHeader(http.StatusNotFound)
+		case "/example.com/mod/@v/v0.0.9.mod":
+			// probe() fetches @latest's own .mod unconditionally to check
+			// for retract directives; this test isn't about that.
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "module example.com/mod\n")
 		default:
 			t.Fatalf("unexpected request to %s", r.URL.Path)
 		}

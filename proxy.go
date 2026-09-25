@@ -75,6 +75,28 @@ type report struct {
 	// version (@v/<version>.mod), fetched only when versionInfo is a
 	// confirmed 200 — see canonicalModuleNote in diagnose.go for why.
 	modFile probeResult
+	// latestModFile is the go.mod body for the module's current @latest
+	// version — independent of whichever version was actually requested,
+	// and fetched whenever @latest succeeds. Real `go` only honors
+	// `retract` directives found in the go.mod of a module's latest
+	// release, not necessarily the checked version's own go.mod: confirmed
+	// live via `go list -m -retracted` that github.com/mattn/go-sqlite3@
+	// v2.0.3+incompatible correctly reports "(retracted)" even though that
+	// exact version predates Go modules and has no go.mod of its own (the
+	// proxy synthesizes a bare one for @v/v2.0.3+incompatible.mod with no
+	// retract directive at all) — the retraction is declared in v1.14.52's
+	// go.mod, the module's actual latest release. Using modFile here
+	// instead would silently miss every retraction of an old/+incompatible
+	// version this way. See retraction() in retract.go.
+	//
+	// Known limitation: this only ever looks at the current latest
+	// release's go.mod, not at every version in between — real `go`'s own
+	// resolution walks the module graph more thoroughly, so a version
+	// retracted only by a later release that itself got superseded/retracted
+	// in turn is a case this could miss. Not worth chasing: this already
+	// catches the realistic case (a still-current release retracting an old
+	// version), the one confirmed live above.
+	latestModFile probeResult
 	// repoReachable is set only when latest/list both failed and the module
 	// path is rooted at github.com: it distinguishes "the proxy has really
 	// never heard of this" from "the repo is live and public right now, but
@@ -120,6 +142,12 @@ func (e endpoints) probe(module, version string) report {
 		version: version,
 		latest:  e.get(fmt.Sprintf("%s/%s/@latest", e.proxyBase, mod)),
 		list:    e.get(fmt.Sprintf("%s/%s/@v/list", e.proxyBase, mod)),
+	}
+
+	if r.latest.ok {
+		if info, err := parseVersionInfo(r.latest.body); err == nil && info.Version != "" {
+			r.latestModFile = e.get(fmt.Sprintf("%s/%s/@v/%s.mod", e.proxyBase, mod, escapePath(info.Version)))
+		}
 	}
 
 	checkVersion := version

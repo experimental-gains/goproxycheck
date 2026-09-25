@@ -23,6 +23,7 @@ const (
 	statusBlocklistedMalicious  status = "blocklisted-malicious"
 	statusRepoCheckInconclusive status = "repo-check-inconclusive"
 	statusWrongImportPath       status = "wrong-import-path"
+	statusRetracted             status = "retracted"
 )
 
 // isRepoCheckRateLimited reports whether a repo-reachability probe status
@@ -152,6 +153,26 @@ func diagnose(r report) diagnosis {
 			"%s resolves through proxy.golang.org and sum.golang.org under this import path, but the go.mod at this version declares its module path as %q, not %q — a plain `go install`/`go get` will fail outright with \"module declares its path as: %s\n\tbut was required as: %s\". "+
 				"This isn't a proxy-availability problem `--wait` or a retry can fix: use %s instead of %s.",
 			displayTarget(r), canonical, r.module, canonical, r.module, canonical, r.module)}
+	}
+
+	// Checked ahead of ready/sumdb-lag for the same reason as
+	// canonicalModulePath above: retraction doesn't affect proxy or sumdb
+	// availability at all (see retraction's doc comment — `go install`
+	// succeeds outright on a retracted version), so it isn't a milder
+	// "ready, but note this" footnote — it's the maintainer's own explicit
+	// "don't use this version" signal, which matters regardless of whether
+	// sum.golang.org has caught up yet.
+	if r.latestModFile.ok {
+		if rationale, retracted := retraction(r.latestModFile.body, r.checkVersion()); retracted {
+			explain := "no rationale was given in the retract directive"
+			if rationale != "" {
+				explain = fmt.Sprintf("rationale given: %q", rationale)
+			}
+			return diagnosis{statusRetracted, fmt.Sprintf(
+				"%s resolves fine through proxy.golang.org and sum.golang.org — a plain `go install` will succeed — but this exact version is covered by a `retract` directive in the module's own go.mod (%s). "+
+					"Retraction is advisory only: `go install`/`go get`/`go mod download` don't consult it and will fetch this version anyway; only `go list -m -u` surfaces it. This isn't a proxy-availability problem `--wait` or a retry can fix — it's the maintainer telling you not to use this version. Use a different version instead.",
+				displayTarget(r), explain)}
+		}
 	}
 
 	if r.versionInfo.ok && r.sum.ok {

@@ -112,7 +112,7 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 						displayTarget(r), reason)}
 				}
 			}
-			if !*wait || d.status == statusReady || d.status == statusModuleUnknown || d.status == statusBlocklistedMalicious || d.status == statusWrongImportPath || time.Now().After(deadline) {
+			if !*wait || d.status == statusReady || d.status == statusModuleUnknown || d.status == statusBlocklistedMalicious || d.status == statusWrongImportPath || d.status == statusRetracted || time.Now().After(deadline) {
 				break
 			}
 			time.Sleep(*interval)

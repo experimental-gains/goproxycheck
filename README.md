@@ -130,6 +130,17 @@ actually seeing:
   says the module is fine, and it would report `ready` on exactly the
   import path a plain `go install` fails on. Reported by an external
   user, [issue #2](https://github.com/experimental-gains/goproxycheck/issues/2).
+- You're checking a version the module's own maintainer retracted via a
+  `retract` directive — retraction is advisory only, so `proxy.golang.org`,
+  `sum.golang.org`, and a plain `go install`/`go get`/`go mod download` all
+  keep working on a retracted version exactly like a healthy one; only `go
+  list -m -u` surfaces it. Verified live against a real retraction:
+  `github.com/mattn/go-sqlite3`'s go.mod (at its latest tag) retracts
+  `[v2.0.0+incompatible, v2.0.7+incompatible]` ("Accidental; no major
+  changes or features."), and every version in that range still resolves
+  and installs cleanly. `goproxycheck` reports this as a distinct
+  `retracted` diagnosis (not `ready`) instead of missing the one signal —
+  the maintainer's own go.mod — that says "don't use this."
 
 ## Install
 
@@ -170,7 +181,7 @@ argument errors.
 ## Use as a GitHub Action
 
 ```yaml
-- uses: experimental-gains/goproxycheck@v0.1.24
+- uses: experimental-gains/goproxycheck@v0.1.25
   with:
     args: --wait --timeout 10m github.com/you/yourmodule@v1.2.3
 ```
