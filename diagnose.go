@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net/http"
 	"strings"
 )
 
@@ -24,6 +25,7 @@ const (
 	statusRepoCheckInconclusive status = "repo-check-inconclusive"
 	statusWrongImportPath       status = "wrong-import-path"
 	statusRetracted             status = "retracted"
+	statusProxyError            status = "proxy-error"
 )
 
 // isRepoCheckRateLimited reports whether a repo-reachability probe status
@@ -81,6 +83,33 @@ func isZipBuildError(body string) bool {
 	return strings.Contains(body, "create zip")
 }
 
+// isProxyErrorStatus reports whether code is a "terminal error" response
+// per the documented GOPROXY protocol (go.dev/ref/mod#goproxy-protocol):
+// "Responses with status codes 4xx and 5xx are treated as errors. The
+// error codes 404 (Not Found) and 410 (Gone) indicate that the requested
+// module or version is not available on the proxy, but it may be found
+// elsewhere." Any other non-2xx status (429, 500, 502, 503, a 403 that
+// isn't the malicious-block marker checked separately, etc.) is a
+// different thing entirely: per the same page, "If the proxy responds to
+// a request with an error status other than 404 or 410, the go command
+// will not fall back to later entries in the GOPROXY list" — with the
+// default GOPROXY=proxy.golang.org,direct chain, that means `go install`
+// fails outright with the raw error, not the graceful typo/negative-cache/
+// wait-it-out outcomes this tool otherwise diagnoses. code==0 means no
+// HTTP response was received at all (a transport error, already handled
+// via the .err field before any of these checks run).
+func isProxyErrorStatus(code int) bool {
+	return code != 0 && code != http.StatusOK && code != http.StatusNotFound && code != http.StatusGone
+}
+
+func proxyErrorDiagnosis(host, endpoint string, code int) diagnosis {
+	return diagnosis{statusProxyError, fmt.Sprintf(
+		"%s's %s endpoint returned HTTP %d — not 200 (success) or 404/410 (not found). "+
+			"Per the documented protocol (go.dev/ref/mod#goproxy-protocol), any other 4xx/5xx status is a terminal error, not evidence the module or version doesn't exist: with the default GOPROXY chain, the go command does NOT fall back or wait it out on a non-404/410 error, it fails outright with this same status. "+
+			"This may be a transient issue on %s's side (retry), or a deliberate block unrelated to whether the module is real — it isn't the typo/negative-cache/indexing-lag situation the other diagnoses here describe.",
+		host, endpoint, code, host)}
+}
+
 type diagnosis struct {
 	status  status
 	message string
@@ -113,6 +142,18 @@ func diagnose(r report) diagnosis {
 	}
 
 	if !r.moduleKnown() {
+		// Checked before any of the typo/negative-cache/rate-limited
+		// verdicts below: those all assume @latest and @v/list gave a
+		// clean, meaningful "not found" (404/410) or a transport error
+		// (already ruled out above). A genuine HTTP error status from the
+		// proxy itself (429, 500, 502, 503, an unrelated 403, ...) is
+		// neither — see isProxyErrorStatus's doc comment.
+		if isProxyErrorStatus(r.latest.statusCode) {
+			return proxyErrorDiagnosis("proxy.golang.org", "@latest", r.latest.statusCode)
+		}
+		if isProxyErrorStatus(r.list.statusCode) {
+			return proxyErrorDiagnosis("proxy.golang.org", "@v/list", r.list.statusCode)
+		}
 		if r.repoReachable != nil && *r.repoReachable {
 			if r.repoCheckedNestedPath {
 				repoRoot := githubRepoRoot(r.module)
@@ -180,6 +221,9 @@ func diagnose(r report) diagnosis {
 	}
 
 	if r.versionInfo.ok && !r.sum.ok {
+		if isProxyErrorStatus(r.sum.statusCode) {
+			return proxyErrorDiagnosis("sum.golang.org", "/lookup", r.sum.statusCode)
+		}
 		return diagnosis{statusSumdbLag, "the module proxy has this version, but sum.golang.org doesn't yet. " +
 			"sumdb usually catches up within a minute or two of the proxy; this is normal lag, not the negative-cache bug. Retry shortly."}
 	}
@@ -207,6 +251,15 @@ func diagnose(r report) diagnosis {
 				"This is a permanent security block, not a caching or indexing problem — do not use this version, and don't expect --wait or a new tag pointing at the same code to change the outcome. "+
 				"(@latest and @v/list are otherwise healthy, so this block is scoped to this specific version, not the whole module — an older or newer version may still be safe to use.)",
 			displayTarget(r))}
+	}
+
+	// Checked after the zip-build and malicious-block checks above (both
+	// look at r.versionInfo.body, still meaningful even on a non-200
+	// status): a genuine proxy error status here (429, 500, ...) is
+	// neither of those and isn't the negative-cache/not-yet-indexed
+	// situation the fallback below assumes either.
+	if isProxyErrorStatus(r.versionInfo.statusCode) {
+		return proxyErrorDiagnosis("proxy.golang.org", fmt.Sprintf("@v/%s.info", escapePath(r.checkVersion())), r.versionInfo.statusCode)
 	}
 
 	// versionInfo failed but the module itself is known. Distinguish "never

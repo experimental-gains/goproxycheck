@@ -715,3 +715,151 @@ func TestDiagnose_NotYetIndexed(t *testing.T) {
 		t.Fatalf("status = %s, want %s; message: %s", got.status, statusNotYetIndexed, got.message)
 	}
 }
+
+// TestDiagnose_ProxyErrorStatus_ModuleUnknown reproduces the run #380 find:
+// per go.dev/ref/mod#goproxy-protocol, only 404/410 mean "not found" — any
+// other 4xx/5xx (429, 500, 502, 503, ...) is a terminal protocol error the
+// go command does NOT fall back or wait on. Pre-fix, @latest/@v/list both
+// returning 503 was indistinguishable from a clean double-404 and got
+// misdiagnosed as statusModuleUnknown ("check for a typo"/negative-cache),
+// actively wrong advice for a proxy-side outage that has nothing to do with
+// whether the module exists.
+func TestDiagnose_ProxyErrorStatus_ModuleUnknown(t *testing.T) {
+	proxy := fakeProxy(t, map[string]int{
+		"/example.com/mod/@latest":        http.StatusServiceUnavailable,
+		"/example.com/mod/@v/list":        http.StatusServiceUnavailable,
+		"/example.com/mod/@v/v0.1.0.info": http.StatusServiceUnavailable,
+		"/lookup/example.com/mod@v0.1.0":  http.StatusServiceUnavailable,
+	})
+	defer proxy.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: proxy.URL, client: proxy.Client()}
+	r := ep.probe("example.com/mod", "v0.1.0")
+	got := diagnose(r)
+	if got.status != statusProxyError {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusProxyError, got.message)
+	}
+	if !strings.Contains(got.message, "503") || !strings.Contains(got.message, "@latest") {
+		t.Fatalf("message should name the actual endpoint and status code: %s", got.message)
+	}
+	if strings.Contains(got.message, "check for a typo") {
+		t.Fatalf("a proxy outage must not read like a confirmed module-unknown/typo answer: %s", got.message)
+	}
+}
+
+// A 403 that ISN'T the documented malicious-block body (just some other
+// forbidden response, e.g. a corporate WAF or a misconfigured mirror) must
+// still be told apart from the specific blocklisted-malicious diagnosis.
+func TestDiagnose_ProxyErrorStatus_PlainForbidden(t *testing.T) {
+	proxy := fakeProxy(t, map[string]int{
+		"/example.com/mod/@latest":        http.StatusForbidden,
+		"/example.com/mod/@v/list":        http.StatusForbidden,
+		"/example.com/mod/@v/v0.1.0.info": http.StatusForbidden,
+		"/lookup/example.com/mod@v0.1.0":  http.StatusForbidden,
+	})
+	defer proxy.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: proxy.URL, client: proxy.Client()}
+	r := ep.probe("example.com/mod", "v0.1.0")
+	got := diagnose(r)
+	if got.status != statusProxyError {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusProxyError, got.message)
+	}
+}
+
+// The malicious-block diagnosis (body-based) must still win over the new
+// generic status-based check when both a 403 status AND the marker body
+// are present — it's strictly more informative.
+func TestDiagnose_ProxyErrorStatus_DoesNotShadowMaliciousBlock(t *testing.T) {
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = fmt.Fprint(w, "go.sum database server considers this module to be malicious")
+	}))
+	defer proxy.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: proxy.URL, client: proxy.Client()}
+	r := ep.probe("example.com/mod", "v0.1.0")
+	got := diagnose(r)
+	if got.status != statusBlocklistedMalicious {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusBlocklistedMalicious, got.message)
+	}
+}
+
+// TestDiagnose_ProxyErrorStatus_VersionInfo covers the module-known,
+// version-unresolvable path: @latest/@v/list are healthy but the specific
+// version's @v/<version>.info returns a genuine error status instead of a
+// 404. Pre-fix this fell into the not-yet-indexed/negative-cache fallback
+// ("retry in a minute, or use --wait"), which under --wait would poll to
+// the full timeout on what's actually a terminal per-request error.
+func TestDiagnose_ProxyErrorStatus_VersionInfo(t *testing.T) {
+	proxy := fakeProxy(t, map[string]int{
+		"/example.com/mod/@latest":        http.StatusOK,
+		"/example.com/mod/@v/list":        http.StatusOK,
+		"/example.com/mod/@v/v0.1.0.info": http.StatusTooManyRequests,
+		"/example.com/mod/@v/v0.1.0.mod":  http.StatusOK,
+	})
+	defer proxy.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/example.com/mod@v0.1.0": http.StatusNotFound,
+	})
+	defer sum.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, client: proxy.Client()}
+	r := ep.probe("example.com/mod", "v0.1.0")
+	got := diagnose(r)
+	if got.status != statusProxyError {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusProxyError, got.message)
+	}
+	if !strings.Contains(got.message, "429") {
+		t.Fatalf("message should surface the actual status code: %s", got.message)
+	}
+}
+
+// TestDiagnose_ProxyErrorStatus_Sum covers the sum.golang.org side: proxy
+// has the version, but the sumdb lookup returns a genuine error status
+// rather than a clean 404. Pre-fix this was indistinguishable from
+// ordinary sumdb-lag ("retry shortly") — the wrong advice for a terminal
+// error the go command itself won't just wait out.
+func TestDiagnose_ProxyErrorStatus_Sum(t *testing.T) {
+	proxy := fakeProxy(t, map[string]int{
+		"/example.com/mod/@latest":        http.StatusOK,
+		"/example.com/mod/@v/list":        http.StatusOK,
+		"/example.com/mod/@v/v0.1.0.info": http.StatusOK,
+		"/example.com/mod/@v/v0.1.0.mod":  http.StatusOK,
+	})
+	defer proxy.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/example.com/mod@v0.1.0": http.StatusInternalServerError,
+	})
+	defer sum.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, client: proxy.Client()}
+	r := ep.probe("example.com/mod", "v0.1.0")
+	got := diagnose(r)
+	if got.status != statusProxyError {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusProxyError, got.message)
+	}
+	if !strings.Contains(got.message, "sum.golang.org") || !strings.Contains(got.message, "500") {
+		t.Fatalf("message should name sum.golang.org and the actual status code: %s", got.message)
+	}
+}
+
+// A clean 410 (Gone) — the documented alternative to 404 — must still be
+// treated as an ordinary "not found," not caught by the new error-status
+// check.
+func TestDiagnose_Gone_TreatedAsNotFound(t *testing.T) {
+	proxy := fakeProxy(t, map[string]int{
+		"/example.com/mod/@latest":        http.StatusGone,
+		"/example.com/mod/@v/list":        http.StatusGone,
+		"/example.com/mod/@v/v0.1.0.info": http.StatusGone,
+		"/lookup/example.com/mod@v0.1.0":  http.StatusGone,
+	})
+	defer proxy.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: proxy.URL, client: proxy.Client()}
+	r := ep.probe("example.com/mod", "v0.1.0")
+	got := diagnose(r)
+	if got.status == statusProxyError {
+		t.Fatalf("410 Gone is a documented not-found status, must not be diagnosed as a proxy error: %s", got.message)
+	}
+}

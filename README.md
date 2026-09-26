@@ -141,6 +141,18 @@ actually seeing:
   and installs cleanly. `goproxycheck` reports this as a distinct
   `retracted` diagnosis (not `ready`) instead of missing the one signal —
   the maintainer's own go.mod — that says "don't use this."
+- `proxy.golang.org` or `sum.golang.org` answers with something other than
+  `200`, `404`, or `410` — a `429`, `500`, `502`, `503`, or any other
+  status. Per the documented [GOPROXY
+  protocol](https://go.dev/ref/mod#goproxy-protocol), only `404`/`410`
+  mean "not found, try the next source"; any other error status is
+  terminal — with the default `GOPROXY` chain, a plain `go install`/`go
+  get` fails outright with that same status instead of falling back or
+  treating the module as unknown. `goproxycheck` reports this as a
+  distinct `proxy-error` diagnosis instead of folding it into
+  `module-unknown`/`negative-cache-suspected`/`sumdb-lag`, which would
+  otherwise send you looking for a typo or waiting out an outage that a
+  `--wait` retry (or the proxy operator) needs to actually resolve.
 
 ## Install
 
