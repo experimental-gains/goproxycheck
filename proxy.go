@@ -141,6 +141,13 @@ type report struct {
 	// realistic way to hit that limit. See diagnose's
 	// statusRepoCheckInconclusive.
 	repoCheckStatusCode int
+	// repoCheckErr is the transport-level error from the repoReachable probe,
+	// set only when that GET never got an HTTP response at all (DNS failure,
+	// timeout, connection refused, ...) — nil otherwise, including on a
+	// clean non-2xx response like a 404 or 429. See
+	// isRepoCheckInconclusive's doc comment for why this case needs the same
+	// "we don't know" treatment as a rate-limited or 5xx response.
+	repoCheckErr error
 	// resolvedVersion is set when version was a query (e.g. "latest", a
 	// partial version like "v0.19", a comparison like "<v1.2.3", or a
 	// revision identifier such as a branch name or commit hash — see
@@ -241,6 +248,7 @@ func (e endpoints) probe(module, version string) report {
 			r.repoReachable = &reachable
 			r.repoCheckedNestedPath = m[0] != module
 			r.repoCheckStatusCode = checkResult.statusCode
+			r.repoCheckErr = checkResult.err
 		}
 	}
 	return r

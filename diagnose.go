@@ -32,15 +32,42 @@ const (
 	statusGovcsDisallowedLocally status = "govcs-disallowed-locally"
 )
 
-// isRepoCheckRateLimited reports whether a repo-reachability probe status
-// code is GitHub rate-limiting or blocking the request itself, rather than
-// answering "the repo doesn't exist." Unauthenticated GETs to github.com
-// (not the api.github.com REST API, which has its own separate limits) can
-// get a 403 from secondary rate limiting or a 429 under sustained load —
-// both look exactly like a 404 through repoReachable's plain bool, but mean
-// "we don't know" instead of "no."
-func isRepoCheckRateLimited(statusCode int) bool {
-	return statusCode == 403 || statusCode == 429
+// isRepoCheckInconclusive reports whether a repo-reachability probe status
+// code means the check itself failed to get a trustworthy answer, rather
+// than confirming "the repo doesn't exist." Unauthenticated GETs to
+// github.com (not the api.github.com REST API, which has its own separate
+// limits) can get a 403 from secondary rate limiting or a 429 under
+// sustained load (the original case this covered) — but github.com is also
+// a real service with real outages: its own status page documents 5xx
+// incidents (500/502/503/504) that are unrelated to whether any given repo
+// exists, and this tool's plain HTTP GET can also fail at the transport
+// level entirely (DNS failure, timeout, connection refused — no HTTP
+// response at all, surfaced as statusCode 0 by probeResult.get's err
+// branch, since a genuine HTTP round trip always sets a real status code).
+// All three cases look exactly like a 404 through repoReachable's plain
+// bool, but mean "we don't know" instead of "no" — the same gap the
+// original 403/429 fix closed, just for the other ways an HTTP check can
+// fail to produce a real answer.
+func isRepoCheckInconclusive(statusCode int) bool {
+	return statusCode == 403 || statusCode == 429 || statusCode == 0 || (statusCode >= 500 && statusCode < 600)
+}
+
+// repoCheckInconclusiveDetail describes why a repo-reachability probe
+// didn't produce a trustworthy answer, given its raw HTTP status code (0
+// for a transport error, per isRepoCheckInconclusive's doc comment) and,
+// only meaningful when statusCode is 0, the transport error itself.
+func repoCheckInconclusiveDetail(statusCode int, err error) (detail, explanation string) {
+	switch {
+	case statusCode == 0:
+		return fmt.Sprintf("the request itself failed (%v) instead of getting any HTTP response", err),
+			"That's a network-level failure reaching github.com, not an answer from GitHub at all."
+	case statusCode == 403 || statusCode == 429:
+		return fmt.Sprintf("got HTTP %d", statusCode),
+			"That status means GitHub itself rate-limited or blocked this tool's unauthenticated check — not that the repo doesn't exist."
+	default:
+		return fmt.Sprintf("got HTTP %d", statusCode),
+			"That status means GitHub's own server had an error serving this request — not that the repo doesn't exist."
+	}
 }
 
 // blocklistMarker is the distinctive substring proxy.golang.org includes
@@ -221,13 +248,14 @@ func diagnose(r report) diagnosis {
 					"GOPROXY=direct works around it for your own local build but does not fix what other users or CI see from the shared proxy — and only if your GOVCS setting allows a direct fetch for this module (the default does; a custom GOVCS restriction can still block it with its own 'GOVCS disallows' error). Waiting is the only broadly-effective known fix.",
 				r.module, r.module)}
 		}
-		if r.repoReachable != nil && isRepoCheckRateLimited(r.repoCheckStatusCode) {
+		if r.repoReachable != nil && isRepoCheckInconclusive(r.repoCheckStatusCode) {
 			repoRoot := githubRepoRoot(r.module)
+			detail, explanation := repoCheckInconclusiveDetail(r.repoCheckStatusCode, r.repoCheckErr)
 			return diagnosis{statusRepoCheckInconclusive, fmt.Sprintf(
-				"proxy.golang.org has never heard of %s (both @latest and @v/list failed), and checking whether https://%s is reachable got HTTP %d instead of a clear answer. "+
-					"That status means GitHub itself rate-limited or blocked this tool's unauthenticated check — not that the repo doesn't exist. This is a known way for the check to be inconclusive when run frequently in CI (e.g. via the shipped GitHub Action). "+
+				"proxy.golang.org has never heard of %s (both @latest and @v/list failed), and checking whether https://%s is reachable %s instead of a clear answer. "+
+					"%s This is a known way for the check to be inconclusive when run frequently in CI (e.g. via the shipped GitHub Action). "+
 					"Check https://%s in a browser, or retry this check in a few minutes; don't treat this the same as a confirmed module-unknown.",
-				r.module, repoRoot, r.repoCheckStatusCode, repoRoot)}
+				r.module, repoRoot, detail, explanation, repoRoot)}
 		}
 		return diagnosis{statusModuleUnknown, "proxy.golang.org has never heard of this module (both @latest and @v/list failed). " +
 			"Check: is the repo public? does the module path in go.mod exactly match the repo (case matters)? " +

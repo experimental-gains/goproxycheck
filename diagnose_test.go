@@ -503,6 +503,87 @@ func TestDiagnose_RepoCheckTooManyRequests(t *testing.T) {
 	}
 }
 
+// TestDiagnose_RepoCheckServerError is a real-world-testing find in the same
+// class as the 403/429 cases right above: github.com is a real service with
+// its own documented history of 5xx outages (500/502/503/504), completely
+// unrelated to whether any given repo exists. Before this fix, a 5xx from
+// the repo-reachability check fell all the way through to the plain
+// module-unknown fallback below (isRepoCheckRateLimited only recognized 403
+// and 429), telling the caller "check: is the repo public? typo?" for a
+// check that never actually got an answer from GitHub at all.
+func TestDiagnose_RepoCheckServerError(t *testing.T) {
+	proxy := fakeProxy(t, map[string]int{
+		"/github.com/owner/repo/@latest":        http.StatusNotFound,
+		"/github.com/owner/repo/@v/list":        http.StatusNotFound,
+		"/github.com/owner/repo/@v/v0.1.0.info": http.StatusNotFound,
+	})
+	defer proxy.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/github.com/owner/repo@v0.1.0": http.StatusNotFound,
+	})
+	defer sum.Close()
+	repoCheck := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer repoCheck.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, repoCheckBase: repoCheck.URL, client: proxy.Client()}
+	r := ep.probe("github.com/owner/repo", "v0.1.0")
+	got := diagnose(r)
+	if got.status != statusRepoCheckInconclusive {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusRepoCheckInconclusive, got.message)
+	}
+	if strings.Contains(got.message, "is the repo public") {
+		t.Fatalf("a GitHub-side server error must not read like a confirmed module-unknown answer: %s", got.message)
+	}
+	if !strings.Contains(got.message, "502") {
+		t.Fatalf("message should surface the actual status code that made the check inconclusive: %s", got.message)
+	}
+	if strings.Contains(got.message, "rate-limited") {
+		t.Fatalf("a 502 is a server error, not a rate limit — message must not misattribute it: %s", got.message)
+	}
+}
+
+// TestDiagnose_RepoCheckTransportError covers the case where the
+// repo-reachability GET never gets an HTTP response at all (DNS failure,
+// timeout, connection refused, ...) — surfaced here by closing the fake
+// repo-check server before probe() ever calls it, so the GET fails outright
+// with a connection error. Before this fix, that error left checkResult.ok
+// false and statusCode 0, which isRepoCheckRateLimited(0) didn't recognize
+// either — the identical "check: is the repo public?" module-unknown
+// misdiagnosis as the 403/429/5xx cases, for the one failure mode that has
+// the least business being read as a real answer from GitHub (there wasn't
+// even an HTTP response).
+func TestDiagnose_RepoCheckTransportError(t *testing.T) {
+	proxy := fakeProxy(t, map[string]int{
+		"/github.com/owner/repo/@latest":        http.StatusNotFound,
+		"/github.com/owner/repo/@v/list":        http.StatusNotFound,
+		"/github.com/owner/repo/@v/v0.1.0.info": http.StatusNotFound,
+	})
+	defer proxy.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/github.com/owner/repo@v0.1.0": http.StatusNotFound,
+	})
+	defer sum.Close()
+	repoCheck := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	repoCheck.Close() // closed before use: any GET to its URL fails at the transport level
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, repoCheckBase: repoCheck.URL, client: proxy.Client()}
+	r := ep.probe("github.com/owner/repo", "v0.1.0")
+	got := diagnose(r)
+	if got.status != statusRepoCheckInconclusive {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusRepoCheckInconclusive, got.message)
+	}
+	if strings.Contains(got.message, "is the repo public") {
+		t.Fatalf("a transport failure must not read like a confirmed module-unknown answer: %s", got.message)
+	}
+	if !strings.Contains(got.message, "request itself failed") {
+		t.Fatalf("message should say the check itself never got a response, not cite a bogus status code: %s", got.message)
+	}
+}
+
 func TestDiagnose_SumdbLag(t *testing.T) {
 	proxy := fakeProxy(t, map[string]int{
 		"/example.com/mod/@latest":        http.StatusOK,
