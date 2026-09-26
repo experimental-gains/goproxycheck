@@ -147,6 +147,73 @@ func TestResolveTarget_NoGoMod(t *testing.T) {
 	}
 }
 
+// TestResolveTarget_MultipleTagsAtHead_PicksTheVersionTag is a regression
+// test for a real bug: `git describe --tags --exact-match HEAD` silently
+// picks just one of several tags pointing at the same commit, by an
+// internal tie-break unrelated to which one is the actual semver release —
+// confirmed live that it returned a non-version marker tag ("ci-verified")
+// ahead of the real "v1.6.0" release tag on the same commit. When exactly
+// one of the tags at HEAD is a valid module version, that's the
+// unambiguous right answer and should be picked without requiring the
+// caller to disambiguate explicitly.
+func TestResolveTarget_MultipleTagsAtHead_PicksTheVersionTag(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	_ = os.WriteFile("go.mod", []byte("module example.com/fallback\n\ngo 1.24\n"), 0o644)
+	run := func(name string, args ...string) {
+		t.Helper()
+		if out, err := exec.Command(name, args...).CombinedOutput(); err != nil {
+			t.Fatalf("%s %v: %v\n%s", name, args, err, out)
+		}
+	}
+	run("git", "init", "-q")
+	run("git", "config", "user.email", "test@example.com")
+	run("git", "config", "user.name", "test")
+	run("git", "add", "go.mod")
+	run("git", "commit", "-q", "-m", "init")
+	// A non-version marker tag alongside the real release tag, both on the
+	// same commit — the realistic shape (CI/release automation adding a
+	// "latest"/"stable"/"ci-verified" marker tag, or a leftover re-tag).
+	run("git", "tag", "ci-verified")
+	run("git", "tag", "v1.6.0")
+
+	module, version, err := resolveTarget(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if module != "example.com/fallback" || version != "v1.6.0" {
+		t.Errorf("got (%q, %q), want (%q, %q) — picked the marker tag instead of the release tag", module, version, "example.com/fallback", "v1.6.0")
+	}
+}
+
+// TestResolveTarget_MultipleVersionTagsAtHead_Ambiguous covers the case
+// where more than one tag at HEAD looks like a real module version (e.g. a
+// mistaken re-tag on the same commit) — there's no way to know which one
+// the caller meant, so this should return a clear error instead of
+// silently guessing one, same as the no-tag-at-all case already does.
+func TestResolveTarget_MultipleVersionTagsAtHead_Ambiguous(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	_ = os.WriteFile("go.mod", []byte("module example.com/fallback\n\ngo 1.24\n"), 0o644)
+	run := func(name string, args ...string) {
+		t.Helper()
+		if out, err := exec.Command(name, args...).CombinedOutput(); err != nil {
+			t.Fatalf("%s %v: %v\n%s", name, args, err, out)
+		}
+	}
+	run("git", "init", "-q")
+	run("git", "config", "user.email", "test@example.com")
+	run("git", "config", "user.name", "test")
+	run("git", "add", "go.mod")
+	run("git", "commit", "-q", "-m", "init")
+	run("git", "tag", "v1.6.0")
+	run("git", "tag", "v1.6.1")
+
+	if _, _, err := resolveTarget(nil); err == nil {
+		t.Fatal("expected an error when more than one version-shaped tag points at HEAD")
+	}
+}
+
 // TestLocalGoproxyOff covers localGoproxyOff's parsing of `go env GOPROXY`
 // output, including the comma/pipe list case: confirmed live against the
 // real `go` command that "off" only disables lookup when it's the *first*

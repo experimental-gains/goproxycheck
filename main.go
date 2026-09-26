@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/mod/semver"
 )
 
 func main() {
@@ -30,7 +32,7 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 	jsonOut := fs.Bool("json", false, "print the diagnosis as JSON instead of text")
 	fs.Usage = func() {
 		_, _ = fmt.Fprintln(stderr, "usage: goproxycheck [flags] [module@version]")
-		_, _ = fmt.Fprintln(stderr, "  with no argument, reads the module path from ./go.mod and the version from `git describe --tags`")
+		_, _ = fmt.Fprintln(stderr, "  with no argument, reads the module path from ./go.mod and the version from the tag(s) at HEAD")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -497,10 +499,61 @@ func localSumdbSkipped(module string) (skipped bool, reason string) {
 	return false, ""
 }
 
+// gitDescribeTag determines the release tag for HEAD by listing every tag
+// that points exactly at it, rather than delegating that choice to `git
+// describe --tags --exact-match HEAD` — confirmed live that when more than
+// one tag points at the same commit (a real pattern: release automation and
+// CI commonly add a second marker tag such as "latest", "stable", or
+// "ci-verified" on the same commit as the semver release tag, and a mistaken
+// re-tag left in place does the same), `git describe` silently returns just
+// one of them, chosen by an internal, undocumented tie-break — empirically
+// the alphabetically-first tag ref, completely unrelated to which one is
+// actually the semver release — with no error, no warning, and nothing in
+// its output to reveal a choice was even made.
+//
+// Before this existed, goproxycheck's no-argument mode (the shipped GitHub
+// Action's default invocation, with no `args` input set) could silently
+// probe a non-version marker tag sitting on the exact same commit as the
+// real release instead of the release tag itself: verified live with a repo
+// carrying both `v1.6.0` and `ci-verified` on HEAD, `git describe --tags
+// --exact-match HEAD` returned `ci-verified`, and goproxycheck reported
+// "not-yet-indexed... retry in a minute, or use --wait" for a tag that will
+// never be indexed (it isn't a module version), while the real v1.6.0
+// release — fully live and ready right now — was never checked at all;
+// under --wait this polls uselessly to timeout every time.
+//
+// When there's more than one tag at HEAD, this now picks the one valid Go
+// module version among them (via semver.IsValid, the same check `go`
+// itself requires of a module version) rather than guessing, and returns a
+// clear error asking for an explicit module@version instead of silently
+// choosing when that's still ambiguous (none, or more than one, look like a
+// real version).
 func gitDescribeTag() (string, error) {
-	out, err := exec.Command("git", "describe", "--tags", "--exact-match", "HEAD").Output()
+	out, err := exec.Command("git", "tag", "--points-at", "HEAD").Output()
 	if err != nil {
-		return "", fmt.Errorf("git describe --tags --exact-match HEAD: %w (HEAD may not be tagged — pass module@version explicitly)", err)
+		return "", fmt.Errorf("git tag --points-at HEAD: %w (HEAD may not be tagged — pass module@version explicitly)", err)
 	}
-	return strings.TrimSpace(string(out)), nil
+	var tags []string
+	for _, t := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if t != "" {
+			tags = append(tags, t)
+		}
+	}
+	if len(tags) == 0 {
+		return "", fmt.Errorf("no tag points at HEAD (HEAD may not be tagged — pass module@version explicitly)")
+	}
+	if len(tags) == 1 {
+		return tags[0], nil
+	}
+
+	var versionTags []string
+	for _, t := range tags {
+		if semver.IsValid(t) {
+			versionTags = append(versionTags, t)
+		}
+	}
+	if len(versionTags) == 1 {
+		return versionTags[0], nil
+	}
+	return "", fmt.Errorf("HEAD has more than one tag (%s) and it's ambiguous which one is the release version — pass module@version explicitly", strings.Join(tags, ", "))
 }
