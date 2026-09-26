@@ -18,4 +18,4 @@ set of causes, not a guess.
 - [pkg.go.dev](https://pkg.go.dev/github.com/experimental-gains/goproxycheck): generated Go API docs
 
 ## Repo
-- [Source](https://github.com/experimental-gains/goproxycheck): MIT-licensed, zero dependencies, currently at v0.1.25
+- [Source](https://github.com/experimental-gains/goproxycheck): MIT-licensed, zero dependencies, currently at v0.1.29
