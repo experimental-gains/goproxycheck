@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"golang.org/x/mod/semver"
 )
@@ -184,6 +185,25 @@ func resolveTarget(args []string) (module, version string, err error) {
 		parts := strings.SplitN(args[0], "@", 2)
 		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 			return "", "", fmt.Errorf("argument must be in module@version form, got %q", args[0])
+		}
+		if strings.ContainsFunc(parts[1], unicode.IsSpace) {
+			// Confirmed live: a version query with a leading/trailing/embedded
+			// space (e.g. "v0.19.0 ", picked up from a copy-paste, a CI
+			// variable, or a file read with the newline only partly
+			// stripped) is not rejected up front by cmd/go the way a
+			// newline/colon/question-mark is ("disallowed version string") —
+			// go percent-encodes the space and sends the request anyway,
+			// gets a 404, and ultimately fails since no real tag or branch
+			// can ever contain whitespace (git's own ref-name rules forbid
+			// it: see git-check-ref-format). Before this check, goproxycheck
+			// probed the same malformed query and reported
+			// statusNotYetIndexed ("retry in a minute, or use --wait") —
+			// under --wait, this polled the full --timeout for a version
+			// string that will never be indexed because it was never a real
+			// version to begin with, the same shape of waste the
+			// statusZipBuildError/statusDeprecated early-break cases already
+			// exist to prevent for other permanent, non-timing failures.
+			return "", "", fmt.Errorf("version %q contains whitespace, which can never be part of a real module version, tag, or revision — check for a stray space or newline (e.g. from copy-paste, a shell variable, or a file read with a trailing newline)", parts[1])
 		}
 		return parts[0], parts[1], nil
 	}

@@ -114,6 +114,26 @@ func TestResolveTarget_TooManyArgs(t *testing.T) {
 	}
 }
 
+// TestResolveTarget_WhitespaceInVersion is a regression test for a real bug:
+// a version query with a leading, trailing, or embedded space (e.g. picked
+// up from copy-paste, a CI variable, or a file read with the newline only
+// partly stripped) used to sail through unrejected and get diagnosed as
+// statusNotYetIndexed ("retry in a minute, or use --wait") — misleading,
+// since no real tag or branch can ever contain whitespace (git disallows it
+// in ref names), so waiting could never make it "become indexed." Confirmed
+// live against the real proxy: cmd/go itself doesn't reject this input
+// up front either (unlike a literal newline, ":", or "?"), it percent-encodes
+// the space and gets a 404 like any other nonexistent version.
+func TestResolveTarget_WhitespaceInVersion(t *testing.T) {
+	for _, version := range []string{"v1.2.3 ", " v1.2.3", "v1.2\t.3", "v1.2.3\nv1.2.4"} {
+		t.Run(version, func(t *testing.T) {
+			if _, _, err := resolveTarget([]string{"example.com/mod@" + version}); err == nil {
+				t.Fatalf("expected an error for version %q containing whitespace", version)
+			}
+		})
+	}
+}
+
 func TestResolveTarget_FallbackToGoModAndGitTag(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
