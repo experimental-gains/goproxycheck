@@ -133,7 +133,14 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 			// statusRetracted right next to it: it's the maintainer's own
 			// go.mod saying "don't use this," not a proxy/sumdb timing issue
 			// — no amount of waiting changes a deprecation notice.
-			if !*wait || d.status == statusReady || d.status == statusModuleUnknown || d.status == statusBlocklistedMalicious || d.status == statusWrongImportPath || d.status == statusRetracted || d.status == statusDeprecated || d.status == statusZipBuildError || time.Now().After(deadline) {
+			// statusMajorVersionMismatch joins this list for the same reason
+			// as statusZipBuildError right above: a go.mod missing its
+			// required /vN path suffix at this tag is a permanent property
+			// of that tag, confirmed live against github.com/osrg/gobgp@
+			// v2.16.0 and others (see majorVersionMismatchMarker's doc
+			// comment) — no amount of polling makes an existing tag's go.mod
+			// grow the suffix it's missing.
+			if !*wait || d.status == statusReady || d.status == statusModuleUnknown || d.status == statusBlocklistedMalicious || d.status == statusWrongImportPath || d.status == statusRetracted || d.status == statusDeprecated || d.status == statusZipBuildError || d.status == statusMajorVersionMismatch || time.Now().After(deadline) {
 				break
 			}
 			time.Sleep(*interval)

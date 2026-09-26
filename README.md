@@ -130,6 +130,27 @@ actually seeing:
   says the module is fine, and it would report `ready` on exactly the
   import path a plain `go install` fails on. Reported by an external
   user, [issue #2](https://github.com/experimental-gains/goproxycheck/issues/2).
+- `invalid version: module contains a go.mod file, so module path must match
+  major version ("X/vN")` — a different import-path problem than the one
+  above: the *specific tagged version* you checked has a go.mod, but that
+  go.mod's module path doesn't carry the `/vN` suffix Go's semantic import
+  versioning rule requires for a v2-or-higher release
+  ([go.dev/ref/mod#major-version-suffix](https://go.dev/ref/mod#major-version-suffix)).
+  proxy.golang.org 404s this exact version outright with that message baked
+  into the body, and also excludes it from `@v/list` — so without a
+  dedicated check it looked exactly like ordinary indexing lag
+  (`not-yet-indexed`, "retry in a minute, or use --wait"), when it's actually
+  permanent: no wait or retry adds the missing suffix to a go.mod that's
+  already committed at that tag. Verified live (2026-09-26) against three
+  real, currently affected public repos: `@v/v2.16.0.info` for
+  `github.com/osrg/gobgp`, `@v/v2.14.2.info` for `github.com/mislav/hub`, and
+  `@v/v2.10.0.info` for `github.com/git-lfs/git-lfs` all return this exact
+  wording (module path and suggested suffix aside) with `@latest`/`@v/list`
+  both healthy the whole time — and `go get github.com/osrg/gobgp@v2.16.0`
+  in a real module fails outright with the identical message. `goproxycheck`
+  reports this as a distinct `major-version-mismatch` diagnosis (not
+  `not-yet-indexed`) and names the corrected path the proxy's own error
+  suggests.
 - You're checking a version the module's own maintainer retracted via a
   `retract` directive — retraction is advisory only, so `proxy.golang.org`,
   `sum.golang.org`, and a plain `go install`/`go get`/`go mod download` all

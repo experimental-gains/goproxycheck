@@ -131,6 +131,99 @@ func TestDiagnose_ZipBuildError(t *testing.T) {
 	}
 }
 
+// TestDiagnose_MajorVersionMismatch covers a real proxy.golang.org response
+// found by testing against github.com/osrg/gobgp@v2.16.0 (and, identically
+// worded but for a different suffix, github.com/mislav/hub and
+// github.com/git-lfs/git-lfs): @latest/@v/list are both healthy, but
+// @v/<version>.info 404s because the go.mod committed at that tag doesn't
+// carry the /v2 suffix Go's major-version-suffix rule requires. The version
+// also never appears in @v/list (the proxy excludes major-mismatched tags
+// from it), so before this fix it fell all the way through to
+// statusNotYetIndexed — "ordinary indexing lag ... retry in a minute" —
+// when the real `go get github.com/osrg/gobgp@v2.16.0` fails outright with
+// this exact message and will never succeed no matter how long you wait.
+func TestDiagnose_MajorVersionMismatch(t *testing.T) {
+	const body = `not found: github.com/osrg/gobgp@v2.16.0: invalid version: module contains a go.mod file, so module path must match major version ("github.com/osrg/gobgp/v2")`
+	listSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/github.com/osrg/gobgp/@latest":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, `{"Version":"v0.0.0-20211201041502-6248c576b118","Time":"2021-12-01T04:15:02Z"}`)
+		case "/github.com/osrg/gobgp/@v/list":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "v2.0.0+incompatible\n")
+		case "/github.com/osrg/gobgp/@v/v2.16.0.info":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = fmt.Fprint(w, body)
+		case "/github.com/osrg/gobgp/@v/v0.0.0-20211201041502-6248c576b118.mod":
+			// probe() fetches @latest's own .mod unconditionally to check
+			// for retract directives; this test isn't about that.
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "module github.com/osrg/gobgp\n")
+		default:
+			t.Fatalf("unexpected request to %s", r.URL.Path)
+		}
+	}))
+	defer listSrv.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/github.com/osrg/gobgp@v2.16.0": http.StatusNotFound,
+	})
+	defer sum.Close()
+
+	ep := endpoints{proxyBase: listSrv.URL, sumBase: sum.URL, client: listSrv.Client()}
+	r := ep.probe("github.com/osrg/gobgp", "v2.16.0")
+	got := diagnose(r)
+	if got.status != statusMajorVersionMismatch {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusMajorVersionMismatch, got.message)
+	}
+	if !strings.Contains(got.message, "github.com/osrg/gobgp/v2") {
+		t.Errorf("message = %q, want it to name the suggested path github.com/osrg/gobgp/v2", got.message)
+	}
+}
+
+// TestDiagnose_MajorVersionMismatch_NoSuggestion covers the defensive
+// fallback in majorVersionMismatchSuggestion: a body that contains the
+// marker substring but not the expected quoted-suggestion shape (in case a
+// future proxy wording tweak drops or reformats it) still gets diagnosed as
+// statusMajorVersionMismatch, just with generic advice instead of a named
+// replacement path.
+func TestDiagnose_MajorVersionMismatch_NoSuggestion(t *testing.T) {
+	const body = "not found: invalid version: module contains a go.mod file, so module path must match major version (unparseable)"
+	listSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/example.com/mod/@latest":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, `{"Version":"v0.1.0","Time":"2026-09-19T00:00:00Z"}`)
+		case "/example.com/mod/@v/list":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "v0.1.0\n")
+		case "/example.com/mod/@v/v2.0.0.info":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = fmt.Fprint(w, body)
+		case "/example.com/mod/@v/v0.1.0.mod":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "module example.com/mod\n")
+		default:
+			t.Fatalf("unexpected request to %s", r.URL.Path)
+		}
+	}))
+	defer listSrv.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/example.com/mod@v2.0.0": http.StatusNotFound,
+	})
+	defer sum.Close()
+
+	ep := endpoints{proxyBase: listSrv.URL, sumBase: sum.URL, client: listSrv.Client()}
+	r := ep.probe("example.com/mod", "v2.0.0")
+	got := diagnose(r)
+	if got.status != statusMajorVersionMismatch {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusMajorVersionMismatch, got.message)
+	}
+	if !strings.Contains(got.message, "add the matching /vN suffix") {
+		t.Errorf("message = %q, want the generic fallback advice", got.message)
+	}
+}
+
 // TestDiagnose_BlocklistedMalicious is the regression for a real, verified
 // misdiagnosis (run #122): proxy.golang.org returns 403 with a distinctive
 // plain-text body when it has flagged a specific module as malicious.

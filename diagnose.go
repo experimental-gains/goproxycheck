@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 )
 
@@ -27,6 +28,7 @@ const (
 	statusRetracted             status = "retracted"
 	statusDeprecated            status = "deprecated"
 	statusProxyError            status = "proxy-error"
+	statusMajorVersionMismatch  status = "major-version-mismatch"
 )
 
 // isRepoCheckRateLimited reports whether a repo-reachability probe status
@@ -82,6 +84,53 @@ func isBlocklistedMalicious(body string) bool {
 // a retry might reveal the real (permanent) zip-build-error instead.
 func isZipBuildError(body string) bool {
 	return strings.Contains(body, "create zip")
+}
+
+// majorVersionMismatchMarker is the distinctive substring proxy.golang.org
+// includes in the plain-text body of a 404 response when the requested
+// version has a go.mod file present, but that go.mod's module path doesn't
+// carry the major-version suffix required for the requested version — the
+// semantic import versioning rule (go.dev/ref/mod#major-version-suffix):
+// "If a module has a major version of 2 or higher, ... the module path must
+// have a corresponding /vN suffix". Confirmed live (2026-09-26) against
+// three real, independently affected public repos, all still exhibiting the
+// bug today (old tags predating a later /vN-suffix fix, still reachable by
+// an explicit version query): @v/v2.16.0.info for github.com/osrg/gobgp,
+// @v/v2.14.2.info for github.com/mislav/hub, and @v/v2.10.0.info for
+// github.com/git-lfs/git-lfs each 404 with this exact wording (differing
+// only in the module path and suggested suffix) — even though @latest and
+// @v/list are both healthy for all three (moduleKnown() is true, so this
+// isn't module-unknown either). `go get github.com/osrg/gobgp@v2.16.0` in a
+// real module reproduces the identical message verbatim and fails outright
+// (exit 1) — not the "wait and retry" situation a bare 404 for a listed
+// module usually means.
+//
+// Without this check, this 404 fell through to the not-yet-indexed/
+// negative-cache fallback at the bottom of diagnose (the requested version
+// never appears in @v/list either, since the proxy excludes major-version-
+// mismatched tags from it, so it landed on statusNotYetIndexed specifically)
+// — "ordinary indexing lag, retry in a minute, or use --wait", which is
+// actively wrong: this is a permanent property of the go.mod committed at
+// that tag, exactly like isZipBuildError right above. No amount of waiting
+// or retrying fixes it; only a new tag with the corrected module path does
+// (or, for a pre-existing tag, nothing — it can never resolve as requested).
+const majorVersionMismatchMarker = "so module path must match major version"
+
+// majorVersionMismatchSuggestionPattern extracts the parenthesized canonical
+// path proxy.golang.org's error body suggests, e.g. from `...major version
+// ("github.com/osrg/gobgp/v2")` this captures `github.com/osrg/gobgp/v2`.
+var majorVersionMismatchSuggestionPattern = regexp.MustCompile(`major version \("([^"]+)"\)`)
+
+// majorVersionMismatchSuggestion returns the corrected module path
+// proxy.golang.org's own error body names, or "" if the body doesn't match
+// the expected quoted-suggestion shape (defensive: callers fall back to
+// generic advice instead of interpolating a blank path into a message).
+func majorVersionMismatchSuggestion(body string) string {
+	m := majorVersionMismatchSuggestionPattern.FindStringSubmatch(body)
+	if m == nil {
+		return ""
+	}
+	return m[1]
 }
 
 // isProxyErrorStatus reports whether code is a "terminal error" response
@@ -291,6 +340,22 @@ func diagnose(r report) diagnosis {
 			"%s: the proxy can't build a module zip from this tag: %s. "+
 				"This is a permanent property of the tagged tree (a bad file name, an oversized file, a case-insensitive filename collision, or similar), not the negative-cache bug — cutting a new tag won't help unless it also fixes the underlying file problem.",
 			displayTarget(r), firstLine(r.versionInfo.body))}
+	}
+
+	// Checked alongside isZipBuildError above for the same reason: a 404 on
+	// r.versionInfo whose body carries this specific proxy-generated message
+	// is a permanent, structural failure, not the negative-cache/not-yet-
+	// indexed situation the fallback further down assumes — see
+	// majorVersionMismatchMarker's doc comment for the live verification.
+	if strings.Contains(r.versionInfo.body, majorVersionMismatchMarker) {
+		advice := "add the matching /vN suffix to the module path and cut a new tag"
+		if suggestion := majorVersionMismatchSuggestion(r.versionInfo.body); suggestion != "" {
+			advice = fmt.Sprintf("use %s instead of %s (if that's a real, existing version there — otherwise the module needs a new tag with that corrected path)", suggestion, r.module)
+		}
+		return diagnosis{statusMajorVersionMismatch, fmt.Sprintf(
+			"%s: this version has a go.mod file, but its module path doesn't carry the major-version suffix Go's semantic import versioning rule requires (go.dev/ref/mod#major-version-suffix) — proxy.golang.org refuses to serve it: %s. "+
+				"This isn't the negative-cache bug or ordinary indexing lag: it's a permanent property of the go.mod committed at this tag, so --wait and a retry can't fix it. %s.",
+			displayTarget(r), firstLine(r.versionInfo.body), advice)}
 	}
 
 	// The blocklist check above only sees @latest/@v/list, which catches a

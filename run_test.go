@@ -440,6 +440,56 @@ func TestRun_WaitStopsOnZipBuildError(t *testing.T) {
 	}
 }
 
+// majorVersionMismatchEndpoints simulates a version whose go.mod exists but
+// lacks the /vN major-version suffix the proxy requires (the real
+// github.com/osrg/gobgp@v2.16.0 shape) — a permanent property of that tag,
+// not indexing lag, so --wait must stop on the first probe instead of
+// polling it for the full --timeout.
+func majorVersionMismatchEndpoints(t *testing.T, hits *int) endpoints {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v0.1.0"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("v0.1.0\n"))
+		case strings.HasSuffix(r.URL.Path, ".info"):
+			*hits++
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`not found: example.com/mod@v2.0.0: invalid version: module contains a go.mod file, so module path must match major version ("example.com/mod/v2")`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return endpoints{proxyBase: srv.URL, sumBase: srv.URL, client: srv.Client()}
+}
+
+// TestRun_WaitStopsOnMajorVersionMismatch guards the run()-level early-break
+// list in the --wait polling loop the same way TestRun_WaitStopsOnZipBuildError
+// does for statusZipBuildError: before statusMajorVersionMismatch was added
+// to that list, `--wait` polled a doomed major-version-suffix mismatch at
+// the full --interval cadence for the entire --timeout instead of returning
+// after the first probe, since nothing about the tag's go.mod can ever
+// change by waiting.
+func TestRun_WaitStopsOnMajorVersionMismatch(t *testing.T) {
+	var hits int
+	ep := majorVersionMismatchEndpoints(t, &hits)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--wait", "--interval=1ms", "--timeout=5s", "example.com/mod@v2.0.0"}, &stdout, &stderr, ep)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stdout.String(), "major-version-mismatch") {
+		t.Errorf("stdout = %q, want it to mention major-version-mismatch", stdout.String())
+	}
+	if hits != 1 {
+		t.Fatalf(".info was probed %d times; want exactly 1 — --wait should stop immediately on a permanent major-version-mismatch instead of polling the full 5s timeout", hits)
+	}
+}
+
 // deprecatedEndpoints simulates a module whose go.mod deprecates it —
 // otherwise fully healthy (both .info and sum lookup succeed) — to check
 // that --wait stops on the first probe instead of polling a permanent
