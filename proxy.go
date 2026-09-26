@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"golang.org/x/mod/semver"
 )
 
 const (
@@ -75,27 +77,40 @@ type report struct {
 	// version (@v/<version>.mod), fetched only when versionInfo is a
 	// confirmed 200 — see canonicalModuleNote in diagnose.go for why.
 	modFile probeResult
-	// latestModFile is the go.mod body for the module's current @latest
-	// version — independent of whichever version was actually requested,
-	// and fetched whenever @latest succeeds. Real `go` only honors
-	// `retract` directives found in the go.mod of a module's latest
-	// release, not necessarily the checked version's own go.mod: confirmed
-	// live via `go list -m -retracted` that github.com/mattn/go-sqlite3@
-	// v2.0.3+incompatible correctly reports "(retracted)" even though that
-	// exact version predates Go modules and has no go.mod of its own (the
-	// proxy synthesizes a bare one for @v/v2.0.3+incompatible.mod with no
-	// retract directive at all) — the retraction is declared in v1.14.52's
-	// go.mod, the module's actual latest release. Using modFile here
-	// instead would silently miss every retraction of an old/+incompatible
-	// version this way. See retraction() in retract.go.
+	// latestModFile is the go.mod body of the highest tagged version in
+	// the module's *current* major-version line — not necessarily
+	// @latest's own version — independent of whichever version was
+	// actually requested, and fetched whenever @latest succeeds. Real `go`
+	// finds retract directives by loading go.mod from the version @latest
+	// would resolve to *before* retractions are considered
+	// (go.dev/ref/mod#go-mod-file-retract), not from @latest's own,
+	// already-retraction-filtered result — those two only diverge when the
+	// highest tag in the current major-version line is itself retracted.
+	// Confirmed live (2026-09) against github.com/jayconrod/retract, the
+	// Go team's own canonical self-retraction example: v1.0.1 retracts
+	// both itself and v1.0.0, so @latest resolves past both to v0.9.9,
+	// whose go.mod predates the retract directive and carries none —
+	// fetching info.Version's go.mod unconditionally (the old behavior)
+	// silently missed the retraction `go list -m -u` still correctly
+	// reports by reading v1.0.1's go.mod instead. See probe()'s
+	// normalizedMajor-scoped search and retraction() in retract.go.
 	//
-	// Known limitation: this only ever looks at the current latest
-	// release's go.mod, not at every version in between — real `go`'s own
-	// resolution walks the module graph more thoroughly, so a version
+	// "Highest tag" is scoped to @latest's own major-version line
+	// (collapsing v0/v1, matching golang.org/x/mod/semver.Major), not the
+	// true global maximum across @v/list: confirmed live against
+	// github.com/mattn/go-sqlite3@v2.0.3+incompatible — its highest tag
+	// overall is an abandoned, bare v2 experiment with no retract block of
+	// its own, while the retraction covering that exact version actually
+	// lives in the still-active v1.x line's go.mod (v1.14.52). Scoping by
+	// major line keeps both live-verified cases correct at once; using the
+	// unscoped global max would have regressed this one instead.
+	//
+	// Known limitation: this only ever looks at the current major-version
+	// line's highest tag, not at every version in between — real `go`'s
+	// own resolution walks the module graph more thoroughly, so a version
 	// retracted only by a later release that itself got superseded/retracted
 	// in turn is a case this could miss. Not worth chasing: this already
-	// catches the realistic case (a still-current release retracting an old
-	// version), the one confirmed live above.
+	// catches the realistic cases confirmed live above.
 	latestModFile probeResult
 	// repoReachable is set only when latest/list both failed and the module
 	// path is rooted at github.com: it distinguishes "the proxy has really
@@ -146,7 +161,16 @@ func (e endpoints) probe(module, version string) report {
 
 	if r.latest.ok {
 		if info, err := parseVersionInfo(r.latest.body); err == nil && info.Version != "" {
-			r.latestModFile = e.get(fmt.Sprintf("%s/%s/@v/%s.mod", e.proxyBase, mod, escapePath(info.Version)))
+			modVersion := info.Version
+			if r.list.ok {
+				wantMajor := normalizedMajor(modVersion)
+				for _, v := range r.listedVersions() {
+					if normalizedMajor(v) == wantMajor && semver.Compare(v, modVersion) > 0 {
+						modVersion = v
+					}
+				}
+			}
+			r.latestModFile = e.get(fmt.Sprintf("%s/%s/@v/%s.mod", e.proxyBase, mod, escapePath(modVersion)))
 		}
 	}
 
@@ -265,4 +289,22 @@ func parseVersionInfo(body string) (versionInfoBody, error) {
 	var v versionInfoBody
 	err := json.Unmarshal([]byte(body), &v)
 	return v, err
+}
+
+// normalizedMajor returns v's major-version-compatibility line, the way
+// the go command's own major-version-suffix rules group them: v0 and v1
+// collapse into the same implicit line (neither ever carries a path
+// suffix or +incompatible marker), while v2 and above are each their own
+// line. semver.Major returns "" for a string that isn't valid semver at
+// all; that can't happen for real proxy.golang.org data, but grouping it
+// with the v0/v1 line rather than treating it as a line of its own is the
+// conservative choice — it can only ever suppress a comparison, not
+// wrongly promote an invalid string to "highest tag."
+func normalizedMajor(v string) string {
+	switch m := semver.Major(v); m {
+	case "v0", "v1", "":
+		return "v1"
+	default:
+		return m
+	}
 }

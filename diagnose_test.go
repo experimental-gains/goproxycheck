@@ -587,6 +587,61 @@ func TestDiagnose_Retracted(t *testing.T) {
 	}
 }
 
+// TestDiagnose_RetractedPastSelfRetractingLatest is the end-to-end
+// counterpart of TestProbe_LatestModFileScopedPastSelfRetractingLatest
+// (proxy_more_test.go): reproduces github.com/jayconrod/retract, the Go
+// team's own canonical self-retraction example, at the diagnose() level.
+// v1.0.1 retracts both itself and v1.0.0, so @latest resolves past both to
+// v0.9.9, whose go.mod predates the `retract` directive and carries none.
+// `go list -m -u` still reports v1.0.0 as retracted (confirmed live,
+// 2026-09) by reading v1.0.1's go.mod instead — before this fix,
+// goproxycheck fetched v0.9.9's go.mod unconditionally as latestModFile and
+// reported plain statusReady for a version the maintainer explicitly
+// retracted.
+func TestDiagnose_RetractedPastSelfRetractingLatest(t *testing.T) {
+	const module = "github.com/jayconrod/retract"
+	const version = "v1.0.0"
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/" + module + "/@latest":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, `{"Version":"v0.9.9","Time":"2021-01-26T16:46:49Z"}`)
+		case "/" + module + "/@v/list":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "v1.0.0\nv0.9.9\nv1.0.1\n")
+		case "/" + module + "/@v/" + version + ".info":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2021-01-01T00:00:00Z"}`, version)
+		case "/" + module + "/@v/" + version + ".mod":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "module "+module+"\n\ngo 1.16\n")
+		case "/" + module + "/@v/v0.9.9.mod":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "module "+module+"\n\ngo 1.16\n")
+		case "/" + module + "/@v/v1.0.1.mod":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "module "+module+"\n\ngo 1.16\n\nretract (\n\tv1.0.0 // Published accidentally.\n\tv1.0.1 // For retractions only.\n)\n")
+		default:
+			t.Fatalf("unexpected request to %s", r.URL.Path)
+		}
+	}))
+	defer proxy.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/" + module + "@" + version: http.StatusOK,
+	})
+	defer sum.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, client: proxy.Client()}
+	r := ep.probe(module, version)
+	got := diagnose(r)
+	if got.status != statusRetracted {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusRetracted, got.message)
+	}
+	if !strings.Contains(got.message, `rationale given: "Published accidentally."`) {
+		t.Fatalf("expected the retraction rationale to be quoted, got: %s", got.message)
+	}
+}
+
 // TestDiagnose_RetractedRangeDoesNotCoverVersion checks the negative case:
 // a go.mod with a retract directive that exists but doesn't cover the
 // checked version (the common case for any module with retractions at
