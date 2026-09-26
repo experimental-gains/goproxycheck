@@ -89,6 +89,25 @@ actually seeing:
   `proxy.golang.org` unconditionally (what this tool did before this
   check existed) reported a false `module-unknown`, telling you to check
   for a typo when nothing was wrong at all.
+- `GOVCS disallows using git for public/private X; see 'go help vcs'` —
+  a local `GOVCS` policy (see `go help vcs`) blocks the direct VCS fetch
+  that a `GOPRIVATE`/`GONOPROXY` match or `GOPROXY=direct` would otherwise
+  use for a `github.com`-hosted module (the only host this tool knows the
+  VCS is git for certain). Without this check, `goproxycheck` used to
+  unconditionally claim such a fetch "will" succeed once it detected the
+  private-module or direct-proxy config, the same false-positive shape as
+  the two checks above — confirmed live that `GOPRIVATE=github.com/golang/protobuf
+  GOVCS=private:off go mod download github.com/golang/protobuf@v1.5.0`
+  fails outright with this exact message rather than fetching anything,
+  and that a plain `public:hg` (omitting git from the allowed list) does
+  the same under `GOPROXY=direct`. `goproxycheck` parses the same
+  ordered, earliest-rule-wins `pattern:vcslist` list `cmd/go` itself
+  applies (confirmed live across four orderings, including a specific
+  `github.com:...` rule placed both before and after a broader
+  `public:...` rule, proving the *earlier* rule wins regardless of which
+  is more specific) and reports a distinct `govcs-disallowed-locally`
+  diagnosis instead of the misleading `private-module-locally`/
+  `goproxy-direct-locally` verdict.
 - `git ls-remote -q origin ... exit status 128` / `could not read
   Username for 'https://github.com'` — this one bypasses the module
   proxy protocol entirely (Go fell back to a direct VCS fetch). Usually

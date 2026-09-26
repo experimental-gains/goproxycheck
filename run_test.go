@@ -192,6 +192,33 @@ func TestRun_LocalModulePrivate(t *testing.T) {
 	}
 }
 
+// TestRun_LocalModulePrivate_GovcsDisallowed is the fix for a real gap in
+// TestRun_LocalModulePrivate above: that test's message unconditionally
+// claimed `go install`/`go get` "will fetch it directly from its VCS host"
+// once GOPRIVATE/GONOPROXY matches, but confirmed live that a local GOVCS
+// setting excluding git for private modules makes the real command fail
+// outright instead — `GOPRIVATE=github.com/golang/protobuf
+// GOVCS=private:off go mod download github.com/golang/protobuf@v1.5.0`
+// fails with "GOVCS disallows using git for private
+// github.com/golang/protobuf; see 'go help vcs'", not a successful direct
+// fetch. Scoped to github.com (see githubRepoPattern) since that's the
+// only host this tool knows the VCS is git for certain.
+func TestRun_LocalModulePrivate_GovcsDisallowed(t *testing.T) {
+	t.Setenv("GOPRIVATE", "github.com/golang/protobuf")
+	t.Setenv("GOVCS", "private:off")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"github.com/golang/protobuf@v1.5.0"}, &stdout, &stderr, endpoints{})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "govcs-disallowed-locally") {
+		t.Errorf("stdout = %q, want it to mention govcs-disallowed-locally", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "private-module-locally") {
+		t.Errorf("stdout = %q, want it NOT to fall back to the plain private-module-locally message", stdout.String())
+	}
+}
+
 // TestRun_LocalModulePrivate_LeadingSpaceDoesNotMatch is the run()-level
 // regression case for the splitPatterns leading-space bug (see
 // pattern_test.go's TestSplitPatterns_LeadingSpaceBreaksMatch for the
@@ -240,6 +267,31 @@ func TestRun_LocalGoproxyDirect(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "goproxy-direct-locally") {
 		t.Errorf("stdout = %q, want it to mention goproxy-direct-locally", stdout.String())
+	}
+}
+
+// TestRun_LocalGoproxyDirect_GovcsDisallowed is the fix for the same gap as
+// TestRun_LocalModulePrivate_GovcsDisallowed above, for the GOPROXY=direct
+// path instead of the GOPRIVATE path: the goproxy-direct-locally message
+// used to only *mention* GOVCS as an unchecked caveat ("A real failure
+// here ... would show up as its own error straight from go"), when it can
+// check GOVCS directly instead. Confirmed live: `GOPROXY=direct
+// GOVCS=public:hg go mod download github.com/golang/protobuf@v1.5.0` fails
+// with "GOVCS disallows using git for public github.com/golang/protobuf",
+// not a successful direct fetch.
+func TestRun_LocalGoproxyDirect_GovcsDisallowed(t *testing.T) {
+	t.Setenv("GOPROXY", "direct")
+	t.Setenv("GOVCS", "public:hg")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"github.com/golang/protobuf@v1.5.0"}, &stdout, &stderr, endpoints{})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "govcs-disallowed-locally") {
+		t.Errorf("stdout = %q, want it to mention govcs-disallowed-locally", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "goproxy-direct-locally") {
+		t.Errorf("stdout = %q, want it NOT to fall back to the plain goproxy-direct-locally message", stdout.String())
 	}
 }
 
