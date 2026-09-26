@@ -203,16 +203,39 @@ func diagnose(r report) diagnosis {
 	// "ready, but note this" footnote — it's the maintainer's own explicit
 	// "don't use this version" signal, which matters regardless of whether
 	// sum.golang.org has caught up yet.
-	if r.latestModFile.ok {
+	//
+	// Gated on r.versionInfo.ok (unlike r.latestModFile.ok alone, which only
+	// reflects whether the *module* has a @latest, not whether the specific
+	// checked *version* was ever published): a retract range is written in
+	// version-number order, not against the set of versions that actually
+	// exist, so a version that was never tagged can still fall inside it —
+	// confirmed live (2026-09-26) against this file's own go-sqlite3 example,
+	// whose retract range is [v2.0.0+incompatible, v2.0.7+incompatible] but
+	// only v2.0.0-v2.0.3+incompatible were ever published (@v/list). Querying
+	// v2.0.5+incompatible — never tagged, confirmed 404 on both
+	// @v/v2.0.5+incompatible.info and a real `go install` ("unknown revision
+	// v2.0.5") — was misdiagnosed as statusRetracted with a message claiming
+	// it "resolves fine through proxy.golang.org and sum.golang.org" before
+	// this gate, the exact opposite of what a real `go install` does.
+	if r.versionInfo.ok && r.latestModFile.ok {
 		if rationale, retracted := retraction(r.latestModFile.body, r.checkVersion()); retracted {
 			explain := "no rationale was given in the retract directive"
 			if rationale != "" {
 				explain = fmt.Sprintf("rationale given: %q", rationale)
 			}
+			// r.versionInfo.ok only confirms the proxy has this version; a
+			// still-inflight sum.golang.org (r.sum.ok false) means it hasn't
+			// finished replicating yet, so the "will succeed" claim below
+			// must stay honestly scoped to that (same principle as the
+			// sumdb-lag diagnosis below, which this check runs ahead of).
+			resolves := "resolves fine through proxy.golang.org and sum.golang.org — a plain `go install` will succeed"
+			if !r.sum.ok {
+				resolves = "resolves through proxy.golang.org, but sum.golang.org hasn't caught up yet (ordinary indexing lag, not the negative-cache bug — see sumdb-lag)"
+			}
 			return diagnosis{statusRetracted, fmt.Sprintf(
-				"%s resolves fine through proxy.golang.org and sum.golang.org — a plain `go install` will succeed — but this exact version is covered by a `retract` directive in the module's own go.mod (%s). "+
+				"%s %s — but this exact version is covered by a `retract` directive in the module's own go.mod (%s). "+
 					"Retraction is advisory only: `go install`/`go get`/`go mod download` don't consult it and will fetch this version anyway; only `go list -m -u` surfaces it. This isn't a proxy-availability problem `--wait` or a retry can fix — it's the maintainer telling you not to use this version. Use a different version instead.",
-				displayTarget(r), explain)}
+				displayTarget(r), resolves, explain)}
 		}
 	}
 

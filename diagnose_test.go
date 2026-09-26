@@ -622,6 +622,57 @@ func TestDiagnose_RetractedRangeDoesNotCoverVersion(t *testing.T) {
 	}
 }
 
+// TestDiagnose_RetractedRangeCoversNeverPublishedVersion is modeled on a
+// real, live-verified case: github.com/mattn/go-sqlite3's go.mod retract
+// range [v2.0.0+incompatible, v2.0.7+incompatible] covers v2.0.4-v2.0.7, but
+// @v/list (confirmed live, 2026-09-26) shows only v2.0.0-v2.0.3+incompatible
+// were ever tagged — a retract range is written in version-number order, not
+// against the set of versions that actually exist. Querying
+// v2.0.5+incompatible must NOT report statusRetracted: @v/v2.0.5+incompatible
+// .info 404s for real ("unknown revision v2.0.5"), so a plain `go install`
+// fails outright, the opposite of what the pre-fix statusRetracted message
+// ("resolves fine through proxy.golang.org and sum.golang.org — a plain `go
+// install` will succeed") claimed.
+func TestDiagnose_RetractedRangeCoversNeverPublishedVersion(t *testing.T) {
+	const module = "github.com/mattn/go-sqlite3"
+	const version = "v2.0.5+incompatible"
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/" + module + "/@latest":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, `{"Version":"v1.14.52","Time":"2026-06-05T00:00:00Z"}`)
+		case "/" + module + "/@v/list":
+			// v2.0.4-v2.0.7+incompatible were never tagged; only the four
+			// listed here (plus the unrelated v1.x line) were.
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "v2.0.0+incompatible\nv2.0.1+incompatible\nv2.0.2+incompatible\nv2.0.3+incompatible\nv1.14.52\n")
+		case "/" + module + "/@v/" + version + ".info":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = fmt.Fprintf(w, "not found: %s@%s: invalid version: unknown revision v2.0.5", module, version)
+		case "/" + module + "/@v/v1.14.52.mod":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "module github.com/mattn/go-sqlite3\n\ngo 1.21\n\nretract (\n\t[v2.0.0+incompatible, v2.0.7+incompatible] // Accidental; no major changes or features.\n)\n")
+		default:
+			t.Fatalf("unexpected request to %s", r.URL.Path)
+		}
+	}))
+	defer proxy.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/" + module + "@" + version: http.StatusNotFound,
+	})
+	defer sum.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, client: proxy.Client()}
+	r := ep.probe(module, version)
+	got := diagnose(r)
+	if got.status == statusRetracted {
+		t.Fatalf("status = %s, want anything but retracted for a version that was never published; message: %s", got.status, got.message)
+	}
+	if got.status != statusNotYetIndexed {
+		t.Fatalf("status = %s, want not-yet-indexed (not in @v/list, never published); message: %s", got.status, got.message)
+	}
+}
+
 func TestDiagnose_NetworkError(t *testing.T) {
 	r := report{
 		module:  "example.com/mod",
