@@ -440,6 +440,56 @@ func TestRun_WaitStopsOnZipBuildError(t *testing.T) {
 	}
 }
 
+// deprecatedEndpoints simulates a module whose go.mod deprecates it —
+// otherwise fully healthy (both .info and sum lookup succeed) — to check
+// that --wait stops on the first probe instead of polling a permanent
+// deprecation notice for the full --timeout, the same waste
+// TestRun_WaitStopsOnZipBuildError guards against for statusZipBuildError.
+func deprecatedEndpoints(t *testing.T, hits *int) endpoints {
+	t.Helper()
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v0.1.0"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("v0.1.0\n"))
+		case strings.HasSuffix(r.URL.Path, ".info"):
+			*hits++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v0.1.0"}`))
+		case strings.HasSuffix(r.URL.Path, ".mod"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("// Deprecated: use example.com/mod2 instead.\nmodule example.com/mod\n"))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	t.Cleanup(proxy.Close)
+	sum := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(sum.Close)
+	return endpoints{proxyBase: proxy.URL, sumBase: sum.URL, client: proxy.Client()}
+}
+
+func TestRun_WaitStopsOnDeprecated(t *testing.T) {
+	var hits int
+	ep := deprecatedEndpoints(t, &hits)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--wait", "--interval=1ms", "--timeout=5s", "example.com/mod@v0.1.0"}, &stdout, &stderr, ep)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stdout.String(), "deprecated") {
+		t.Errorf("stdout = %q, want it to mention deprecated", stdout.String())
+	}
+	if hits != 1 {
+		t.Fatalf(".info was probed %d times; want exactly 1 — --wait should stop immediately on a permanent deprecation notice instead of polling the full 5s timeout", hits)
+	}
+}
+
 // sumdbLagEndpoints simulates the module proxy already having the version
 // (@latest/@v/list/.info all 200) while sum.golang.org hasn't caught up yet
 // (lookup 404) — the same shape TestDiagnose_SumdbLag uses at the diagnose()

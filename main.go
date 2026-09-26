@@ -128,7 +128,11 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 			// --wait --timeout=300ms: it polled the full 300ms instead of
 			// returning immediately, the same shape of waste this list
 			// already exists to prevent for the other permanent statuses.
-			if !*wait || d.status == statusReady || d.status == statusModuleUnknown || d.status == statusBlocklistedMalicious || d.status == statusWrongImportPath || d.status == statusRetracted || d.status == statusZipBuildError || time.Now().After(deadline) {
+			// statusDeprecated joins this list for the same reason as
+			// statusRetracted right next to it: it's the maintainer's own
+			// go.mod saying "don't use this," not a proxy/sumdb timing issue
+			// — no amount of waiting changes a deprecation notice.
+			if !*wait || d.status == statusReady || d.status == statusModuleUnknown || d.status == statusBlocklistedMalicious || d.status == statusWrongImportPath || d.status == statusRetracted || d.status == statusDeprecated || d.status == statusZipBuildError || time.Now().After(deadline) {
 				break
 			}
 			time.Sleep(*interval)

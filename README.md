@@ -141,6 +141,21 @@ actually seeing:
   and installs cleanly. `goproxycheck` reports this as a distinct
   `retracted` diagnosis (not `ready`) instead of missing the one signal —
   the maintainer's own go.mod — that says "don't use this."
+- `go: module X is deprecated: ...` — the module's own go.mod carries a
+  `// Deprecated:` comment on its `module` directive, a whole-module
+  version of the retraction signal above: advisory only, so
+  `proxy.golang.org`, `sum.golang.org`, and a plain `go install`/`go get`
+  still work fine, but `go get` itself prints this warning first. Verified
+  live against a real deprecation: `github.com/golang/protobuf`'s go.mod
+  (as of its latest tag) carries `// Deprecated: Use the
+  "google.golang.org/protobuf" module instead.` — and even `go get
+  github.com/golang/protobuf@v1.3.0`, a version tagged years before that
+  comment was added, still prints the warning, because `go` reads the
+  notice from the module's current latest go.mod, not the checked
+  version's own. `goproxycheck` reports this as a distinct `deprecated`
+  diagnosis (not `ready`), reading it from the same latest-tag go.mod
+  fetch already made for retraction, so it catches this for every version
+  of a deprecated module, not just ones tagged after the notice existed.
 - `proxy.golang.org` or `sum.golang.org` answers with something other than
   `200`, `404`, or `410` — a `429`, `500`, `502`, `503`, or any other
   status. Per the documented [GOPROXY

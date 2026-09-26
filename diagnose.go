@@ -25,6 +25,7 @@ const (
 	statusRepoCheckInconclusive status = "repo-check-inconclusive"
 	statusWrongImportPath       status = "wrong-import-path"
 	statusRetracted             status = "retracted"
+	statusDeprecated            status = "deprecated"
 	statusProxyError            status = "proxy-error"
 )
 
@@ -236,6 +237,40 @@ func diagnose(r report) diagnosis {
 				"%s %s — but this exact version is covered by a `retract` directive in the module's own go.mod (%s). "+
 					"Retraction is advisory only: `go install`/`go get`/`go mod download` don't consult it and will fetch this version anyway; only `go list -m -u` surfaces it. This isn't a proxy-availability problem `--wait` or a retry can fix — it's the maintainer telling you not to use this version. Use a different version instead.",
 				displayTarget(r), resolves, explain)}
+		}
+	}
+
+	// Checked ahead of ready/sumdb-lag for the same reason as retraction
+	// above, and using the same r.latestModFile (not r.modFile): deprecation
+	// is a whole-module notice attached to the `module` directive, not a
+	// per-version property, so it doesn't affect proxy/sumdb availability
+	// either — `go install`/`go get` fetch a deprecated module exactly like
+	// any other, they just also print a warning first. Confirmed live
+	// (2026-09-26): `go get github.com/golang/protobuf@v1.3.0` prints "go:
+	// module github.com/golang/protobuf is deprecated: Use the
+	// \"google.golang.org/protobuf\" module instead." even though v1.3.0's
+	// own go.mod predates the deprecation comment entirely — see
+	// deprecation's doc comment for why r.latestModFile (not r.modFile) is
+	// the right source, mirroring probe()'s normalizedMajor-scoped fetch.
+	//
+	// Checked after retraction rather than before: retraction is the more
+	// specific, more urgent signal (this exact version, not just the module
+	// in general), so it takes priority on the rare version that's somehow
+	// both. Every other version of a deprecated module still gets this
+	// check, unaffected by whether that particular version happens to also
+	// be retracted.
+	if r.versionInfo.ok && r.latestModFile.ok {
+		if message, deprecated := deprecation(r.latestModFile.body); deprecated {
+			// Same honest scoping as the retraction diagnosis above: don't
+			// claim sum.golang.org is caught up when r.sum.ok says otherwise.
+			resolves := "resolves fine through proxy.golang.org and sum.golang.org — a plain `go install` will succeed"
+			if !r.sum.ok {
+				resolves = "resolves through proxy.golang.org, but sum.golang.org hasn't caught up yet (ordinary indexing lag, not the negative-cache bug — see sumdb-lag)"
+			}
+			return diagnosis{statusDeprecated, fmt.Sprintf(
+				"%s %s, but will also print a warning first: the module's own go.mod deprecates it (%q). "+
+					"Like retraction, this is advisory only: `go install`/`go get`/`go mod download` still fetch it. Unlike retraction, this applies to every version of the module, not just this one — check the deprecation message for what to use instead.",
+				displayTarget(r), resolves, message)}
 		}
 	}
 

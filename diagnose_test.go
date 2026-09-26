@@ -728,6 +728,142 @@ func TestDiagnose_RetractedRangeCoversNeverPublishedVersion(t *testing.T) {
 	}
 }
 
+// TestDiagnose_Deprecated is modeled on a real, live-verified case:
+// github.com/golang/protobuf's go.mod (at its latest tag, v1.5.4) carries
+//
+//	// Deprecated: Use the "google.golang.org/protobuf" module instead.
+//	module github.com/golang/protobuf
+//
+// Confirmed live (2026-09-26) that proxy.golang.org and sum.golang.org both
+// serve v1.5.4 cleanly and `go get github.com/golang/protobuf@v1.5.4`
+// succeeds outright — but also prints "go: module github.com/golang/protobuf
+// is deprecated: Use the \"google.golang.org/protobuf\" module instead."
+// first. Before this diagnosis existed, goproxycheck reported this module as
+// plain statusReady with no mention of it at all.
+func TestDiagnose_Deprecated(t *testing.T) {
+	const module = "github.com/golang/protobuf"
+	const version = "v1.5.4"
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/" + module + "/@latest", "/" + module + "/@v/" + version + ".info":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2024-03-06T06:45:40Z"}`, version)
+		case "/" + module + "/@v/list":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, "%s\n", version)
+		case "/" + module + "/@v/" + version + ".mod":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "// Deprecated: Use the \"google.golang.org/protobuf\" module instead.\nmodule "+module+"\n\ngo 1.17\n")
+		default:
+			t.Fatalf("unexpected request to %s", r.URL.Path)
+		}
+	}))
+	defer proxy.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/" + module + "@" + version: http.StatusOK,
+	})
+	defer sum.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, client: proxy.Client()}
+	r := ep.probe(module, version)
+	got := diagnose(r)
+	if got.status != statusDeprecated {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusDeprecated, got.message)
+	}
+	if !strings.Contains(got.message, `Use the \"google.golang.org/protobuf\" module instead.`) {
+		t.Fatalf("expected the deprecation message to be quoted, got: %s", got.message)
+	}
+	if !strings.Contains(got.message, "go install") {
+		t.Fatalf("expected the message to note `go install` still succeeds despite the deprecation, got: %s", got.message)
+	}
+}
+
+// TestDiagnose_DeprecatedPastNotice is the deprecation counterpart of
+// TestDiagnose_RetractedPastSelfRetractingLatest: confirms deprecation is
+// read from r.latestModFile, not the checked version's own r.modFile.
+// Confirmed live (2026-09-26): github.com/golang/protobuf@v1.3.0's own
+// go.mod predates the deprecation comment entirely (added later, only as of
+// the module's actual latest release, v1.5.4) — yet `go get
+// github.com/golang/protobuf@v1.3.0` still prints the deprecation warning.
+// Reading the checked version's own modFile instead would miss this for
+// every version published before the notice was added.
+func TestDiagnose_DeprecatedPastNotice(t *testing.T) {
+	const module = "github.com/golang/protobuf"
+	const version = "v1.3.0"
+	const latest = "v1.5.4"
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/" + module + "/@latest":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2024-03-06T06:45:40Z"}`, latest)
+		case "/" + module + "/@v/list":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, "%s\n%s\n", version, latest)
+		case "/" + module + "/@v/" + version + ".info":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2019-01-01T00:00:00Z"}`, version)
+		case "/" + module + "/@v/" + version + ".mod":
+			// No deprecation comment here — this version predates it.
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "module "+module+"\n")
+		case "/" + module + "/@v/" + latest + ".mod":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "// Deprecated: Use the \"google.golang.org/protobuf\" module instead.\nmodule "+module+"\n\ngo 1.17\n")
+		default:
+			t.Fatalf("unexpected request to %s", r.URL.Path)
+		}
+	}))
+	defer proxy.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/" + module + "@" + version: http.StatusOK,
+	})
+	defer sum.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, client: proxy.Client()}
+	r := ep.probe(module, version)
+	got := diagnose(r)
+	if got.status != statusDeprecated {
+		t.Fatalf("status = %s, want %s (deprecation notice added after this version was tagged); message: %s", got.status, statusDeprecated, got.message)
+	}
+}
+
+// TestDiagnose_RetractedTakesPriorityOverDeprecated checks the ordering
+// decision in diagnose(): when a checked version is covered by both a
+// retract directive and a whole-module deprecation notice in the same
+// go.mod, retraction (the more specific, this-exact-version signal) wins
+// over deprecation (the more general, every-version-of-this-module signal).
+func TestDiagnose_RetractedTakesPriorityOverDeprecated(t *testing.T) {
+	const module = "example.com/mod"
+	const version = "v1.0.0"
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/" + module + "/@latest", "/" + module + "/@v/" + version + ".info":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, `{"Version":%q}`, version)
+		case "/" + module + "/@v/list":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, "%s\n", version)
+		case "/" + module + "/@v/" + version + ".mod":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "// Deprecated: use example.com/mod2 instead.\nmodule "+module+"\n\nretract v1.0.0 // bad release\n")
+		default:
+			t.Fatalf("unexpected request to %s", r.URL.Path)
+		}
+	}))
+	defer proxy.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/" + module + "@" + version: http.StatusOK,
+	})
+	defer sum.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, client: proxy.Client()}
+	r := ep.probe(module, version)
+	got := diagnose(r)
+	if got.status != statusRetracted {
+		t.Fatalf("status = %s, want %s (retraction should take priority over deprecation); message: %s", got.status, statusRetracted, got.message)
+	}
+}
+
 func TestDiagnose_NetworkError(t *testing.T) {
 	r := report{
 		module:  "example.com/mod",
