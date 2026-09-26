@@ -114,7 +114,21 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 						displayTarget(r), reason)}
 				}
 			}
-			if !*wait || d.status == statusReady || d.status == statusModuleUnknown || d.status == statusBlocklistedMalicious || d.status == statusWrongImportPath || d.status == statusRetracted || time.Now().After(deadline) {
+			// statusZipBuildError belongs in this early-break list for the same
+			// reason as the other four: diagnose's own message for it says
+			// this outright ("This is a permanent property of the tagged
+			// tree... cutting a new tag won't help unless it also fixes the
+			// underlying file problem") — waiting cannot change a
+			// case-insensitive filename collision or oversized file in the
+			// tagged tree. Before this, `--wait` polled a doomed zip-build
+			// error at the full --interval cadence for the entire --timeout
+			// (5 minutes by default), hammering proxy.golang.org for an
+			// answer that was already final on the first probe — reproduced
+			// live with a fake proxy serving a "create zip" 404 under
+			// --wait --timeout=300ms: it polled the full 300ms instead of
+			// returning immediately, the same shape of waste this list
+			// already exists to prevent for the other permanent statuses.
+			if !*wait || d.status == statusReady || d.status == statusModuleUnknown || d.status == statusBlocklistedMalicious || d.status == statusWrongImportPath || d.status == statusRetracted || d.status == statusZipBuildError || time.Now().After(deadline) {
 				break
 			}
 			time.Sleep(*interval)

@@ -389,6 +389,57 @@ func TestRun_WaitTimesOut(t *testing.T) {
 	}
 }
 
+// zipBuildErrorEndpoints simulates a tag the proxy can never turn into a
+// module zip (e.g. a case-insensitive filename collision) — a permanent
+// property of the tagged tree, not indexing lag, so --wait must stop on the
+// first probe instead of polling it for the full --timeout.
+func zipBuildErrorEndpoints(t *testing.T, hits *int) endpoints {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v0.1.0"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("v0.1.0\n"))
+		case strings.HasSuffix(r.URL.Path, ".info"):
+			*hits++
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte("fetch: create zip: some/BAD and some/bad differ only by case"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return endpoints{proxyBase: srv.URL, sumBase: srv.URL, client: srv.Client()}
+}
+
+// TestRun_WaitStopsOnZipBuildError guards the run()-level early-break list in
+// the --wait polling loop: before this, statusZipBuildError was missing from
+// it (unlike statusModuleUnknown/statusBlocklistedMalicious/
+// statusWrongImportPath/statusRetracted, the other permanent, waiting-can't-
+// fix-this statuses), so `--wait` polled a doomed zip-build error at the
+// full --interval cadence for the entire --timeout — reproduced live before
+// the fix with a 300ms timeout that polled the full duration instead of
+// returning after the first probe. Asserting hits == 1 (not an elapsed-time
+// bound) keeps this deterministic instead of timing-flaky.
+func TestRun_WaitStopsOnZipBuildError(t *testing.T) {
+	var hits int
+	ep := zipBuildErrorEndpoints(t, &hits)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--wait", "--interval=1ms", "--timeout=5s", "example.com/mod@v0.1.0"}, &stdout, &stderr, ep)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stdout.String(), "zip-build-error") {
+		t.Errorf("stdout = %q, want it to mention zip-build-error", stdout.String())
+	}
+	if hits != 1 {
+		t.Fatalf(".info was probed %d times; want exactly 1 — --wait should stop immediately on a permanent zip-build-error instead of polling the full 5s timeout", hits)
+	}
+}
+
 // sumdbLagEndpoints simulates the module proxy already having the version
 // (@latest/@v/list/.info all 200) while sum.golang.org hasn't caught up yet
 // (lookup 404) — the same shape TestDiagnose_SumdbLag uses at the diagnose()
