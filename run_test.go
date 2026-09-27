@@ -219,6 +219,36 @@ func TestRun_LocalModulePrivate_GovcsDisallowed(t *testing.T) {
 	}
 }
 
+// TestRun_LocalModulePrivate_GovcsMalformed covers a gap in
+// TestRun_LocalModulePrivate_GovcsDisallowed just above: that test's
+// govcs-disallowed-locally message is only reachable at all if the local
+// GOVCS string parses in the first place. Confirmed live (2026-09-27,
+// GOPROXY=direct against a fresh GOMODCACHE): with an unrelated, malformed
+// entry placed *ahead* of an otherwise fully permissive "public:git|hg" rule
+// in GOVCS, `go mod download -x` for a public module fails outright with
+// `malformed entry in GOVCS (missing colon): "badrule"` — never even
+// reaching the permissive rule — while goproxycheck's govcsAllowsGit (by
+// design, see its own doc comment) skips the unparseable rule and falls
+// through, so before this fix it reported statusPrivateModuleLocally
+// ("will fetch it directly ... succeed") for a config that actually makes
+// every direct-VCS fetch fail. See govcsConfigError's doc comment for the
+// four other malformed shapes confirmed the same way.
+func TestRun_LocalModulePrivate_GovcsMalformed(t *testing.T) {
+	t.Setenv("GOPRIVATE", "github.com/golang/protobuf")
+	t.Setenv("GOVCS", "badrule,public:git|hg")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"github.com/golang/protobuf@v1.5.0"}, &stdout, &stderr, endpoints{})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "govcs-malformed-locally") {
+		t.Errorf("stdout = %q, want it to mention govcs-malformed-locally", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "private-module-locally") || strings.Contains(stdout.String(), "govcs-disallowed-locally") {
+		t.Errorf("stdout = %q, want it NOT to fall back to private-module-locally or govcs-disallowed-locally", stdout.String())
+	}
+}
+
 // TestRun_LocalModulePrivate_LeadingSpaceDoesNotMatch is the run()-level
 // regression case for the splitPatterns leading-space bug (see
 // pattern_test.go's TestSplitPatterns_LeadingSpaceBreaksMatch for the
@@ -292,6 +322,27 @@ func TestRun_LocalGoproxyDirect_GovcsDisallowed(t *testing.T) {
 	}
 	if strings.Contains(stdout.String(), "goproxy-direct-locally") {
 		t.Errorf("stdout = %q, want it NOT to fall back to the plain goproxy-direct-locally message", stdout.String())
+	}
+}
+
+// TestRun_LocalGoproxyDirect_GovcsMalformed is the same gap as
+// TestRun_LocalModulePrivate_GovcsMalformed above, for the GOPROXY=direct
+// path instead of the GOPRIVATE path — see that test's comment for the live
+// verification (the same malformed-GOVCS shape applies regardless of why the
+// fetch needs to go direct).
+func TestRun_LocalGoproxyDirect_GovcsMalformed(t *testing.T) {
+	t.Setenv("GOPROXY", "direct")
+	t.Setenv("GOVCS", "badrule,public:git|hg")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"github.com/golang/protobuf@v1.5.0"}, &stdout, &stderr, endpoints{})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "govcs-malformed-locally") {
+		t.Errorf("stdout = %q, want it to mention govcs-malformed-locally", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "goproxy-direct-locally") || strings.Contains(stdout.String(), "govcs-disallowed-locally") {
+		t.Errorf("stdout = %q, want it NOT to fall back to goproxy-direct-locally or govcs-disallowed-locally", stdout.String())
 	}
 }
 

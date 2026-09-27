@@ -30,6 +30,7 @@ const (
 	statusProxyError             status = "proxy-error"
 	statusMajorVersionMismatch   status = "major-version-mismatch"
 	statusGovcsDisallowedLocally status = "govcs-disallowed-locally"
+	statusGovcsMalformedLocally  status = "govcs-malformed-locally"
 	statusUnknownRevision        status = "unknown-revision"
 )
 

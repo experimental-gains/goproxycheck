@@ -63,3 +63,50 @@ func TestLocalGovcsAllowsGit(t *testing.T) {
 		t.Errorf("localGovcsAllowsGit with GOVCS=public:git|hg = %v, want true", got)
 	}
 }
+
+// TestGovcsConfigError covers govcsConfigError against the five malformed
+// shapes confirmed live against a real toolchain (2026-09-27, GOPROXY=direct
+// against a fresh GOMODCACHE so the direct-VCS/checkGOVCS path is actually
+// exercised — see govcsConfigError's doc comment for the exact commands and
+// error text `go mod download -x` produced for each): a plain, well-formed
+// config (and the unset/empty case) must report no error, since a false
+// positive here would make run() claim a fetch fails when it wouldn't.
+func TestGovcsConfigError(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		wantErr bool
+	}{
+		{"unset/empty is well-formed", "", false},
+		{"ordinary two-rule config is well-formed", "private:all,public:git|hg", false},
+		{"a normal single pattern rule is well-formed", "github.com/myorg/*:git", false},
+		{"empty entry from a double comma", "public:git|hg,,private:all", true},
+		{"leading/trailing comma also produces an empty entry", ",public:git|hg", true},
+		{"entry missing its colon", "badrule,public:git|hg", true},
+		{"empty pattern", ":git", true},
+		{"empty VCS list", "public:", true},
+		{"relative pattern", "./foo:git", true},
+		{"duplicate pattern later in the list is unreachable", "public:git,public:hg", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := govcsConfigError(c.raw)
+			if (err != nil) != c.wantErr {
+				t.Errorf("govcsConfigError(%q) = %v, want error: %v", c.raw, err, c.wantErr)
+			}
+		})
+	}
+}
+
+// TestLocalGovcsConfigError covers the go-env-reading wrapper the same way
+// TestLocalGovcsAllowsGit covers localGovcsAllowsGit.
+func TestLocalGovcsConfigError(t *testing.T) {
+	t.Setenv("GOVCS", "badrule,public:git|hg")
+	if err := localGovcsConfigError(); err == nil {
+		t.Error("localGovcsConfigError with GOVCS=badrule,public:git|hg = nil, want a malformed-entry error")
+	}
+	t.Setenv("GOVCS", "public:git|hg")
+	if err := localGovcsConfigError(); err != nil {
+		t.Errorf("localGovcsConfigError with GOVCS=public:git|hg = %v, want nil", err)
+	}
+}
