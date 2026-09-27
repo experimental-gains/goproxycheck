@@ -249,6 +249,46 @@ func TestRun_LocalModulePrivate_GovcsMalformed(t *testing.T) {
 	}
 }
 
+// TestRun_LocalModulePrivate_GovcsUsesGoprivateNotGonoproxy is the fix for a
+// real gap in TestRun_LocalModulePrivate_GovcsDisallowed above: that test's
+// GOPRIVATE and GONOPROXY patterns always matched the same module, so it
+// couldn't catch this tool passing the *wrong* private/public bool into the
+// GOVCS check. Real cmd/go's own "public"/"private" classification for GOVCS
+// (internal/vcs/vcs.go's checkGOVCS) always checks GOPRIVATE specifically —
+// never GONOPROXY, despite GONOPROXY defaulting to GOPRIVATE's value when
+// unset — regardless of *why* a direct VCS fetch is happening. Confirmed
+// live (2026-09-27) with GOPRIVATE and GONOPROXY deliberately set to
+// different, non-overlapping patterns: GOPRIVATE=nonmatching.example/*
+// (does NOT match), GONOPROXY=github.com/golang/protobuf (matches, forcing
+// this tool's localModulePrivate short-circuit), GOVCS="public:off,
+// private:git" — `go mod download -x github.com/golang/protobuf@v1.5.0`
+// fails with "GOVCS disallows using git for *public* github.com/golang/
+// protobuf", i.e. real go classified it public (per GOPRIVATE) despite
+// GONOPROXY's match, so the permissive "private:git" rule never applies.
+// Before this fix, run() hardcoded `true` for this branch's private bool
+// (matching GONOPROXY, not GOPRIVATE), so it evaluated "private:git"
+// instead and reported statusPrivateModuleLocally ("will fetch it directly
+// ... succeed") for a config a real `go install` refuses outright.
+func TestRun_LocalModulePrivate_GovcsUsesGoprivateNotGonoproxy(t *testing.T) {
+	t.Setenv("GOPRIVATE", "nonmatching.example/*")
+	t.Setenv("GONOPROXY", "github.com/golang/protobuf")
+	t.Setenv("GOVCS", "public:off,private:git")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"github.com/golang/protobuf@v1.5.0"}, &stdout, &stderr, endpoints{})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "govcs-disallowed-locally") {
+		t.Errorf("stdout = %q, want it to mention govcs-disallowed-locally", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "public") {
+		t.Errorf("stdout = %q, want it to say the module was classified public (per GOPRIVATE, not GONOPROXY)", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "private-module-locally") {
+		t.Errorf("stdout = %q, want it NOT to fall back to the plain private-module-locally message", stdout.String())
+	}
+}
+
 // TestRun_LocalModulePrivate_LeadingSpaceDoesNotMatch is the run()-level
 // regression case for the splitPatterns leading-space bug (see
 // pattern_test.go's TestSplitPatterns_LeadingSpaceBreaksMatch for the
@@ -343,6 +383,45 @@ func TestRun_LocalGoproxyDirect_GovcsMalformed(t *testing.T) {
 	}
 	if strings.Contains(stdout.String(), "goproxy-direct-locally") || strings.Contains(stdout.String(), "govcs-disallowed-locally") {
 		t.Errorf("stdout = %q, want it NOT to fall back to goproxy-direct-locally or govcs-disallowed-locally", stdout.String())
+	}
+}
+
+// TestRun_LocalGoproxyDirect_GovcsUsesGoprivateNotGonoproxy is the mirror
+// case of TestRun_LocalModulePrivate_GovcsUsesGoprivateNotGonoproxy above,
+// for the GOPROXY=direct path instead of the GONOPROXY-match path: real
+// go's GOVCS private/public classification checks GOPRIVATE regardless of
+// *why* the fetch went direct, including when it's GOPROXY=direct itself
+// (an unrelated reason) rather than a GONOPROXY match. Confirmed live
+// (2026-09-27) with GOPROXY=direct, GOPRIVATE=github.com/golang/protobuf
+// (matches), GONOPROXY=nonmatching.example/* (deliberately set to NOT
+// match, overriding its usual GOPRIVATE fallback) and GOVCS="private:off,
+// public:git": `go mod download -x github.com/golang/protobuf@v1.5.0`
+// fails with "GOVCS disallows using git for *private* github.com/golang/
+// protobuf" — real go classified it private purely off GOPRIVATE, even
+// though GONOPROXY (the pattern this tool's GOPROXY=direct branch used to
+// check against, via a hardcoded `false`) didn't match at all. Before this
+// fix, run() hardcoded `false` for this branch's private bool, so it
+// evaluated "public:git" instead and reported statusGoproxyDirectLocally
+// ("will fetch it ... never through proxy.golang.org") for a config a real
+// `go install` refuses outright.
+func TestRun_LocalGoproxyDirect_GovcsUsesGoprivateNotGonoproxy(t *testing.T) {
+	t.Setenv("GOPROXY", "direct")
+	t.Setenv("GOPRIVATE", "github.com/golang/protobuf")
+	t.Setenv("GONOPROXY", "nonmatching.example/*")
+	t.Setenv("GOVCS", "private:off,public:git")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"github.com/golang/protobuf@v1.5.0"}, &stdout, &stderr, endpoints{})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "govcs-disallowed-locally") {
+		t.Errorf("stdout = %q, want it to mention govcs-disallowed-locally", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "private") {
+		t.Errorf("stdout = %q, want it to say the module was classified private (per GOPRIVATE, not GONOPROXY)", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "goproxy-direct-locally") {
+		t.Errorf("stdout = %q, want it NOT to fall back to the plain goproxy-direct-locally message", stdout.String())
 	}
 }
 

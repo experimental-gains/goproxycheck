@@ -84,17 +84,18 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 		// for why other hosts are out of scope) — but the parse-error check
 		// ahead of it needs no such certainty, since a malformed GOVCS string
 		// breaks every direct fetch regardless of host or VCS type.
+		govcsPrivate := localGovcsPrivate(module)
 		switch govcsErr := localGovcsConfigError(); {
 		case govcsErr != nil:
 			d = diagnosis{statusGovcsMalformedLocally, fmt.Sprintf(
 				"your local `GOPRIVATE`/`GONOPROXY` config matches %s via the pattern %q, so `go install`/`go get` would normally fetch it directly from its VCS host — but your local `GOVCS` setting is itself malformed (%v), which makes every direct-VCS-requiring `go` command fail outright with this exact parse error, not just for this module, and regardless of whether some other rule in the list would otherwise have allowed it. "+
 					"That's your machine's own config, not a proxy-availability problem, and this tool's proxy/sumdb checks don't apply to it either way. Fix your `GOVCS` setting (see `go help vcs`) — real `go` validates the whole list up front, so one bad entry anywhere breaks every direct fetch.",
 				module, pattern, govcsErr)}
-		case githubRepoPattern.MatchString(module) && !localGovcsAllowsGit(module, true):
+		case githubRepoPattern.MatchString(module) && !localGovcsAllowsGit(module, govcsPrivate):
 			d = diagnosis{statusGovcsDisallowedLocally, fmt.Sprintf(
-				"your local `GOPRIVATE`/`GONOPROXY` config matches %s via the pattern %q, so `go install`/`go get` would normally fetch it directly from its VCS host — but your local `GOVCS` setting disallows git for this (private) module, so the real command fails outright with `GOVCS disallows using git for private %[1]s; see 'go help vcs'` instead of succeeding. "+
+				"your local `GOPRIVATE`/`GONOPROXY` config matches %s via the pattern %q, so `go install`/`go get` would normally fetch it directly from its VCS host — but your local `GOVCS` setting disallows git for this (%[3]s) module, so the real command fails outright with `GOVCS disallows using git for %[3]s %[1]s; see 'go help vcs'` instead of succeeding. "+
 					"That's your machine's own config, not a proxy-availability problem, and this tool's proxy/sumdb checks don't apply to it either way. Adjust `GOVCS` (or `go env -w GOVCS=...`) if you meant to allow this.",
-				module, pattern)}
+				module, pattern, govcsWhat(govcsPrivate))}
 		default:
 			d = diagnosis{statusPrivateModuleLocally, fmt.Sprintf(
 				"your local `GOPRIVATE`/`GONOPROXY` config matches %s via the pattern %q, so `go install`/`go get` will fetch it directly from its VCS host here, never through proxy.golang.org — "+
@@ -125,17 +126,18 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 		// pattern-specific disallow) — see that branch's comment for why the
 		// parse-error case needs no VCS-type certainty and the disallow case
 		// does.
+		govcsPrivate := localGovcsPrivate(module)
 		switch govcsErr := localGovcsConfigError(); {
 		case govcsErr != nil:
 			d = diagnosis{statusGovcsMalformedLocally, fmt.Sprintf(
 				"your local `GOPROXY` resolves to `direct` (via env var or `go env -w`), so `go install`/`go get` would normally fetch %s@%s straight from its VCS host — but your local `GOVCS` setting is itself malformed (%v), which makes every direct-VCS-requiring `go` command fail outright with this exact parse error, regardless of whether some other rule in the list would otherwise have allowed this fetch. "+
 					"That's your machine's own config, not a proxy-availability problem, and this tool's proxy/sumdb checks don't apply to it either way. Fix your `GOVCS` setting (see `go help vcs`) — real `go` validates the whole list up front, so one bad entry anywhere breaks every direct fetch.",
 				module, version, govcsErr)}
-		case githubRepoPattern.MatchString(module) && !localGovcsAllowsGit(module, false):
+		case githubRepoPattern.MatchString(module) && !localGovcsAllowsGit(module, govcsPrivate):
 			d = diagnosis{statusGovcsDisallowedLocally, fmt.Sprintf(
-				"your local `GOPROXY` resolves to `direct` (via env var or `go env -w`), so `go install`/`go get` would normally fetch %s@%s straight from its VCS host — but your local `GOVCS` setting disallows git for this (public) module, so the real command fails outright with `GOVCS disallows using git for public %[1]s; see 'go help vcs'` instead of succeeding. "+
+				"your local `GOPROXY` resolves to `direct` (via env var or `go env -w`), so `go install`/`go get` would normally fetch %s@%s straight from its VCS host — but your local `GOVCS` setting disallows git for this (%[3]s) module, so the real command fails outright with `GOVCS disallows using git for %[3]s %[1]s; see 'go help vcs'` instead of succeeding. "+
 					"That's your machine's own config, not a proxy-availability problem, and this tool's proxy/sumdb checks don't apply to it either way. Adjust `GOVCS` (or `go env -w GOVCS=...`) if you meant to allow this.",
-				module, version)}
+				module, version, govcsWhat(govcsPrivate))}
 		default:
 			d = diagnosis{statusGoproxyDirectLocally, fmt.Sprintf(
 				"your local `GOPROXY` resolves to `direct` (via env var or `go env -w`), so `go install`/`go get` will fetch %s@%s straight from its VCS host here, never through proxy.golang.org — "+
@@ -554,10 +556,65 @@ func localModulePrivate(module string) (bool, string) {
 	return false, ""
 }
 
+// localGovcsPrivate reports whether module matches the local `go` command's
+// effective GOPRIVATE pattern list — deliberately GOPRIVATE alone, NOT
+// GONOPROXY, even though GONOPROXY defaults to GOPRIVATE's value when unset
+// (see localModulePrivate). Real cmd/go's own GOVCS "public"/"private"
+// pattern classification (internal/vcs/vcs.go's checkGOVCS: `private :=
+// module.MatchPrefixPatterns(cfg.GOPRIVATE, root)`) always checks GOPRIVATE
+// specifically, regardless of *why* a direct VCS fetch is happening —
+// whether GONOPROXY matched (the localModulePrivate branch in run()) or
+// GOPROXY resolved to "direct" outright (the other branch), using an
+// unrelated GOPRIVATE/GONOPROXY setting either way.
+//
+// Confirmed live (2026-09-27) both directions, with GOPRIVATE and GONOPROXY
+// deliberately set to different, non-overlapping patterns so the two checks
+// can't coincidentally agree: with GOPRIVATE=nonmatching.example/* and
+// GONOPROXY=github.com/golang/protobuf (so GONOPROXY forces a direct fetch
+// but GOPRIVATE does NOT match it), GOVCS="public:off,private:git" — `go
+// mod download -x github.com/golang/protobuf@v1.5.0` fails with "GOVCS
+// disallows using git for *public* github.com/golang/protobuf", i.e. real
+// go classified it public despite GONOPROXY's match. And with
+// GOPROXY=direct, GOPRIVATE=github.com/golang/protobuf, GONOPROXY=
+// nonmatching.example/*, GOVCS="private:off,public:git" — the same command
+// fails with "GOVCS disallows using git for *private* github.com/golang/
+// protobuf", i.e. real go classified it private purely off GOPRIVATE even
+// though the fetch went direct for an unrelated reason (GOPROXY=direct, not
+// a GONOPROXY match) and GONOPROXY itself didn't match.
+//
+// Before this existed, run() passed a hardcoded `true` (in the
+// localModulePrivate branch) or `false` (in the GOPROXY=direct branch) to
+// localGovcsAllowsGit instead of this — so a GOPRIVATE/GONOPROXY split
+// config like either case above made this tool evaluate the wrong GOVCS
+// rule (private:git instead of public:off, or public:git instead of
+// private:off) and report the fetch as fine ("will fetch it directly, no
+// problem") when a real `go mod download`/`go install` fails outright with
+// "GOVCS disallows using git for ...".
+func localGovcsPrivate(module string) bool {
+	out, err := exec.Command("go", "env", "GOPRIVATE").Output()
+	if err != nil {
+		return false // best-effort: don't block the real check on this
+	}
+	return matchesAnyPattern(module, splitPatterns(strings.TrimSpace(string(out))))
+}
+
+// govcsWhat renders the "public"/"private" word real `go`'s own "GOVCS
+// disallows using %s for %s %s" error message uses (internal/vcs/vcs.go's
+// checkGOVCS), given the same GOPRIVATE-derived classification
+// localGovcsPrivate computes.
+func govcsWhat(private bool) string {
+	if private {
+		return "private"
+	}
+	return "public"
+}
+
 // localGovcsAllowsGit reports whether the local `go` command's effective
 // GOVCS setting permits a direct git fetch of module, given whether module
-// is already known to be private (see localModulePrivate). Delegates the
-// actual rule-matching to govcsAllowsGit (govcs.go); this wrapper only
+// is already known to be private per real go's own GOPRIVATE-based
+// classification (see localGovcsPrivate — NOT localModulePrivate, which
+// mirrors GONOPROXY instead and answers a different question). Delegates
+// the actual rule-matching to govcsAllowsGit (govcs.go); this wrapper only
 // handles reading `go env GOVCS`, matching the localModulePrivate/
 // localGoproxyOff shape above.
 //
