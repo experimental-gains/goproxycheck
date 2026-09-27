@@ -169,7 +169,13 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 			// v2.16.0 and others (see majorVersionMismatchMarker's doc
 			// comment) — no amount of polling makes an existing tag's go.mod
 			// grow the suffix it's missing.
-			if !*wait || d.status == statusReady || d.status == statusModuleUnknown || d.status == statusBlocklistedMalicious || d.status == statusWrongImportPath || d.status == statusRetracted || d.status == statusDeprecated || d.status == statusZipBuildError || d.status == statusMajorVersionMismatch || time.Now().After(deadline) {
+			// statusUnknownRevision joins this list for the same reason as
+			// statusZipBuildError and statusMajorVersionMismatch: a version
+			// query naming a revision that doesn't exist in the repo at all
+			// (see unknownRevisionMarker's doc comment) can never resolve no
+			// matter how long this polls — there's no tag/branch/commit for
+			// the proxy to eventually pick up.
+			if !*wait || d.status == statusReady || d.status == statusModuleUnknown || d.status == statusBlocklistedMalicious || d.status == statusWrongImportPath || d.status == statusRetracted || d.status == statusDeprecated || d.status == statusZipBuildError || d.status == statusMajorVersionMismatch || d.status == statusUnknownRevision || time.Now().After(deadline) {
 				break
 			}
 			time.Sleep(*interval)

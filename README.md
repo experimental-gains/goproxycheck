@@ -208,6 +208,23 @@ actually seeing:
   `module-unknown`/`negative-cache-suspected`/`sumdb-lag`, which would
   otherwise send you looking for a typo or waiting out an outage that a
   `--wait` retry (or the proxy operator) needs to actually resolve.
+- `invalid version: unknown revision X` — the version you checked doesn't
+  name a real tag, branch, or commit in the module's repository at all: a
+  fabricated or mistyped pseudo-version, a nonexistent branch name, or a
+  bogus commit hash. Verified live (2026-09-27) on two independent proxy
+  backends: a made-up pseudo-version and a nonexistent branch both 404
+  against `golang.org/x/tools` with this exact wording, and the same
+  wording appears for a bogus tag/branch against a live, already-public
+  GitHub-hosted module — `go get` fails outright with the identical
+  message immediately, every time. Also confirmed this doesn't collide
+  with genuine indexing lag: a real tag pushed to an already-public GitHub
+  repo resolved correctly on the very first probe after the push reached
+  GitHub. Without this check it fell through to the same `not-yet-indexed`
+  fallback as ordinary indexing lag ("retry in a minute, or use --wait"),
+  which is wrong for a revision that will never exist no matter how long
+  you wait. `goproxycheck` reports this as a distinct `unknown-revision`
+  diagnosis and stops immediately under `--wait` instead of polling the
+  full `--timeout`.
 
 ## Install
 
@@ -248,7 +265,7 @@ argument errors.
 ## Use as a GitHub Action
 
 ```yaml
-- uses: experimental-gains/goproxycheck@v0.1.34
+- uses: experimental-gains/goproxycheck@v0.1.35
   with:
     args: --wait --timeout 10m github.com/you/yourmodule@v1.2.3
 ```

@@ -30,6 +30,7 @@ const (
 	statusProxyError             status = "proxy-error"
 	statusMajorVersionMismatch   status = "major-version-mismatch"
 	statusGovcsDisallowedLocally status = "govcs-disallowed-locally"
+	statusUnknownRevision        status = "unknown-revision"
 )
 
 // isRepoCheckInconclusive reports whether a repo-reachability probe status
@@ -159,6 +160,41 @@ func majorVersionMismatchSuggestion(body string) string {
 		return ""
 	}
 	return m[1]
+}
+
+// unknownRevisionMarker is the distinctive substring proxy.golang.org
+// includes in the plain-text body of a 404 response when the requested
+// version query — a branch name, a raw or embedded commit hash, or a
+// malformed/fabricated pseudo-version — doesn't correspond to any revision
+// that actually exists in the module's repository. Confirmed live
+// (2026-09-27) against two independent proxy backends: a fabricated
+// pseudo-version and a nonexistent branch name against golang.org/x/tools
+// (Google's go.googlesource.com-backed proxy) both 404 with "invalid
+// version: unknown revision <name>", and the identical wording (minus the
+// git-ls-remote preamble a cold/never-fetched module gets) appears for a
+// bogus tag or branch against a live, already-indexed GitHub-hosted module
+// (github.com/experimental-gains/agent-bootstrap-log) — `go get` fails
+// outright with this exact message in both cases, immediately, not after
+// any delay. This is a permanent property of the query itself (the named
+// revision does not exist), not the not-yet-indexed/negative-cache timing
+// conditions the fallback at the bottom of diagnose assumes: verified live
+// that a real, freshly-pushed tag on an already-public GitHub repo resolves
+// correctly on the very first probe after the push reaches GitHub (no
+// "unknown revision" transient state observed), so this marker doesn't
+// collide with genuine indexing lag — see also isZipBuildError and
+// majorVersionMismatchMarker right above, the other two "permanent, not a
+// timing problem" 404 bodies this file already special-cases.
+//
+// Without this check, a bogus revision query fell through to the
+// not-yet-indexed fallback ("ordinary indexing lag — retry in a minute, or
+// use --wait"), which is actively wrong for a revision that will never
+// exist, and under --wait polled the full --timeout for an answer that was
+// already final on the first probe — the same shape of waste already fixed
+// for statusZipBuildError and statusMajorVersionMismatch.
+const unknownRevisionMarker = "invalid version: unknown revision"
+
+func isUnknownRevision(body string) bool {
+	return strings.Contains(body, unknownRevisionMarker)
 }
 
 // isProxyErrorStatus reports whether code is a "terminal error" response
@@ -385,6 +421,24 @@ func diagnose(r report) diagnosis {
 			"%s: this version has a go.mod file, but its module path doesn't carry the major-version suffix Go's semantic import versioning rule requires (go.dev/ref/mod#major-version-suffix) — proxy.golang.org refuses to serve it: %s. "+
 				"This isn't the negative-cache bug or ordinary indexing lag: it's a permanent property of the go.mod committed at this tag, so --wait and a retry can't fix it. %s.",
 			displayTarget(r), firstLine(r.versionInfo.body), advice)}
+	}
+
+	// Checked alongside isZipBuildError and majorVersionMismatchMarker above
+	// for the same reason: a 404 whose body carries this specific
+	// proxy-generated message means the requested version/branch/commit
+	// query doesn't name any revision that exists at all — see
+	// unknownRevisionMarker's doc comment for the live verification against
+	// both a fabricated pseudo-version and a nonexistent branch name, on two
+	// independent proxy backends. This can't be the not-yet-indexed/
+	// negative-cache situation the fallback further down assumes: those both
+	// require the version to be a real revision the proxy just hasn't
+	// caught up on yet, not one that never existed in the first place.
+	if isUnknownRevision(r.versionInfo.body) {
+		return diagnosis{statusUnknownRevision, fmt.Sprintf(
+			"%s: proxy.golang.org says this isn't a revision that exists in the module's repository at all: %s. "+
+				"This isn't the negative-cache bug or ordinary indexing lag (both require the version to already be a real, existing tag/branch/commit that the proxy just hasn't picked up yet) — it's a permanent invalid-version error, and a real `go install`/`go get` fails outright with this same message right now. --wait and a retry can't fix it. "+
+				"Check for a typo in the version, tag, or commit hash, or confirm that revision actually exists in the repository.",
+			displayTarget(r), firstLine(r.versionInfo.body))}
 	}
 
 	// The blocklist check above only sees @latest/@v/list, which catches a

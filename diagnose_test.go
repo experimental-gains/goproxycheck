@@ -861,7 +861,10 @@ func TestDiagnose_RetractedRangeDoesNotCoverVersion(t *testing.T) {
 // .info 404s for real ("unknown revision v2.0.5"), so a plain `go install`
 // fails outright, the opposite of what the pre-fix statusRetracted message
 // ("resolves fine through proxy.golang.org and sum.golang.org — a plain `go
-// install` will succeed") claimed.
+// install` will succeed") claimed. It should also land on statusUnknownRevision,
+// not statusNotYetIndexed — see unknownRevisionMarker's doc comment: this
+// body is the exact "invalid version: unknown revision" shape that means the
+// version was never a real revision at all, not that indexing merely lags.
 func TestDiagnose_RetractedRangeCoversNeverPublishedVersion(t *testing.T) {
 	const module = "github.com/mattn/go-sqlite3"
 	const version = "v2.0.5+incompatible"
@@ -897,8 +900,8 @@ func TestDiagnose_RetractedRangeCoversNeverPublishedVersion(t *testing.T) {
 	if got.status == statusRetracted {
 		t.Fatalf("status = %s, want anything but retracted for a version that was never published; message: %s", got.status, got.message)
 	}
-	if got.status != statusNotYetIndexed {
-		t.Fatalf("status = %s, want not-yet-indexed (not in @v/list, never published); message: %s", got.status, got.message)
+	if got.status != statusUnknownRevision {
+		t.Fatalf("status = %s, want unknown-revision (proxy's own body says \"unknown revision\", a permanent error, not indexing lag); message: %s", got.status, got.message)
 	}
 }
 
@@ -1129,6 +1132,63 @@ func TestDiagnose_NotYetIndexed(t *testing.T) {
 	got := diagnose(r)
 	if got.status != statusNotYetIndexed {
 		t.Fatalf("status = %s, want %s; message: %s", got.status, statusNotYetIndexed, got.message)
+	}
+}
+
+// TestDiagnose_UnknownRevision is modeled on two independent live-verified
+// cases (2026-09-27): querying a fabricated pseudo-version and a nonexistent
+// branch name against golang.org/x/tools both 404 with "invalid version:
+// unknown revision <name>", and the identical wording (minus the
+// git-ls-remote preamble a cold module gets) appears for a bogus tag or
+// branch against a live, already-public GitHub-hosted module
+// (github.com/experimental-gains/agent-bootstrap-log) — real `go get` fails
+// outright with this exact message, immediately, every time. Before this
+// status existed, this 404 fell through to the same not-yet-indexed fallback
+// TestDiagnose_NotYetIndexed exercises above ("ordinary indexing lag —
+// retry in a minute, or use --wait"), which is actively wrong: no amount of
+// waiting makes a nonexistent revision start existing. Also confirmed live
+// that this doesn't collide with genuine indexing lag: a real tag pushed to
+// an already-public GitHub repo resolved correctly on the very first probe
+// after the push reached GitHub, with no "unknown revision" transient state
+// observed at any point.
+func TestDiagnose_UnknownRevision(t *testing.T) {
+	const module = "github.com/experimental-gains/agent-bootstrap-log"
+	const version = "v9.9.9-nonexistent-totally-made-up"
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/" + module + "/@latest":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, `{"Version":"v0.1.0"}`)
+		case "/" + module + "/@v/list":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "v0.1.0\n")
+		case "/" + module + "/@v/" + version + ".info":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = fmt.Fprintf(w, "not found: %s@%s: invalid version: unknown revision %s", module, version, version)
+		case "/" + module + "/@v/v0.1.0.mod":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "module "+module+"\n")
+		default:
+			t.Fatalf("unexpected request to %s", r.URL.Path)
+		}
+	}))
+	defer proxy.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/" + module + "@" + version: http.StatusNotFound,
+	})
+	defer sum.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, client: proxy.Client()}
+	r := ep.probe(module, version)
+	got := diagnose(r)
+	if got.status != statusUnknownRevision {
+		t.Fatalf("status = %s, want %s (a nonexistent revision is a permanent error, not indexing lag); message: %s", got.status, statusUnknownRevision, got.message)
+	}
+	if !strings.Contains(got.message, "unknown revision") {
+		t.Errorf("message should quote the proxy's own error body, got: %s", got.message)
+	}
+	if strings.Contains(got.message, "retry in a minute") {
+		t.Errorf("message should not suggest retrying like ordinary indexing lag, got: %s", got.message)
 	}
 }
 

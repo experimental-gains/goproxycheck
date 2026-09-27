@@ -542,6 +542,57 @@ func TestRun_WaitStopsOnMajorVersionMismatch(t *testing.T) {
 	}
 }
 
+// unknownRevisionEndpoints simulates a version query naming a revision that
+// doesn't exist in the module's repository at all (a fabricated
+// pseudo-version, a bogus branch, or a mistyped commit hash) — confirmed
+// live (2026-09-27) that proxy.golang.org 404s this with "invalid version:
+// unknown revision <name>" and never resolves it no matter how long you
+// wait, since there's no such revision to eventually pick up.
+func unknownRevisionEndpoints(t *testing.T, hits *int) endpoints {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v0.1.0"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("v0.1.0\n"))
+		case strings.HasSuffix(r.URL.Path, ".info"):
+			*hits++
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`not found: example.com/mod@bogus-branch: invalid version: unknown revision bogus-branch`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return endpoints{proxyBase: srv.URL, sumBase: srv.URL, client: srv.Client()}
+}
+
+// TestRun_WaitStopsOnUnknownRevision guards the run()-level early-break list
+// in the --wait polling loop the same way TestRun_WaitStopsOnMajorVersionMismatch
+// does for statusMajorVersionMismatch: before statusUnknownRevision was added
+// to that list, `--wait` polled a doomed nonexistent-revision query at the
+// full --interval cadence for the entire --timeout instead of returning
+// after the first probe, since no amount of polling makes a revision that
+// was never real start existing.
+func TestRun_WaitStopsOnUnknownRevision(t *testing.T) {
+	var hits int
+	ep := unknownRevisionEndpoints(t, &hits)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--wait", "--interval=1ms", "--timeout=5s", "example.com/mod@bogus-branch"}, &stdout, &stderr, ep)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stdout.String(), "unknown-revision") {
+		t.Errorf("stdout = %q, want it to mention unknown-revision", stdout.String())
+	}
+	if hits != 1 {
+		t.Fatalf(".info was probed %d times; want exactly 1 — --wait should stop immediately on a permanent unknown-revision error instead of polling the full 5s timeout", hits)
+	}
+}
+
 // deprecatedEndpoints simulates a module whose go.mod deprecates it —
 // otherwise fully healthy (both .info and sum lookup succeed) — to check
 // that --wait stops on the first probe instead of polling a permanent
