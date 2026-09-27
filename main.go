@@ -20,6 +20,11 @@ import (
 	"unicode"
 
 	"golang.org/x/mod/semver"
+
+	// Aliased: resolveTarget's named return value is itself called "module"
+	// (a string, the module path), which would otherwise shadow this package
+	// for the whole function body.
+	modulepkg "golang.org/x/mod/module"
 )
 
 func main() {
@@ -240,6 +245,29 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 	return 1
 }
 
+// isComparisonVersionQuery reports whether v is one of the four version-range
+// queries cmd/go's own modload/query.go special-cases (newQueryMatcher, cases
+// "<=", "<", ">=", ">"; go.dev/ref/mod#version-queries) ahead of treating the
+// string as a literal version or revision name. Both '<' and '>' are
+// themselves disallowed characters in an ordinary version/revision string
+// (see fileNameOK in golang.org/x/mod/module) — so a version beginning with
+// either one can only ever be this kind of range query, never a literal name
+// — which is why checking just the prefix here is enough to tell them apart.
+//
+// This exists so the disallowed-version-character check in resolveTarget
+// below doesn't misfire on a query real `go` validates in a completely
+// different way: confirmed live (2026-09-27) that `go get
+// golang.org/x/mod@<v0.1:9` fails with `invalid semantic version "v0.1:9" in
+// range "<v0.1:9"`, not the `disallowed version string` error the same
+// embedded ':' produces in a literal version (`go get
+// golang.org/x/mod@v0.1:9`). Without this exclusion, a legitimate range
+// query like `@<v1.2.3` — valid, documented syntax real `go` accepts fine —
+// would have been wrongly rejected by this tool as an invalid version string
+// before ever being probed, when it isn't one.
+func isComparisonVersionQuery(v string) bool {
+	return strings.HasPrefix(v, "<") || strings.HasPrefix(v, ">")
+}
+
 // resolveTarget parses "module@version" from args, or falls back to reading
 // the module path from ./go.mod and the version from the most recent git
 // tag — the shape of "just tagged a release, is it live yet?" this tool is
@@ -299,6 +327,52 @@ func resolveTarget(args []string) (module, version string, err error) {
 			// doomed-poll bug already fixed for statusZipBuildError,
 			// statusMajorVersionMismatch, and statusUnknownRevision.
 			return "", "", fmt.Errorf(`version "patch" can only be resolved relative to a version %s already requires in some go.mod — goproxycheck has no such existing-requirement context for a bare module@version argument, and neither does a real 'go get %s@patch' run the same way: it fails immediately with `+"`can't query version \"patch\" of module %s: no existing version is required`"+`, without ever contacting the proxy. Check a concrete version, %s@latest, or %s@upgrade instead (upgrade IS well-defined with no existing requirement: it's equivalent to latest)`, parts[0], parts[0], parts[0], parts[0], parts[0])
+		}
+		if !isComparisonVersionQuery(parts[1]) {
+			// Confirmed live against cmd/go's own modfetch/proxy.go
+			// (proxyRepo.Stat: `encRev, err := module.EscapeVersion(rev); if
+			// err != nil { return nil, p.versionError(rev, err) }`, called
+			// before any network request for every version/revision query
+			// that isn't "latest"/"upgrade"/"patch" or a comparison range —
+			// see isComparisonVersionQuery): a version or revision string
+			// containing a character golang.org/x/mod/module's fileNameOK
+			// disallows (the shell-special set double-quote, single-quote,
+			// *, <, >, ?, backtick, and |; the path separators /, :, and
+			// backslash; a bare ;; a literal !; a trailing .; or a
+			// Windows-reserved element name like NUL/COM1) fails
+			// immediately and unconditionally with `invalid version: version
+			// %q invalid: disallowed version string`, entirely offline,
+			// before cmd/go ever contacts a proxy — verified live
+			// (2026-09-27) across all of those shapes: `go get
+			// golang.org/x/mod@v0.1:9`, `@v0.1?9`, `@v0.1;9`, `@v0.1*9`,
+			// `@v0.1!9`, `@v0.1.0.`, and `@NUL` every one fails this exact
+			// way, even against a module path that doesn't exist at all.
+			//
+			// Before this check, goproxycheck sent a version like this
+			// straight to e.get(fmt.Sprintf(".../@v/%s.info",
+			// escapePath(checkVersion))) instead. For most of these
+			// characters the real proxy 404s with a distinct "bad request:
+			// invalid escaped version %q: invalid char %q" body (confirmed
+			// live) that matches none of diagnose's specific markers
+			// (isZipBuildError, majorVersionMismatchMarker,
+			// isUnknownRevision all miss it), so it fell through to the
+			// generic statusNotYetIndexed fallback — "ordinary indexing lag
+			// ... retry in a minute, or use --wait" — and under --wait
+			// polled the full --timeout for a version real `go` rejects
+			// outright, offline, on every single invocation, the same
+			// shape of waste already fixed for "patch" and whitespace
+			// above. For an un-percent-encoded "?" specifically it's worse
+			// than a wasted poll: net/url parses the raw "?" in the
+			// constructed URL as the start of a query string, so the
+			// request actually sent doesn't even reach the intended path —
+			// confirmed live that building the URL with version "v0.1?9"
+			// and issuing it sends path ".../@v/v0.1" with query "9.info"
+			// attached, getting back "bad request: query parameters not
+			// allowed" instead of any answer about the version that was
+			// actually asked about.
+			if _, err := modulepkg.EscapeVersion(parts[1]); err != nil {
+				return "", "", fmt.Errorf("version %q is not a valid module version/revision string (%v) — a real `go get`/`go install` rejects this exact string immediately with `invalid version: version %q invalid: disallowed version string`, entirely offline, before ever contacting the proxy, so this could never resolve no matter how long you --wait or retry. Check for a stray character from copy-paste, URL-encoding, or shell quoting (e.g. a colon, question mark, backslash, asterisk, pipe, or quote)", parts[1], err, parts[1])
+			}
 		}
 		return parts[0], parts[1], nil
 	}

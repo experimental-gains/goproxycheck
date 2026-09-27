@@ -218,6 +218,69 @@ func TestResolveTarget_PatchVersionRejected(t *testing.T) {
 	}
 }
 
+// TestResolveTarget_DisallowedVersionCharsRejected is a regression test for a
+// real bug: a version string containing a character real `go` disallows
+// outright (a colon, question mark, semicolon, asterisk, pipe, backslash,
+// exclamation mark, a trailing dot, or a Windows-reserved name like "NUL")
+// used to sail through resolveTarget unrejected and get probed against the
+// real proxy, where it either 404s with a body ("bad request: invalid
+// escaped version ...") that matches none of diagnose's specific markers
+// (falling through to statusNotYetIndexed, "retry in a minute, or use
+// --wait" — a doomed --wait poll, since cmd/go itself rejects the identical
+// string immediately and offline with "invalid version: version %q invalid:
+// disallowed version string", confirmed live 2026-09-27 against
+// golang.org/x/mod for every one of these), or — for an un-percent-encoded
+// "?" specifically — gets mangled entirely by net/url treating it as the
+// start of a query string before the request is even sent.
+func TestResolveTarget_DisallowedVersionCharsRejected(t *testing.T) {
+	for _, version := range []string{
+		"v0.1:9",  // path separator, confirmed live: "invalid version: version \"v0.1:9\" invalid: disallowed version string"
+		"v0.1?9",  // shell-special; also mangled by net/url as a query-string separator
+		"v0.1;9",  // bare semicolon
+		"v0.1*9",  // shell-special glob char
+		"v0.1|9",  // shell-special pipe
+		"v0.1\\9", // path separator
+		"v0.1!9",  // literal '!' collides with the proxy's own case-escaping marker
+		"v0.1.0.", // trailing dot
+		"NUL",     // Windows-reserved element name
+	} {
+		t.Run(version, func(t *testing.T) {
+			_, _, err := resolveTarget([]string{"example.com/mod@" + version})
+			if err == nil {
+				t.Fatalf("expected an error for disallowed version string %q", version)
+			}
+			if !strings.Contains(err.Error(), "disallowed version string") {
+				t.Errorf("error should mention the real `go` wording (\"disallowed version string\"): %v", err)
+			}
+		})
+	}
+}
+
+// TestResolveTarget_ComparisonVersionQueryNotRejected is a regression test
+// guarding the isComparisonVersionQuery exclusion added alongside the
+// disallowed-version-character check above: a version-range query like
+// "<v1.2.3" or ">=v0.9.0" (go.dev/ref/mod#version-queries) is valid,
+// documented syntax real `go` accepts fine — it's resolved by comparing
+// against @v/list locally, never sent to the proxy as a literal version —
+// but it necessarily starts with '<' or '>', characters that are themselves
+// disallowed in an ordinary version string. Without excluding this shape,
+// the disallowed-version-character check above would wrongly reject every
+// comparison query resolveTarget previously accepted, before it's ever
+// probed.
+func TestResolveTarget_ComparisonVersionQueryNotRejected(t *testing.T) {
+	for _, version := range []string{"<v1.2.3", "<=v1.2.3", ">v1.2.3", ">=v1.2.3"} {
+		t.Run(version, func(t *testing.T) {
+			_, gotVersion, err := resolveTarget([]string{"example.com/mod@" + version})
+			if err != nil {
+				t.Fatalf("resolveTarget rejected valid comparison query %q: %v", version, err)
+			}
+			if gotVersion != version {
+				t.Errorf("got version %q, want %q", gotVersion, version)
+			}
+		})
+	}
+}
+
 func TestResolveTarget_FallbackToGoModAndGitTag(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
