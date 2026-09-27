@@ -297,6 +297,17 @@ func TestLocalGoproxyNonPublic(t *testing.T) {
 		{"custom pipe direct", "https://goproxy.example.com|direct", "custom", "https://goproxy.example.com"},
 		{"file proxy", "file:///tmp/fileproxy,off", "custom", "file:///tmp/fileproxy"},
 		{"empty", "", "", ""},
+		// Confirmed live (2026-09-27): `go env GOPROXY` echoes back the raw,
+		// un-normalized config string ("proxy.golang.org", not
+		// "https://proxy.golang.org"), but real cmd/go's own proxyList
+		// (modfetch/proxy.go) implicitly prepends "https://" to any bare-host
+		// entry before ever using it — confirmed with `go mod download -x
+		// golang.org/x/mod@v0.19.0` under GOPROXY=proxy.golang.org (no
+		// scheme): the trace hits https://proxy.golang.org, byte-for-byte the
+		// same public proxy the default config uses.
+		{"no scheme", "proxy.golang.org", "", ""},
+		{"no scheme trailing slash", "proxy.golang.org/", "", ""},
+		{"no scheme then direct", "proxy.golang.org,direct", "", ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -374,6 +385,12 @@ func TestPublicProxyFallback(t *testing.T) {
 		{"custom then direct then public, public unreachable", "https://corp.example.com,direct,https://proxy.golang.org", "", false, false},
 		{"trailing slash public", "https://corp.example.com,https://proxy.golang.org/", "https://corp.example.com", false, true},
 		{"empty", "", "", false, false},
+		// Same no-scheme normalization gap as TestLocalGoproxyNonPublic's
+		// "no scheme" case, but for the later-in-the-chain fallback path:
+		// confirmed live the same way, `go mod download -x` for a chain
+		// with a bare "proxy.golang.org" second entry still falls through
+		// to the exact public proxy this tool probes.
+		{"custom then no-scheme public", "https://corp.example.com,proxy.golang.org", "https://corp.example.com", false, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

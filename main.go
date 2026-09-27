@@ -12,6 +12,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -402,13 +404,42 @@ func localGoproxyNonPublic() (kind, value string) {
 	switch first := firstGoproxyEntry(); first {
 	case "", "off":
 		return "", "" // "" (unreadable): fall through to the normal probe; "off" is handled separately above
-	case defaultProxyBase, defaultProxyBase + "/":
-		return "", ""
 	case "direct":
 		return "direct", ""
 	default:
-		return "custom", first
+		switch normalizeGoproxyURL(first) {
+		case defaultProxyBase, defaultProxyBase + "/":
+			return "", ""
+		default:
+			return "custom", first
+		}
 	}
+}
+
+// normalizeGoproxyURL mirrors the implicit-scheme rule cmd/go's own
+// proxyList (modfetch/proxy.go) applies to each GOPROXY entry before ever
+// using it: "anything containing the string ':/' or matching an absolute
+// file path must be a complete URL. For all other paths, implicitly add
+// 'https://'." `go env GOPROXY` itself echoes back the raw, un-normalized
+// config string (confirmed live: GOPROXY=proxy.golang.org makes `go env
+// GOPROXY` print "proxy.golang.org", not "https://proxy.golang.org"), so
+// firstGoproxyEntry/publicProxyFallback comparing that raw string directly
+// against defaultProxyBase missed this real normalization step entirely.
+//
+// Confirmed live (2026-09-27): with GOPROXY=proxy.golang.org (no scheme —
+// a natural way to write it by analogy to GOPRIVATE/GONOPROXY's bare-host
+// patterns) or GOPROXY=proxy.golang.org/ (same, with a trailing slash),
+// `go mod download -x golang.org/x/mod@v0.19.0` fetches from
+// https://proxy.golang.org/... — byte-for-byte the same public proxy the
+// default config uses, not some distinct scheme-less endpoint. Before
+// this fix, localGoproxyNonPublic/publicProxyFallback classified either
+// value as an opaque "custom" proxy this tool "has no way to know" how to
+// check, when the probe below is actually exactly right.
+func normalizeGoproxyURL(url string) string {
+	if strings.ContainsAny(url, ".:/") && !strings.Contains(url, ":/") && !filepath.IsAbs(url) && !path.IsAbs(url) {
+		return "https://" + url
+	}
+	return url
 }
 
 // parseGoproxyChain replicates cmd/go's own GOPROXY-list walk (proxyList in
@@ -474,7 +505,8 @@ func publicProxyFallback() (precedingCustom []string, anyErrorFallback, ok bool)
 	}
 	entries, seps := parseGoproxyChain(strings.TrimSpace(string(out)))
 	for i, url := range entries {
-		if url != defaultProxyBase && url != defaultProxyBase+"/" {
+		normalized := normalizeGoproxyURL(url)
+		if normalized != defaultProxyBase && normalized != defaultProxyBase+"/" {
 			continue
 		}
 		if i == 0 {
