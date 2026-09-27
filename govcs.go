@@ -54,6 +54,19 @@ const govcsDefault = "public:git|hg,private:all"
 // paths don't contain colons) with vcslist "git" — so the rule matched
 // nothing, execution fell through to the next rule, and this function
 // reported git as allowed for a fetch real `go` actually refuses outright.
+//
+// A sixth case, confirmed live the same way (2026-09-27, `GOPROXY=direct go
+// get -x` against github.com/golang/protobuf@v1.5.0 with a fresh
+// GOMODCACHE): whitespace around the colon or the "|"-separated VCS names,
+// e.g. "public : off" or "public: git | hg" — a natural way to hand-format a
+// multi-rule GOVCS value. Real cmd/go's parseGOVCS trims each piece
+// (pattern, vcslist, and every individual VCS name) after splitting; this
+// function used to compare the untrimmed pieces directly, so "public : off"
+// had pattern `"public "` (trailing space) which never equals the literal
+// "public", the rule silently never matched, and execution fell through to
+// the next rule (or all the way to the fail-open default) instead of
+// blocking the fetch real `go` actually refuses with "GOVCS disallows using
+// git for public github.com/golang/protobuf; see 'go help vcs'".
 func govcsAllowsGit(module string, private bool, raw string) bool {
 	if strings.TrimSpace(raw) == "" {
 		raw = govcsDefault
@@ -67,6 +80,7 @@ func govcsAllowsGit(module string, private bool, raw string) bool {
 		if !found {
 			continue // malformed rule; real `go` errors out here, best-effort skip
 		}
+		pattern, vcslist = strings.TrimSpace(pattern), strings.TrimSpace(vcslist)
 		var matched bool
 		switch pattern {
 		case "public":
@@ -86,7 +100,7 @@ func govcsAllowsGit(module string, private bool, raw string) bool {
 			return true
 		}
 		for _, vcs := range strings.Split(vcslist, "|") {
-			if vcs == "git" {
+			if strings.TrimSpace(vcs) == "git" {
 				return true
 			}
 		}

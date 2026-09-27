@@ -56,6 +56,26 @@ func TestGovcsAllowsGit(t *testing.T) {
 			"github.com/golang/protobuf", false,
 			"github.com:hg:git,public:git|hg", false,
 		},
+		{
+			// Confirmed live (2026-09-27, `GOPROXY=direct go get -x`
+			// against github.com/golang/protobuf@v1.5.0 with a fresh
+			// GOMODCACHE): real cmd/go trims whitespace around the colon
+			// in each rule, so "public : off" behaves exactly like
+			// "public:off" and blocks. This function used to compare the
+			// untrimmed pattern "public " against the literal "public",
+			// which never matched, so the rule was silently skipped.
+			"whitespace around the colon is trimmed, same as real go",
+			"github.com/golang/protobuf", false,
+			"public : off,private:all", false,
+		},
+		{
+			// Confirmed live the same way with `GOVCS="public: git | hg"`:
+			// real cmd/go also trims each "|"-separated VCS name, so
+			// " git " still matches "git".
+			"whitespace around a pipe-separated VCS name is trimmed too",
+			"github.com/golang/protobuf", false,
+			"public: git | hg", true,
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
