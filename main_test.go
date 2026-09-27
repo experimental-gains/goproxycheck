@@ -69,6 +69,64 @@ func TestModuleFromGoMod_TabSeparator(t *testing.T) {
 	}
 }
 
+// TestModuleFromGoMod_ParenBlock is a regression test for a real bug: the
+// `module` directive's parenthesized block form ("module (\n\tpath\n)")
+// isn't shown in go.dev/ref/mod#go-mod-file-module's prose, but real
+// golang.org/x/mod/modfile accepts it exactly like require/replace/tool/
+// exclude's own block forms — confirmed live (2026-09-27) that a go.mod
+// written this way builds, `go list -m` reports the correct module path,
+// and `go mod tidy` rewrites it to the single-line form. Before this
+// fix, moduleDirective's single-line branch matched the "module (" line
+// with rest "(" (not a valid quoted string), returning the bogus module
+// path "(" and silently dropping the block's real path line — sending
+// goproxycheck's no-argument mode probing a nonsense module path instead
+// of the real one.
+func TestModuleFromGoMod_ParenBlock(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "go.mod")
+	_ = os.WriteFile(path, []byte("module (\n\tgithub.com/foo/bar\n)\n\ngo 1.24\n"), 0o644)
+
+	got, err := moduleFromGoMod(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "github.com/foo/bar"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// TestModuleFromGoMod_ParenBlock_QuotedAndComment covers the same block
+// form with a quoted path and a trailing comment inside the block, and a
+// comment on the closing paren — both valid go.mod syntax for the
+// single-line form already (see TestModuleFromGoMod_Quoted/
+// TestModuleFromGoMod_TrailingComment), now checked inside the block too.
+func TestModuleFromGoMod_ParenBlock_QuotedAndComment(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "go.mod")
+	_ = os.WriteFile(path, []byte("module (\n\t\"github.com/foo/bar\" // the main module\n) // end\n\ngo 1.24\n"), 0o644)
+
+	got, err := moduleFromGoMod(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "github.com/foo/bar"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// TestModuleFromGoMod_ParenBlock_Empty is a defensive check that an
+// (invalid — real go errors on this) empty block reports a clear error
+// instead of silently returning an empty module path.
+func TestModuleFromGoMod_ParenBlock_Empty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "go.mod")
+	_ = os.WriteFile(path, []byte("module (\n)\n\ngo 1.24\n"), 0o644)
+
+	if _, err := moduleFromGoMod(path); err == nil {
+		t.Fatal("expected an error for an empty 'module' block, got none")
+	}
+}
+
 // TestModuleFromGoMod_CommentOnlyValue is a regression test for a real
 // bug found via mutation testing (run #125): a "module" line whose
 // entire value is a "//" comment (e.g. "module //oops", no actual path

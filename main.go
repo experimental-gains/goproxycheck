@@ -299,15 +299,66 @@ func moduleFromGoMod(path string) (string, error) {
 }
 
 // moduleDirective extracts the module path from a go.mod-format body's
-// `module` directive line. Shared by moduleFromGoMod (reading the local
+// `module` directive. Shared by moduleFromGoMod (reading the local
 // ./go.mod) and canonicalModuleNote in diagnose.go (reading the go.mod the
 // proxy serves for a resolved version) — same file format, same parsing
 // rules, so one implementation covers both instead of drifting apart.
+//
+// Handles both the single-line form ("module example.com/foo") and the
+// parenthesized block form ("module (\n\texample.com/foo\n)"). The latter
+// isn't shown in go.dev/ref/mod#go-mod-file-module's prose, but real
+// golang.org/x/mod/modfile's own lexer treats "module" as a valid block
+// verb exactly like require/replace/tool/exclude (no per-verb exception),
+// and modfile.Parse's semantic layer explicitly accepts it — confirmed
+// live (2026-09-27): a go.mod written as
+//
+//	module (
+//		example.com/foo/mymodule
+//	)
+//
+//	go 1.24
+//
+// builds, `go list -m` reports "example.com/foo/mymodule", and `go mod
+// tidy` rewrites it to the single-line form (accepted, if unusual, syntax,
+// not just a lax-mode tolerance). Before this handled the block form, the
+// first line ("module (") matched the single-line branch below with rest
+// "(" — not a valid quoted string, so parseModulePath returned the literal
+// "(" as the "module path" — and the block's real path line was left
+// dangling, matched by nothing, silently ignored. goproxycheck's
+// no-argument mode (reading ./go.mod) then probed the bogus module "(" and
+// reported module-unknown instead of checking the real module; the same
+// bug in canonicalModulePath's use of this function would have misfired a
+// bogus wrong-import-path diagnosis had the proxy-served go.mod for a
+// resolved version used this style.
 func moduleDirective(data string) (string, error) {
-	for _, line := range strings.Split(data, "\n") {
-		line = strings.TrimSpace(line)
+	inBlock := false
+	blockMod := ""
+	for _, raw := range strings.Split(data, "\n") {
+		line := strings.TrimSpace(raw)
+		if inBlock {
+			if stripLineComment(line) == ")" {
+				if blockMod == "" {
+					return "", fmt.Errorf("has a 'module' block with no path")
+				}
+				return blockMod, nil
+			}
+			if mod := parseModulePath(line); mod != "" {
+				// A second non-empty line here is malformed (real go
+				// errors with "repeated module statement"), so this can't
+				// happen against a go.mod real `go` accepts — last one
+				// wins is a harmless fallback, matching this function's
+				// existing best-effort handling of malformed input.
+				blockMod = mod
+			}
+			continue
+		}
 		if rest, ok := strings.CutPrefix(line, "module"); ok && rest != "" && (rest[0] == ' ' || rest[0] == '\t') {
-			mod := parseModulePath(strings.TrimSpace(rest))
+			rest = strings.TrimSpace(rest)
+			if stripLineComment(rest) == "(" {
+				inBlock = true
+				continue
+			}
+			mod := parseModulePath(rest)
 			if mod == "" {
 				// e.g. a "module" line whose entire value is a "//"
 				// comment (found via mutation testing, run #125: the
@@ -320,19 +371,33 @@ func moduleDirective(data string) (string, error) {
 			return mod, nil
 		}
 	}
+	if inBlock {
+		return "", fmt.Errorf("has an unterminated 'module' block")
+	}
 	return "", fmt.Errorf("has no 'module' directive")
 }
 
-// parseModulePath cleans up the raw text after "module " on a go.mod module
-// line: strips a trailing "//" line comment (valid go.mod syntax — `go list
-// -m` ignores it, but a naive TrimSpace would fold it straight into the
-// module path and send goproxycheck probing a bogus URL) and unquotes the
-// path if it's written as a quoted Go string literal (also valid go.mod
-// syntax, just rarer).
-func parseModulePath(s string) string {
+// stripLineComment strips a trailing "// ..." comment from a go.mod line
+// fragment. go.mod's lexer only ever recognizes "//" comments — a "/* */"
+// block comment is a parse error ("mod files must use // comments (not /*
+// */ comments)", confirmed against golang.org/x/mod/modfile/read.go) — so
+// this is the only comment form parseModulePath/moduleDirective ever need
+// to account for.
+func stripLineComment(s string) string {
 	if i := strings.Index(s, "//"); i >= 0 {
 		s = strings.TrimSpace(s[:i])
 	}
+	return s
+}
+
+// parseModulePath cleans up the raw text after "module " on a go.mod module
+// line (or a line inside its parenthesized block form): strips a trailing
+// "//" line comment (valid go.mod syntax — `go list -m` ignores it, but a
+// naive TrimSpace would fold it straight into the module path and send
+// goproxycheck probing a bogus URL) and unquotes the path if it's written
+// as a quoted Go string literal (also valid go.mod syntax, just rarer).
+func parseModulePath(s string) string {
+	s = stripLineComment(s)
 	if unquoted, err := strconv.Unquote(s); err == nil {
 		return unquoted
 	}
