@@ -39,6 +39,21 @@ const govcsDefault = "public:git|hg,private:all"
 // download -x` against github.com/golang/protobuf@v1.5.0, comparing a
 // real "GOVCS disallows using git for public github.com/golang/protobuf"
 // failure against a successful `git ls-remote`/`git archive` trace.
+//
+// A fifth case, confirmed live the same way (2026-09-27, `GOPROXY=direct go
+// mod tidy -x` against rsc.io/quote@v1.5.2 with a fresh GOMODCACHE): a rule
+// whose vcslist itself contains a colon, e.g. "rsc.io:hg:git" (a plausible
+// typo for the pipe-separated "rsc.io:hg|git"). Real cmd/go's parseGOVCS
+// splits each rule on its *first* colon only (strings.Cut, mirrored by
+// govcsConfigError above) — so "rsc.io:hg:git" is pattern "rsc.io", vcslist
+// ["hg:git"] (a single, never-matching VCS name), meaning real `go` fails
+// every git AND hg fetch of anything under rsc.io with "GOVCS disallows
+// using git for public rsc.io/quote; see 'go help vcs'". This function used
+// to split each rule on its *last* colon instead, parsing that same rule as
+// pattern "rsc.io:hg" (which never matches any real module path, since
+// paths don't contain colons) with vcslist "git" — so the rule matched
+// nothing, execution fell through to the next rule, and this function
+// reported git as allowed for a fetch real `go` actually refuses outright.
 func govcsAllowsGit(module string, private bool, raw string) bool {
 	if strings.TrimSpace(raw) == "" {
 		raw = govcsDefault
@@ -48,11 +63,10 @@ func govcsAllowsGit(module string, private bool, raw string) bool {
 		if rule == "" {
 			continue
 		}
-		i := strings.LastIndex(rule, ":")
-		if i < 0 {
+		pattern, vcslist, found := strings.Cut(rule, ":")
+		if !found {
 			continue // malformed rule; real `go` errors out here, best-effort skip
 		}
-		pattern, vcslist := rule[:i], rule[i+1:]
 		var matched bool
 		switch pattern {
 		case "public":

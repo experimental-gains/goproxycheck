@@ -39,6 +39,23 @@ func TestGovcsAllowsGit(t *testing.T) {
 		},
 		{"malformed rule (no colon) is skipped, falls through to default", "github.com/golang/protobuf", false, "garbage", true},
 		{"blank entries in the list are skipped", "github.com/golang/protobuf", false, ",public:git|hg,", true},
+		{
+			// Confirmed live (2026-09-27, `GOPROXY=direct go mod tidy -x`
+			// against github.com/golang/protobuf@v1.5.0 with a fresh
+			// GOMODCACHE): real cmd/go's parseGOVCS splits a rule on its
+			// *first* colon only, so "github.com:hg:git" is pattern
+			// "github.com", vcslist ["hg:git"] (a single VCS name that never
+			// matches "git"), and every git fetch under github.com fails
+			// with "GOVCS disallows using git for public
+			// github.com/golang/protobuf; see 'go help vcs'". Splitting on
+			// the *last* colon instead (the bug this rule catches) misreads
+			// it as pattern "github.com:hg" (which never matches a real
+			// module path) with vcslist "git", so the rule never matches and
+			// execution wrongly falls through to "public:git|hg".
+			"vcslist containing a colon is part of the pattern's first-colon split, not the last",
+			"github.com/golang/protobuf", false,
+			"github.com:hg:git,public:git|hg", false,
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
