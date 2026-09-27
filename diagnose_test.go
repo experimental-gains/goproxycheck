@@ -1320,6 +1320,67 @@ func TestDiagnose_ProxyErrorStatus_Sum(t *testing.T) {
 	}
 }
 
+// TestDiagnose_LatestProxyError_WhileListSucceeds covers a case the other
+// ProxyErrorStatus tests above don't: @v/list succeeds on its own (so
+// r.moduleKnown() is already true, per its own doc comment) while @latest
+// itself returns a genuine proxy-error status rather than a 404/410. A
+// "latest" query has no dedicated @v/latest.info endpoint — probe() can only
+// resolve "latest" by reading @latest's own body — so before this fix,
+// r.versionInfo ended up probed against the literal string "latest", which
+// proxy.golang.org always 404s with "not found: invalid version" regardless
+// of module health (confirmed live against
+// https://proxy.golang.org/golang.org/x/mod/@v/latest.info, 2026-09-27).
+// That fell through to the generic not-yet-indexed fallback ("MODULE@latest
+// is not in @v/list yet ... retry in a minute, or use --wait"), even though
+// @v/list plainly listed real tagged versions in the very same probe.
+//
+// Confirmed against cmd/go's own source (modfetch/proxy.go's
+// proxyRepo.Latest): it only falls back to a @v/list-derived resolution when
+// @latest fails with a 404/410 (fs.ErrNotExist-equivalent, per
+// web/api.go's Response.Err mapping) — any other error status (a 429, 500,
+// ...) is returned to the caller immediately and unconditionally, with no
+// @v/list fallback at all. So a real `go install module@latest` fails
+// outright with the @latest error right now, not "retry in a minute" —
+// exactly the terminal-error semantics isProxyErrorStatus/proxyErrorDiagnosis
+// already give every other endpoint in this file.
+func TestDiagnose_LatestProxyError_WhileListSucceeds(t *testing.T) {
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/example.com/mod/@latest":
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = fmt.Fprint(w, "internal error")
+		case "/example.com/mod/@v/list":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "v1.0.0\nv1.1.0\n")
+		case "/example.com/mod/@v/latest.info":
+			// Confirmed live against the real proxy.golang.org: this literal
+			// request always 404s this way, for any module, healthy or not.
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = fmt.Fprint(w, "not found: invalid version")
+		default:
+			t.Fatalf("unexpected request to %s", r.URL.Path)
+		}
+	}))
+	defer proxy.Close()
+	sum := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer sum.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, client: proxy.Client()}
+	r := ep.probe("example.com/mod", "latest")
+	got := diagnose(r)
+	if got.status != statusProxyError {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusProxyError, got.message)
+	}
+	if !strings.Contains(got.message, "500") || !strings.Contains(got.message, "@latest") {
+		t.Fatalf("message should name the actual endpoint and status code: %s", got.message)
+	}
+	if strings.Contains(got.message, "not in @v/list yet") {
+		t.Fatalf("must not claim the module isn't in @v/list when it plainly lists real versions: %s", got.message)
+	}
+}
+
 // A clean 410 (Gone) — the documented alternative to 404 — must still be
 // treated as an ordinary "not found," not caught by the new error-status
 // check.

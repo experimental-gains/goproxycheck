@@ -299,6 +299,42 @@ func diagnose(r report) diagnosis {
 			"is it covered by a GOPRIVATE/GONOSUMDB pattern that's intentionally excluding it from the public proxy?"}
 	}
 
+	// Checked ahead of every "module known" diagnosis below, specifically for
+	// a "latest" query: r.moduleKnown() above can be satisfied purely by
+	// @v/list succeeding even when @latest itself failed (see moduleKnown's
+	// doc comment) — and probe() has no dedicated way to resolve a "latest"
+	// query once @latest itself is unusable, since there is no @v/latest.info
+	// endpoint: querying it literally always 404s with "invalid version"
+	// regardless of module health (see probe()'s "Confirmed live" comment on
+	// exactly that). So when @latest fails with a genuine proxy-error status
+	// (a 429, 500, ... — a transport error is already ruled out above, and a
+	// clean 404/410 is the ordinary "module has no @latest" case handled
+	// below), r.versionInfo ends up probed against that literal, meaningless
+	// "latest" string instead of any real version, and used to fall through
+	// silently to the generic not-yet-indexed fallback further down —
+	// "MODULE@latest is not in @v/list yet ... retry in a minute, or use
+	// --wait" — even when @v/list plainly listed real tagged versions right
+	// there in the same probe.
+	//
+	// That's not just misleadingly worded, it's the wrong diagnosis: per the
+	// documented protocol (see isProxyErrorStatus/proxyErrorDiagnosis above),
+	// a real `go install module@latest` does NOT wait out or retry a non-404/
+	// 410 error on @latest, it fails outright with that exact error right
+	// now. Confirmed directly against cmd/go's own source
+	// (modfetch/proxy.go's proxyRepo.Latest): it only falls back to deriving
+	// a version from @v/list when @latest fails with a 404/410
+	// (fs.ErrNotExist-equivalent, per web/api.go's Response.Err mapping) —
+	// any other error status is returned to the caller immediately,
+	// unconditionally, with no @v/list fallback at all. Reproduced live with
+	// a fake proxy returning HTTP 500 on @latest while @v/list serves two
+	// perfectly ordinary tagged versions: before this check, goproxycheck
+	// reported statusNotYetIndexed and, under --wait, polled the doomed
+	// literal "@v/latest.info" 404 for the full --timeout instead of
+	// surfacing the real, actionable @latest error immediately.
+	if r.version == "latest" && isProxyErrorStatus(r.latest.statusCode) {
+		return proxyErrorDiagnosis("proxy.golang.org", "@latest", r.latest.statusCode)
+	}
+
 	// Checked ahead of the ready/sumdb-lag verdicts below (both require
 	// r.versionInfo.ok, same as this): a canonical-path mismatch makes `go
 	// install` fail outright regardless of sumdb state, so it isn't a
