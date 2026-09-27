@@ -265,7 +265,7 @@ argument errors.
 ## Use as a GitHub Action
 
 ```yaml
-- uses: experimental-gains/goproxycheck@v0.1.43
+- uses: experimental-gains/goproxycheck@v0.1.44
   with:
     args: --wait --timeout 10m github.com/you/yourmodule@v1.2.3
 ```
