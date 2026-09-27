@@ -182,7 +182,7 @@ func (e endpoints) probe(module, version string) report {
 	}
 
 	checkVersion := version
-	if version == "latest" && r.latest.ok {
+	if (version == "latest" || version == "upgrade") && r.latest.ok {
 		// Confirmed live: `goproxycheck somemodule@latest` — the natural
 		// invocation by analogy to `go install somemodule@latest`, the
 		// standard Go idiom — used to probe @v/latest.info literally, which
@@ -191,6 +191,26 @@ func (e endpoints) probe(module, version string) report {
 		// misdiagnosed a completely ready module as statusNotYetIndexed and
 		// told the user to retry or --wait, which would poll until timeout
 		// since the literal string "latest" never appears in @v/list.
+		//
+		// "upgrade" belongs in this same branch, not a separate one: per
+		// cmd/go's own modload/query.go (newQueryMatcher, case query ==
+		// "upgrade": `if current == "" || current == "none" { qm.mayUseLatest
+		// = true }`), the "upgrade" version query resolves to exactly the
+		// same thing as "latest" whenever there's no already-required
+		// version to stay on or move up from — which, like "patch" (rejected
+		// outright in resolveTarget — see its comment for why "upgrade" gets
+		// different treatment), is always goproxycheck's situation for a
+		// bare `module@version` CLI argument. Confirmed live with matching
+		// `go get -x` traces: `go get golang.org/x/mod@upgrade` and `go get
+		// golang.org/x/mod@latest`, both run against a module with no
+		// existing requirement, issue the identical sequence of
+		// proxy.golang.org requests and resolve to the identical version.
+		// Before this, "upgrade" hit the same doomed-probe bug "latest" used
+		// to: sent as a literal string to @v/upgrade.info, which 404s "not
+		// found: invalid version" for every module regardless of health
+		// (confirmed live), falling through to statusNotYetIndexed and, under
+		// --wait, polling to timeout for a literal "upgrade" that can never
+		// appear in @v/list.
 		if info, err := parseVersionInfo(r.latest.body); err == nil && info.Version != "" {
 			checkVersion = info.Version
 			r.resolvedVersion = info.Version

@@ -513,6 +513,55 @@ func TestRun_LatestQueryResolves(t *testing.T) {
 	}
 }
 
+// TestRun_UpgradeQueryResolves is the fix for a real bug found by testing
+// goproxycheck against the "upgrade" version query (go.dev/ref/mod#version-
+// queries), by analogy to the standard `go get module@upgrade` idiom.
+// Confirmed live against cmd/go's own modload/query.go (newQueryMatcher,
+// case query == "upgrade"): with no existing requirement — always
+// goproxycheck's situation for a bare module@version CLI argument —
+// "upgrade" resolves via the identical Latest lookup as "latest"
+// (mayUseLatest = true), verified by matching `go get -x` request traces for
+// `golang.org/x/mod@upgrade` and `golang.org/x/mod@latest`. Before this fix,
+// "upgrade" was sent to the proxy as a literal version string, which live
+// testing against proxy.golang.org shows 404s "not found: invalid version"
+// for every module regardless of health, misdiagnosing a fully ready module
+// as statusNotYetIndexed. This server only serves @v/v0.5.0.info and sum for
+// v0.5.0 — if probe() still used the literal "upgrade" string, every request
+// but @latest itself would 404.
+func TestRun_UpgradeQueryResolves(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v0.5.0"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("v0.5.0\n"))
+		case strings.HasSuffix(r.URL.Path, "/@v/v0.5.0.info"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v0.5.0"}`))
+		case strings.Contains(r.URL.Path, "/lookup/") && strings.HasSuffix(r.URL.Path, "@v0.5.0"):
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	ep := endpoints{proxyBase: srv.URL, sumBase: srv.URL, client: srv.Client()}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@upgrade"}, &stdout, &stderr, ep)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "ready") {
+		t.Errorf("stdout = %q, want it to mention ready", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "resolved to v0.5.0") {
+		t.Errorf("stdout = %q, want it to mention the resolved version", stdout.String())
+	}
+}
+
 // TestRun_PartialVersionQueryResolves is the fix for a real bug found by
 // testing goproxycheck against real documented Go version-query forms beyond
 // "latest" (go.dev/ref/mod#version-queries): a partial version like "v0.19"

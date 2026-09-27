@@ -331,7 +331,15 @@ func diagnose(r report) diagnosis {
 	// reported statusNotYetIndexed and, under --wait, polled the doomed
 	// literal "@v/latest.info" 404 for the full --timeout instead of
 	// surfacing the real, actionable @latest error immediately.
-	if r.version == "latest" && isProxyErrorStatus(r.latest.statusCode) {
+	// "upgrade" belongs alongside "latest" here for the same reason it's
+	// folded into the same branch in probe(): per cmd/go's own
+	// modload/query.go, "upgrade" resolves via the identical Latest lookup as
+	// "latest" whenever there's no existing requirement to move up from —
+	// always true for a bare goproxycheck module@version argument (see
+	// probe()'s "upgrade" comment) — so a genuine @latest proxy error fails a
+	// real `go get module@upgrade` immediately and unconditionally too, not
+	// just `go get module@latest`.
+	if (r.version == "latest" || r.version == "upgrade") && isProxyErrorStatus(r.latest.statusCode) {
 		return proxyErrorDiagnosis("proxy.golang.org", "@latest", r.latest.statusCode)
 	}
 

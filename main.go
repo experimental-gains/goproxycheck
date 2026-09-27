@@ -272,6 +272,34 @@ func resolveTarget(args []string) (module, version string, err error) {
 			// exist to prevent for other permanent, non-timing failures.
 			return "", "", fmt.Errorf("version %q contains whitespace, which can never be part of a real module version, tag, or revision — check for a stray space or newline (e.g. from copy-paste, a shell variable, or a file read with a trailing newline)", parts[1])
 		}
+		if parts[1] == "patch" {
+			// Confirmed live against cmd/go's own modload/query.go (Query,
+			// case query == "patch": `if current == "" || current == "none"
+			// { return nil, &NoPatchBaseError{path} }`): unlike "latest" and
+			// "upgrade" (see probe()'s "latest"/"upgrade" handling), the
+			// "patch" version query (go.dev/ref/mod#version-queries) is only
+			// ever defined *relative to* a version already required by some
+			// go.mod — it means "the latest available version with the same
+			// major.minor as the version already required." With no existing
+			// requirement to be relative to, which is always goproxycheck's
+			// situation for a bare `module@version` CLI argument, a real `go
+			// get module@patch` fails immediately and unconditionally with
+			// `can't query version "patch" of module <path>: no existing
+			// version is required` — verified live it does this even with
+			// GOPROXY=off and even for a module that doesn't exist at all, so
+			// it never even reaches the network, let alone the proxy this
+			// tool checks. Before this check, goproxycheck sent "patch" as a
+			// literal version string to @v/patch.info, which live testing
+			// against proxy.golang.org shows 404s with a bare "not found:
+			// invalid version" body (no "unknown revision" marker, so it
+			// doesn't match isUnknownRevision either) for every module,
+			// healthy or not, and fell through to statusNotYetIndexed —
+			// "retry in a minute, or use --wait" for a query that can never
+			// succeed no matter how long it's probed, the same shape of
+			// doomed-poll bug already fixed for statusZipBuildError,
+			// statusMajorVersionMismatch, and statusUnknownRevision.
+			return "", "", fmt.Errorf(`version "patch" can only be resolved relative to a version %s already requires in some go.mod — goproxycheck has no such existing-requirement context for a bare module@version argument, and neither does a real 'go get %s@patch' run the same way: it fails immediately with `+"`can't query version \"patch\" of module %s: no existing version is required`"+`, without ever contacting the proxy. Check a concrete version, %s@latest, or %s@upgrade instead (upgrade IS well-defined with no existing requirement: it's equivalent to latest)`, parts[0], parts[0], parts[0], parts[0], parts[0])
+		}
 		return parts[0], parts[1], nil
 	}
 

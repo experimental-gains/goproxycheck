@@ -192,6 +192,32 @@ func TestResolveTarget_WhitespaceInVersion(t *testing.T) {
 	}
 }
 
+// TestResolveTarget_PatchVersionRejected is a regression test for a real
+// bug found by testing goproxycheck against real documented Go version
+// queries beyond "latest"/"upgrade": unlike "upgrade" (see probe()'s
+// "upgrade" handling), the "patch" query is only ever meaningful relative to
+// a version some go.mod already requires. Confirmed live against cmd/go's
+// own modload/query.go (NoPatchBaseError) that `go get module@patch` fails
+// immediately and unconditionally with `can't query version "patch" of
+// module <path>: no existing version is required` when there's no existing
+// requirement — even with GOPROXY=off, and even for a module that doesn't
+// exist — since goproxycheck's bare module@version argument never has such a
+// requirement to be relative to. Before this check, goproxycheck sent
+// "patch" to the proxy as a literal version string, which live testing shows
+// 404s with a bare "not found: invalid version" body (no "unknown revision"
+// marker) for every module, and fell through to statusNotYetIndexed —
+// telling the caller to retry or --wait for a query that can never succeed
+// no matter how long it's probed.
+func TestResolveTarget_PatchVersionRejected(t *testing.T) {
+	_, _, err := resolveTarget([]string{"example.com/mod@patch"})
+	if err == nil {
+		t.Fatal("expected an error for version \"patch\" with no existing requirement")
+	}
+	if !strings.Contains(err.Error(), "patch") {
+		t.Errorf("error should mention the patch query: %v", err)
+	}
+}
+
 func TestResolveTarget_FallbackToGoModAndGitTag(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)

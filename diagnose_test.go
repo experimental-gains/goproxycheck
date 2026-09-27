@@ -1381,6 +1381,54 @@ func TestDiagnose_LatestProxyError_WhileListSucceeds(t *testing.T) {
 	}
 }
 
+// TestDiagnose_UpgradeProxyError_WhileListSucceeds mirrors
+// TestDiagnose_LatestProxyError_WhileListSucceeds above for the "upgrade"
+// version query: per cmd/go's own modload/query.go, "upgrade" resolves via
+// the identical Latest lookup as "latest" when there's no existing
+// requirement (always true for goproxycheck's bare module@version
+// argument), so a genuine @latest proxy error (429/500/...) must fail a
+// `goproxycheck module@upgrade` check the same way it fails
+// `module@latest`, not fall through to a doomed literal-"upgrade" probe of
+// @v/upgrade.info (confirmed live it 404s "not found: invalid version" for
+// any module, healthy or not) and the generic not-yet-indexed fallback.
+func TestDiagnose_UpgradeProxyError_WhileListSucceeds(t *testing.T) {
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/example.com/mod/@latest":
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = fmt.Fprint(w, "internal error")
+		case "/example.com/mod/@v/list":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "v1.0.0\nv1.1.0\n")
+		case "/example.com/mod/@v/upgrade.info":
+			// Confirmed live against the real proxy.golang.org: this literal
+			// request always 404s this way, for any module, healthy or not.
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = fmt.Fprint(w, "not found: invalid version")
+		default:
+			t.Fatalf("unexpected request to %s", r.URL.Path)
+		}
+	}))
+	defer proxy.Close()
+	sum := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer sum.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, client: proxy.Client()}
+	r := ep.probe("example.com/mod", "upgrade")
+	got := diagnose(r)
+	if got.status != statusProxyError {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusProxyError, got.message)
+	}
+	if !strings.Contains(got.message, "500") || !strings.Contains(got.message, "@latest") {
+		t.Fatalf("message should name the actual endpoint and status code: %s", got.message)
+	}
+	if strings.Contains(got.message, "not in @v/list yet") {
+		t.Fatalf("must not claim the module isn't in @v/list when it plainly lists real versions: %s", got.message)
+	}
+}
+
 // A clean 410 (Gone) — the documented alternative to 404 — must still be
 // treated as an ordinary "not found," not caught by the new error-status
 // check.
