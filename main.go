@@ -320,6 +320,37 @@ func resolveTarget(args []string) (module, version string, err error) {
 		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 			return "", "", fmt.Errorf("argument must be in module@version form, got %q", args[0])
 		}
+		if err := modulepkg.CheckPath(parts[0]); err != nil {
+			// Confirmed live (2026-09-28) against golang.org/x/mod/module (the
+			// same package cmd/go itself uses for this check) and the real `go`
+			// toolchain: `go get example.com/foo!bar@v1.0.0` (an invalid
+			// character), `go get example.com/foo.@v1.0.0` (a trailing dot),
+			// `go get example.com/.foo@v1.0.0` (a leading dot), and `go get
+			// example.com/fooé@v1.0.0` (a non-ASCII letter) all fail immediately
+			// and unconditionally with `malformed module path %q: %v`, entirely
+			// offline, before ever contacting a proxy — even with GOPROXY=off,
+			// which still lets an otherwise-valid path (e.g. one with uppercase
+			// letters, itself legal — see escapePath's case-encoding) through to
+			// its own separate "module lookup disabled" error instead.
+			//
+			// resolveTarget already ran the mirror-image check on the version
+			// half of module@version (see the disallowed-version-string check
+			// below, via modulepkg.EscapeVersion) but never validated the
+			// module path half the same way. Before this check, goproxycheck
+			// sent a module path like this straight to escapePath (which merely
+			// case-encodes uppercase ASCII and passes every other character,
+			// including one real Go rejects outright, straight through
+			// unescaped) and then to the proxy, which 404s with its own "invalid
+			// escaped module path" style body that matches none of diagnose's
+			// specific markers — so it fell through to the generic
+			// statusModuleUnknown verdict ("check: is the repo public? does the
+			// module path in go.mod exactly match the repo? ..."), actively
+			// misdirecting the user to check for a typo or a GOPRIVATE
+			// misconfiguration when the real, offline, unconditional answer is
+			// that the module path itself is syntactically invalid and could
+			// never resolve no matter what the repo or proxy config look like.
+			return "", "", fmt.Errorf("module path %q is not valid — a real `go get`/`go install` rejects this exact string immediately with `%v`, entirely offline, before ever contacting the proxy, so this could never resolve regardless of the repo or proxy config. Check for a stray character, leading/trailing dot, or non-ASCII letter in the module path", parts[0], err)
+		}
 		if strings.ContainsFunc(parts[1], unicode.IsSpace) {
 			// Confirmed live: a version query with a leading/trailing/embedded
 			// space (e.g. "v0.19.0 ", picked up from a copy-paste, a CI

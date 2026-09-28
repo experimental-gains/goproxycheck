@@ -199,6 +199,58 @@ func TestResolveTarget_TooManyArgs(t *testing.T) {
 	}
 }
 
+// TestResolveTarget_MalformedModulePathRejected is a regression test for a
+// real bug: resolveTarget validated the version half of "module@version"
+// against golang.org/x/mod/module (via modulepkg.EscapeVersion) but never
+// validated the module path half the same way. Confirmed live (2026-09-28)
+// against the real go1.24.4 toolchain: `go get example.com/foo!bar@v1.0.0`
+// (an invalid character), `go get example.com/foo.@v1.0.0` (a trailing dot),
+// `go get example.com/.foo@v1.0.0` (a leading dot), and `go get
+// example.com/fooé@v1.0.0` (a non-ASCII letter) all fail immediately and
+// unconditionally with `malformed module path %q: %v`, entirely offline,
+// before ever contacting a proxy — even with GOPROXY=off. Before this check,
+// goproxycheck sent a module path like this straight to the proxy (via
+// escapePath, which only case-encodes uppercase ASCII and passes every other
+// character straight through unescaped) and reported the generic
+// statusModuleUnknown verdict ("check: is the repo public? does the module
+// path in go.mod exactly match the repo? ..."), actively misdirecting the
+// user toward a typo/GOPRIVATE explanation instead of the real, offline,
+// unconditional answer that the module path itself is syntactically invalid.
+func TestResolveTarget_MalformedModulePathRejected(t *testing.T) {
+	for _, module := range []string{
+		"example.com/foo!bar", // invalid char '!'
+		"example.com/foo.",    // trailing dot in path element
+		"example.com/.foo",    // leading dot in path element
+		"example.com/fooé",    // non-ASCII letter
+		"example.com/foo bar", // embedded space
+	} {
+		t.Run(module, func(t *testing.T) {
+			_, _, err := resolveTarget([]string{module + "@v1.0.0"})
+			if err == nil {
+				t.Fatalf("expected an error for malformed module path %q", module)
+			}
+			if !strings.Contains(err.Error(), "malformed module path") {
+				t.Errorf("error should mention the real `go` wording (\"malformed module path\"): %v", err)
+			}
+		})
+	}
+}
+
+// TestResolveTarget_ValidUppercaseModulePathNotRejected guards against an
+// over-broad fix to the check above: uppercase ASCII letters are legal in a
+// real module path (e.g. github.com/Masterminds/squirrel) — that's the whole
+// reason escapePath's case-encoding scheme exists — so module.CheckPath must
+// not reject them.
+func TestResolveTarget_ValidUppercaseModulePathNotRejected(t *testing.T) {
+	module, version, err := resolveTarget([]string{"github.com/Masterminds/squirrel@v1.5.4"})
+	if err != nil {
+		t.Fatalf("resolveTarget rejected a valid uppercase module path: %v", err)
+	}
+	if module != "github.com/Masterminds/squirrel" || version != "v1.5.4" {
+		t.Errorf("got module %q version %q, want github.com/Masterminds/squirrel v1.5.4", module, version)
+	}
+}
+
 // TestResolveTarget_WhitespaceInVersion is a regression test for a real bug:
 // a version query with a leading, trailing, or embedded space (e.g. picked
 // up from copy-paste, a CI variable, or a file read with the newline only
