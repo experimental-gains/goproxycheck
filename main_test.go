@@ -755,6 +755,16 @@ func TestGosumdbConfigError(t *testing.T) {
 		{"short truncated hash", "mycompany.example+abc123 https://sumdb.mycompany.example", true, "malformed verifier id"},
 		{"too many fields", "a b c", true, "too many fields"},
 		{"valid generated key with url", "sumdb.mycompany.example+18034219+ARh1MwsDARWl2XLlkBuE9hyxjXsSk5sX709QEBIDy21S https://sumdb.mycompany.example", false, ""},
+		// Regression test: a verifier key whose embedded name carries a
+		// trailing slash (e.g. copy-pasted from a URL instead of a bare
+		// host[/path]) — generated live via note.GenerateKey(rand.Reader,
+		// "example.com/"), which accepts it fine (isValidName has no
+		// opinion on a trailing slash). Confirmed live (2026-09-28): `go
+		// get golang.org/x/text@v0.14.0` with GOSUMDB set to this exact
+		// value, against a fresh GOMODCACHE, fails outright with "invalid
+		// sumdb name (must be host[/path]): example.com/ ...", never
+		// reaching the network — see validSumdbName's doc comment.
+		{"generated key with trailing-slash name", "example.com/+6b8bd748+AfzT6Rs7/F20IZqPIzDwguH7VNYE5d+tqj+5f+EpTQep", true, "invalid sumdb name (must be host[/path])"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

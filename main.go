@@ -932,13 +932,55 @@ func gosumdbConfigError(gosumdb string) error {
 	if k, ok := knownGOSUMDB[key]; ok {
 		key = k
 	}
-	if _, err := note.NewVerifier(key); err != nil {
+	verifier, err := note.NewVerifier(key)
+	if err != nil {
 		return fmt.Errorf("invalid GOSUMDB: %v", err)
+	}
+	if err := validSumdbName(verifier.Name()); err != nil {
+		return err
 	}
 	if len(fields) == 2 {
 		if _, err := url.Parse(fields[1]); err != nil {
 			return fmt.Errorf("invalid GOSUMDB URL: %v", err)
 		}
+	}
+	return nil
+}
+
+// validSumdbName mirrors the extra host-shape validation cmd/go's own
+// dbDial (modfetch/sumdb.go) performs on a verifier key's embedded name
+// after note.NewVerifier has already accepted the key as well-formed.
+// note.NewVerifier's own name check (isValidName) only rejects whitespace,
+// invalid UTF-8, and a literal "+" — it happily accepts a name that isn't a
+// valid URL host at all, which dbDial separately, and unconditionally,
+// rejects before ever dialing anything: `direct, err := url.Parse("https://"
+// + name); if err != nil || strings.HasSuffix(name, "/") || *direct !=
+// (url.URL{Scheme: "https", Host: direct.Host, Path: direct.Path, RawPath:
+// direct.RawPath}) || direct.RawPath != "" || direct.Host == "" { return ...
+// "invalid sumdb name (must be host[/path])" ... }`.
+//
+// Confirmed live (2026-09-28): a GOSUMDB key generated with name
+// "example.com/" (a plausible copy-paste mistake — keeping a trailing slash
+// from a URL when only a bare host[/path] is wanted) passes note.NewVerifier
+// fine — isValidName has no opinion on a trailing slash — but `go get
+// golang.org/x/text@v0.14.0` with GOSUMDB set to that key, against a fresh
+// GOMODCACHE so verification is actually attempted, fails outright before
+// ever making a network request:
+//
+//	go: golang.org/x/text@v0.14.0: verifying module: invalid sumdb name
+//	(must be host[/path]): example.com/ {Scheme:https ... Path:/ ...}
+//
+// Before this check, gosumdbConfigError returned nil for that exact value —
+// note.NewVerifier was the only validation performed — so goproxycheck
+// reported the local GOSUMDB config as fine (and, via localSumdbSkipped/
+// localGosumdbConfigError's callers in run(), could report a module ready)
+// when a real `go install`/`go get` refuses to run at all until GOSUMDB is
+// fixed, for any module needing verification.
+func validSumdbName(name string) error {
+	direct, err := url.Parse("https://" + name)
+	if err != nil || strings.HasSuffix(name, "/") || direct.Host == "" || direct.RawPath != "" ||
+		*direct != (url.URL{Scheme: "https", Host: direct.Host, Path: direct.Path, RawPath: direct.RawPath}) {
+		return fmt.Errorf("invalid GOSUMDB: invalid sumdb name (must be host[/path]): %s", name)
 	}
 	return nil
 }
