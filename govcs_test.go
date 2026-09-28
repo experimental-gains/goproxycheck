@@ -101,6 +101,39 @@ func TestLocalGovcsAllowsGit(t *testing.T) {
 	}
 }
 
+// TestLocalGovcsPrivate_UsesRepoRootNotFullModulePath is the fix for a real
+// bug found via live-toolchain differential testing (2026-09-28): real
+// cmd/go's checkGOVCS (internal/vcs/vcs.go) computes its private/public
+// classification from `module.MatchPrefixPatterns(cfg.GOPRIVATE, root)`,
+// where root is the VCS-resolved repository root — for github.com, always
+// exactly the first two path segments (vcsPaths' `^(?P<root>github\.com/
+// [\w.\-]+/[\w.\-]+)(/[\w.\-]+)*$`), discarding anything past that,
+// including a major-version suffix like "/v2" that lives in a real
+// subdirectory of the repo (as github.com/googleapis/gax-go/v2 actually
+// does).
+//
+// Confirmed live: with GOPRIVATE="github.com/googleapis/gax-go/v2" (naming
+// the exact module path) and GOVCS="public:off,private:git", `go mod
+// download -x github.com/googleapis/gax-go/v2@v2.7.0` fails with "GOVCS
+// disallows using git for public github.com/googleapis/gax-go" — real go
+// classified it public (root "github.com/googleapis/gax-go" doesn't match
+// the GOPRIVATE pattern) despite the pattern matching the full module path
+// exactly. localGovcsPrivate used to match against module directly, so it
+// reported private here — the opposite of what real go does.
+func TestLocalGovcsPrivate_UsesRepoRootNotFullModulePath(t *testing.T) {
+	t.Setenv("GOPRIVATE", "github.com/googleapis/gax-go/v2")
+	if got := localGovcsPrivate("github.com/googleapis/gax-go/v2"); got {
+		t.Errorf(`localGovcsPrivate("github.com/googleapis/gax-go/v2") with GOPRIVATE naming that exact path = %v, want false (real go classifies it public: the repo root "github.com/googleapis/gax-go" doesn't match)`, got)
+	}
+	// Sanity check the other direction: a GOPRIVATE pattern that does cover
+	// the repo root (not just the full module path) must still count as
+	// private, exactly like real go.
+	t.Setenv("GOPRIVATE", "github.com/googleapis/gax-go")
+	if got := localGovcsPrivate("github.com/googleapis/gax-go/v2"); !got {
+		t.Errorf(`localGovcsPrivate("github.com/googleapis/gax-go/v2") with GOPRIVATE naming the repo root = %v, want true`, got)
+	}
+}
+
 // TestGovcsConfigError covers govcsConfigError against the five malformed
 // shapes confirmed live against a real toolchain (2026-09-27, GOPROXY=direct
 // against a fresh GOMODCACHE so the direct-VCS/checkGOVCS path is actually

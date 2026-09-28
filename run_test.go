@@ -289,6 +289,42 @@ func TestRun_LocalModulePrivate_GovcsUsesGoprivateNotGonoproxy(t *testing.T) {
 	}
 }
 
+// TestRun_LocalModulePrivate_GovcsUsesRepoRootNotFullModulePath is the
+// run()-level regression case for the localGovcsPrivate repo-root bug (see
+// TestLocalGovcsPrivate_UsesRepoRootNotFullModulePath in govcs_test.go for
+// the live-toolchain verification): a GOPRIVATE pattern that names a
+// module's full import path — including a real major-version subdirectory
+// like "/v2" — matches that full path but never matches the truncated
+// github.com/owner/repo root real cmd/go's GOVCS classification actually
+// checks. Confirmed live (2026-09-28): with GOPRIVATE=
+// "github.com/googleapis/gax-go/v2" (a real module living in a real "v2"
+// subdirectory) and GOVCS="public:off,private:git", `go mod download -x
+// github.com/googleapis/gax-go/v2@v2.7.0` fails with "GOVCS disallows using
+// git for public github.com/googleapis/gax-go; see 'go help vcs'" — real go
+// classified it public. Before this fix, this tool classified it private
+// (matching the full module path), evaluated the permissive "private:git"
+// rule instead of "public:off", and reported statusPrivateModuleLocally
+// ("will fetch it directly ... no problem") for a fetch that actually fails
+// outright.
+func TestRun_LocalModulePrivate_GovcsUsesRepoRootNotFullModulePath(t *testing.T) {
+	t.Setenv("GOPRIVATE", "github.com/googleapis/gax-go/v2")
+	t.Setenv("GOVCS", "public:off,private:git")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"github.com/googleapis/gax-go/v2@v2.7.0"}, &stdout, &stderr, endpoints{})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "govcs-disallowed-locally") {
+		t.Errorf("stdout = %q, want it to mention govcs-disallowed-locally", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "GOVCS disallows using git for public github.com/googleapis/gax-go;") {
+		t.Errorf("stdout = %q, want it to quote real go's exact error naming the truncated repo root, not the full module path", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "private-module-locally") {
+		t.Errorf("stdout = %q, want it NOT to fall back to the plain private-module-locally message", stdout.String())
+	}
+}
+
 // TestRun_LocalModulePrivate_LeadingSpaceDoesNotMatch is the run()-level
 // regression case for the splitPatterns leading-space bug (see
 // pattern_test.go's TestSplitPatterns_LeadingSpaceBreaksMatch for the
