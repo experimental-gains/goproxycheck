@@ -95,6 +95,33 @@ func TestModuleFromGoMod_ParenBlock(t *testing.T) {
 	}
 }
 
+// TestModuleFromGoMod_ParenBlock_NoSpaceBeforeParen is a regression test for
+// a real bug: "module(" (no space before the opening paren) used to match
+// neither the block-open check nor the single-line path check in
+// moduleDirective (both required the very next byte after "module" to be a
+// space or tab), so this line fell through unmatched entirely, the block's
+// real path line was never reached, and moduleFromGoMod reported "has no
+// 'module' directive" — confirmed live (2026-09-28) that this is real,
+// accepted go.mod syntax: golang.org/x/mod/modfile.Parse/ParseLax both
+// resolve it to the same module path as the spaced form, and a real `go
+// list -m`/`go mod verify` against a go.mod written exactly this way
+// succeed and report the correct module path. Go's lexer tokenizes "module"
+// and "(" independently of whitespace, the same way it does for every
+// other verb/block-open pair.
+func TestModuleFromGoMod_ParenBlock_NoSpaceBeforeParen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "go.mod")
+	_ = os.WriteFile(path, []byte("module(\n\tgithub.com/foo/bar\n)\n\ngo 1.24\n"), 0o644)
+
+	got, err := moduleFromGoMod(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "github.com/foo/bar"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
 // TestModuleFromGoMod_ParenBlock_QuotedAndComment covers the same block
 // form with a quoted path and a trailing comment inside the block, and a
 // comment on the closing paren — both valid go.mod syntax for the

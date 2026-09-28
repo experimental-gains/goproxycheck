@@ -459,6 +459,21 @@ func moduleFromGoMod(path string) (string, error) {
 // bug in canonicalModulePath's use of this function would have misfired a
 // bogus wrong-import-path diagnosis had the proxy-served go.mod for a
 // resolved version used this style.
+//
+// Also handles the block form written with no space before the opening
+// paren ("module(\n\texample.com/foo\n)") — confirmed live (2026-09-28)
+// against both golang.org/x/mod/modfile (Parse and ParseLax agree) and the
+// real `go` toolchain (`go list -m`, `go mod verify` on a real go.mod
+// written this way) that this parses identically to the spaced form: Go's
+// lexer tokenizes "module" and "(" independently of whitespace, exactly
+// like it does for every other verb/block-open pair. Before this, the
+// no-space line matched neither the block-open check nor the single-line
+// path check below (the CutPrefix guard required the very next byte to be
+// a space or tab), so it fell through unmatched, the block's real path
+// line was never reached, and the function reported "has no 'module'
+// directive" for a go.mod the real toolchain reads fine — the same
+// dropped-block failure mode as the space-before-paren bug fixed above,
+// just one character earlier.
 func moduleDirective(data string) (string, error) {
 	inBlock := false
 	blockMod := ""
@@ -481,7 +496,10 @@ func moduleDirective(data string) (string, error) {
 			}
 			continue
 		}
-		if rest, ok := strings.CutPrefix(line, "module"); ok && rest != "" && (rest[0] == ' ' || rest[0] == '\t') {
+		// rest[0] == '(' (no space) is included alongside the ordinary
+		// space/tab separator: "module(" is real, accepted go.mod syntax
+		// for the block-open line — see this function's doc comment.
+		if rest, ok := strings.CutPrefix(line, "module"); ok && rest != "" && (rest[0] == ' ' || rest[0] == '\t' || rest[0] == '(') {
 			rest = strings.TrimSpace(rest)
 			if stripLineComment(rest) == "(" {
 				inBlock = true
