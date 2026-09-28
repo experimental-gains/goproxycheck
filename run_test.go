@@ -903,8 +903,20 @@ func TestRun_SumdbLagWithGosumdbOff(t *testing.T) {
 // (standing in for a real sumdb-lag window) never having caught up, even
 // though a real `go install` in this exact environment would never consult
 // it at all.
+//
+// The GOSUMDB fixture here is a genuinely well-formed verifier key (built
+// with golang.org/x/mod/sumdb/note.GenerateKey, name "sumdb.mycompany.example")
+// plus a URL — confirmed live that `go install` accepts this exact value
+// during GOSUMDB validation and only then fails on an unrelated network
+// error dialing the (nonexistent) custom host, never on "invalid GOSUMDB".
+// This test used to use "mycompany.example+abc123 https://sumdb.mycompany.example"
+// instead — see TestRun_SumdbLagWithMalformedGosumdb below for why that
+// fixture was itself a real bug this file's own tests were carrying: "abc123"
+// isn't a valid key hash, so a real `go install` under that exact value
+// fails outright with "invalid GOSUMDB: malformed verifier id", the opposite
+// of "ready."
 func TestRun_SumdbLagWithCustomGosumdb(t *testing.T) {
-	t.Setenv("GOSUMDB", "mycompany.example+abc123 https://sumdb.mycompany.example")
+	t.Setenv("GOSUMDB", "sumdb.mycompany.example+18034219+ARh1MwsDARWl2XLlkBuE9hyxjXsSk5sX709QEBIDy21S https://sumdb.mycompany.example")
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, sumdbLagEndpoints(t))
 	if code != 0 {
@@ -913,8 +925,42 @@ func TestRun_SumdbLagWithCustomGosumdb(t *testing.T) {
 	if !strings.Contains(stdout.String(), "ready") {
 		t.Errorf("stdout = %q, want it to mention ready", stdout.String())
 	}
-	if !strings.Contains(stdout.String(), `custom GOSUMDB "mycompany.example"`) {
+	if !strings.Contains(stdout.String(), `custom GOSUMDB "sumdb.mycompany.example"`) {
 		t.Errorf("stdout = %q, want it to explain the custom-GOSUMDB reason", stdout.String())
+	}
+}
+
+// TestRun_SumdbLagWithMalformedGosumdb is a regression test for a real bug:
+// a custom (non-"off", non-public) $GOSUMDB that doesn't actually parse as a
+// valid checksum-database verifier key used to be treated exactly like a
+// genuinely working custom database — see the now-fixed fixture in
+// TestRun_SumdbLagWithCustomGosumdb above, which used this exact value.
+//
+// Confirmed live (2026-09-28) against a fresh, isolated GOMODCACHE: `GOSUMDB=
+// "mycompany.example+abc123 https://sumdb.mycompany.example" go install
+// golang.org/x/text@v0.14.0` (a module not already recorded in any local
+// go.sum, so verification is actually attempted) fails outright with
+// "invalid GOSUMDB: malformed verifier id" — real `go install` never
+// reaches the custom database at all, let alone treats the public sumdb's
+// lag as irrelevant. Before this fix, goproxycheck reported statusReady
+// ("a plain `go install` will work right now") for exactly this
+// configuration — the opposite of what a real `go install` does.
+func TestRun_SumdbLagWithMalformedGosumdb(t *testing.T) {
+	t.Setenv("GOSUMDB", "mycompany.example+abc123 https://sumdb.mycompany.example")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, sumdbLagEndpoints(t))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s", code, stdout.String())
+	}
+	out := stdout.String()
+	if strings.Contains(out, "\nready\n") || strings.Contains(out, ": ready\n") {
+		t.Errorf("stdout = %q, must not report ready: a real `go install` under this exact GOSUMDB fails outright", out)
+	}
+	if !strings.Contains(out, "gosumdb-malformed-locally") {
+		t.Errorf("stdout = %q, want it to mention gosumdb-malformed-locally", out)
+	}
+	if !strings.Contains(out, "invalid GOSUMDB: malformed verifier id") {
+		t.Errorf("stdout = %q, want it to quote the real `go` error", out)
 	}
 }
 

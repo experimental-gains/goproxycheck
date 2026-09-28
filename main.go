@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -20,6 +21,7 @@ import (
 	"unicode"
 
 	"golang.org/x/mod/semver"
+	"golang.org/x/mod/sumdb/note"
 
 	// Aliased: resolveTarget's named return value is itself called "module"
 	// (a string, the module path), which would otherwise shadow this package
@@ -161,13 +163,25 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 			r := ep.probe(module, version)
 			d = diagnose(r)
 			if d.status == statusSumdbLag {
-				// See localSumdbSkipped's doc comment: a local GOSUMDB=off
-				// or a matching GONOSUMDB pattern means `go install` never
-				// consults sum.golang.org for this module at all, so a
-				// sumdb-lag verdict from the public sumdb doesn't reflect
-				// what will actually happen here — the proxy already has
-				// it, so it's ready right now.
-				if skipped, reason := localSumdbSkipped(module); skipped {
+				// Checked before localSumdbSkipped: a custom (non-"off",
+				// non-public) $GOSUMDB only genuinely means "verification
+				// goes elsewhere, the public sumdb's lag is irrelevant" when
+				// it's actually a well-formed checksum-database verifier key
+				// — see localGosumdbConfigError's doc comment for why a
+				// malformed one is a real, unconditional failure instead, not
+				// a safe skip.
+				if err := localGosumdbConfigError(module); err != nil {
+					d = diagnosis{statusGosumdbMalformedLocally, fmt.Sprintf(
+						"%s is live on proxy.golang.org, but before that would even matter, your local `GOSUMDB` config is itself malformed (%v) — real `go install`/`go get` fails outright with `invalid GOSUMDB: %v` the moment it actually needs to verify this (or any) module against the checksum database, regardless of what sum.golang.org has. "+
+							"That's your machine's own config, not a proxy-availability problem. Fix `GOSUMDB` (see `go help goproxy`), or set `GOSUMDB=off` if you intend to skip verification entirely.",
+						displayTarget(r), err, err)}
+				} else if skipped, reason := localSumdbSkipped(module); skipped {
+					// See localSumdbSkipped's doc comment: a local GOSUMDB=off
+					// or a matching GONOSUMDB pattern means `go install` never
+					// consults sum.golang.org for this module at all, so a
+					// sumdb-lag verdict from the public sumdb doesn't reflect
+					// what will actually happen here — the proxy already has
+					// it, so it's ready right now.
 					d = diagnosis{statusReady, fmt.Sprintf(
 						"%s is live on proxy.golang.org. sum.golang.org doesn't have it yet, but your local %s means "+
 							"`go install`/`go get` won't consult the checksum database for this module here at all, so that lag doesn't block you — a plain `go install` will work right now.",
@@ -205,7 +219,13 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 			// (see unknownRevisionMarker's doc comment) can never resolve no
 			// matter how long this polls — there's no tag/branch/commit for
 			// the proxy to eventually pick up.
-			if !*wait || d.status == statusReady || d.status == statusModuleUnknown || d.status == statusBlocklistedMalicious || d.status == statusWrongImportPath || d.status == statusRetracted || d.status == statusDeprecated || d.status == statusZipBuildError || d.status == statusMajorVersionMismatch || d.status == statusUnknownRevision || time.Now().After(deadline) {
+			// statusGosumdbMalformedLocally joins this list for the same
+			// reason as statusGovcsMalformedLocally isn't even reached by
+			// this polling loop at all (it's diagnosed before the probe):
+			// a malformed local $GOSUMDB is this machine's own config, and
+			// no amount of proxy.golang.org/sum.golang.org catching up
+			// changes it — it needs a config fix, not a wait.
+			if !*wait || d.status == statusReady || d.status == statusModuleUnknown || d.status == statusBlocklistedMalicious || d.status == statusWrongImportPath || d.status == statusRetracted || d.status == statusDeprecated || d.status == statusZipBuildError || d.status == statusMajorVersionMismatch || d.status == statusUnknownRevision || d.status == statusGosumdbMalformedLocally || time.Now().After(deadline) {
 				break
 			}
 			time.Sleep(*interval)
@@ -832,6 +852,97 @@ func sumdbName(gosumdb string) string {
 	name, _, _ := strings.Cut(gosumdb, " ")
 	name, _, _ = strings.Cut(name, "+")
 	return name
+}
+
+// knownGOSUMDB mirrors cmd/go's own modfetch/key.go verbatim: the only bare
+// name real go resolves to a known checksum-database verifier key without
+// the caller spelling out the full "name+hash+base64key" form. Any other
+// bare name that isn't itself a well-formed verifier key fails to parse
+// below, exactly like it does in real go.
+var knownGOSUMDB = map[string]string{
+	"sum.golang.org": "sum.golang.org+033de0ae+Ac4zctda0e5eza+HJyk9SxEdh+s3Ux18htTTAD8OuAn8",
+}
+
+// gosumdbConfigError reports the error real go's own dbDial (modfetch/
+// sumdb.go, verified directly against that source) raises for a non-"off"
+// $GOSUMDB value before it ever opens a connection to any checksum
+// database, public or custom. sumdbName (above) only extracts *which*
+// database a raw GOSUMDB value names — it doesn't check that the value
+// actually parses as one, so a bare custom hostname (a very natural,
+// plausible way to misconfigure this by analogy to GOPROXY's own bare-host
+// GOPROXY=proxy.golang.org syntax — see normalizeGoproxyURL — but GOSUMDB's
+// own format has no such implicit-scheme fallback) makes sumdbName return
+// that hostname as if it named a real, working custom database.
+//
+// Confirmed live (2026-09-28): `GOSUMDB=sum.example.com go install
+// golang.org/x/text@v0.14.0` (a module not already in any local go.sum, so
+// verification is actually attempted) fails outright with "invalid GOSUMDB:
+// malformed verifier id" — sumdbName("sum.example.com") returns
+// "sum.example.com" unchanged, which localSumdbSkipped used to treat as "a
+// real custom database is in use, so the public sumdb's lag is irrelevant,
+// this is ready" (see its own doc comment, whose only confirmed-live case
+// was a deliberately well-formed key+URL pair). That's backwards for this
+// shape: the real command doesn't quietly use a different database, it
+// refuses to install the module at all, for any module, until GOSUMDB is
+// fixed. Also confirmed live: "invalid GOSUMDB: too many fields" for a
+// three-field value, and "invalid GOSUMDB: invalid verifier hash" for a
+// name+key pair whose embedded hash doesn't match its own key (a copy-paste
+// truncation/corruption) — both go through the identical note.NewVerifier
+// parse this mirrors.
+func gosumdbConfigError(gosumdb string) error {
+	if gosumdb == "sum.golang.google.cn" {
+		gosumdb = "sum.golang.org https://sum.golang.google.cn"
+	}
+	if gosumdb == "off" {
+		return nil
+	}
+	fields := strings.Fields(gosumdb)
+	if len(fields) == 0 {
+		return fmt.Errorf("missing GOSUMDB")
+	}
+	if len(fields) > 2 {
+		return fmt.Errorf("invalid GOSUMDB: too many fields")
+	}
+	key := fields[0]
+	if k, ok := knownGOSUMDB[key]; ok {
+		key = k
+	}
+	if _, err := note.NewVerifier(key); err != nil {
+		return fmt.Errorf("invalid GOSUMDB: %v", err)
+	}
+	if len(fields) == 2 {
+		if _, err := url.Parse(fields[1]); err != nil {
+			return fmt.Errorf("invalid GOSUMDB URL: %v", err)
+		}
+	}
+	return nil
+}
+
+// localGosumdbConfigError reports the error a real `go install`/`go get`
+// would raise from a malformed local $GOSUMDB the moment it actually needs
+// to verify module against the checksum database — nil when verification
+// would be skipped anyway (GOSUMDB=off, or module matches GONOSUMDB, which
+// defaults to GOPRIVATE's value when unset — mirroring real go's own
+// useSumDB check in modfetch/sumdb.go: `cfg.GOSUMDB != "off" &&
+// !module.MatchPrefixPatterns(cfg.GONOSUMDB, mod.Path)`) or when GOSUMDB
+// parses fine, whether or not it names the public sum.golang.org. Best-
+// effort like its sibling localGovcsConfigError: a failed `go env` call
+// doesn't block the real check.
+func localGosumdbConfigError(module string) error {
+	out, err := exec.Command("go", "env", "GOSUMDB").Output()
+	if err != nil {
+		return nil
+	}
+	gosumdb := strings.TrimSpace(string(out))
+	if gosumdb == "off" {
+		return nil
+	}
+	if nonsumOut, err := exec.Command("go", "env", "GONOSUMDB").Output(); err == nil {
+		if matchesAnyPattern(module, splitPatterns(strings.TrimSpace(string(nonsumOut)))) {
+			return nil
+		}
+	}
+	return gosumdbConfigError(gosumdb)
 }
 
 // localSumdbSkipped reports whether the local `go` command's effective
