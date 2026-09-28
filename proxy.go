@@ -396,35 +396,80 @@ func comparisonQuery(v string) (op, operand string, ok bool) {
 // comparison — callers fall back to probing the literal query string in
 // that case, the same as for any other version query this tool can't
 // resolve up front.
+//
+// Restricted to non-prerelease ("release") versions first, only falling
+// back to prerelease versions (anything with a semver.Prerelease suffix —
+// "-rc.1", "-beta2", "-dev", "-alpha.0", etc.) when zero release versions
+// satisfy the comparison at all — mirroring cmd/go's own resolution
+// exactly (modload/query.go's queryMatcher.filterVersions splits every
+// candidate into releases/prereleases up front, and the caller "prefers"
+// picking from releases outright: `if len(releases) > 0 { return
+// lookup(releases[...]) }`, only reaching the prereleases branch when that
+// slice is empty — go.dev/ref/mod#version-queries: "then it prefers the
+// latest release version"). This is not just a tie-break: a prerelease can
+// raw-semver-compare as "closer" to the bound than every available release
+// and still lose, because cmd/go never even considers prereleases once any
+// release satisfies the filter.
+//
+// Confirmed live (2026-09-28) against google.golang.org/grpc, a real
+// module whose highest tagged version overall is a prerelease with no
+// released counterpart (v1.86.0-dev, an in-progress next-minor marker tag)
+// sitting above its highest real release (v1.84.0): `go get -x
+// google.golang.org/grpc@<v2.0.0` in a fresh module resolves to v1.84.0
+// (confirmed via the `go: added google.golang.org/grpc v1.84.0` trace
+// line) — never touching v1.86.0-dev even though semver.Compare places it
+// higher and it satisfies the same "<v2.0.0" bound. Before this fix,
+// resolveComparisonQuery picked purely by raw semver.Compare across every
+// listed version regardless of prerelease status, so goproxycheck reported
+// google.golang.org/grpc@<v2.0.0 as "resolved to v1.86.0-dev" — a
+// different version than the one a real `go get`/`go install` actually
+// resolves and fetches for the identical query.
 func resolveComparisonQuery(op, operand string, listed []string) (resolved string, ok bool) {
 	if !semver.IsValid(operand) {
 		return "", false
 	}
+	pick := func(candidates []string) (resolved string) {
+		for _, v := range candidates {
+			cmp := semver.Compare(v, operand)
+			var matches bool
+			switch op {
+			case "<":
+				matches = cmp < 0
+			case "<=":
+				matches = cmp <= 0
+			case ">":
+				matches = cmp > 0
+			case ">=":
+				matches = cmp >= 0
+			}
+			if !matches {
+				continue
+			}
+			better := resolved == "" ||
+				(op[0] == '<' && semver.Compare(v, resolved) > 0) ||
+				(op[0] == '>' && semver.Compare(v, resolved) < 0)
+			if better {
+				resolved = v
+			}
+		}
+		return resolved
+	}
+
+	var releases, prereleases []string
 	for _, v := range listed {
 		if !semver.IsValid(v) {
 			continue
 		}
-		cmp := semver.Compare(v, operand)
-		var matches bool
-		switch op {
-		case "<":
-			matches = cmp < 0
-		case "<=":
-			matches = cmp <= 0
-		case ">":
-			matches = cmp > 0
-		case ">=":
-			matches = cmp >= 0
-		}
-		if !matches {
-			continue
-		}
-		better := resolved == "" ||
-			(op[0] == '<' && semver.Compare(v, resolved) > 0) ||
-			(op[0] == '>' && semver.Compare(v, resolved) < 0)
-		if better {
-			resolved = v
+		if semver.Prerelease(v) != "" {
+			prereleases = append(prereleases, v)
+		} else {
+			releases = append(releases, v)
 		}
 	}
-	return resolved, resolved != ""
+
+	if r := pick(releases); r != "" {
+		return r, true
+	}
+	r := pick(prereleases)
+	return r, r != ""
 }

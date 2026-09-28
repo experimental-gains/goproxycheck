@@ -157,6 +157,50 @@ func TestResolveComparisonQuery(t *testing.T) {
 	}
 }
 
+// TestResolveComparisonQuery_PrefersReleaseOverHigherPrerelease is the fix
+// for a real bug found by testing goproxycheck against a real module's
+// actual @v/list: resolveComparisonQuery used to pick purely by raw
+// semver.Compare across every listed version, with no regard for whether a
+// candidate was a tagged release or a prerelease. Real cmd/go
+// (modload/query.go's queryMatcher.filterVersions/Query) never does that —
+// it splits candidates into releases and prereleases up front and only
+// ever considers prereleases when zero releases satisfy the comparison at
+// all, per go.dev/ref/mod#version-queries ("... prefers the latest release
+// version").
+//
+// Confirmed live (2026-09-28) against google.golang.org/grpc, whose real
+// @v/list includes a prerelease marker tag (v1.86.0-dev, an in-progress
+// next-minor placeholder with no released counterpart) that raw-semver-compares
+// higher than its actual highest release (v1.84.0): `go get -x
+// google.golang.org/grpc@<v2.0.0` resolves to v1.84.0 (confirmed via the
+// `go: added google.golang.org/grpc v1.84.0` trace line), never touching
+// v1.86.0-dev even though it satisfies the identical "<v2.0.0" bound and
+// compares higher. This fixture reproduces that exact shape: a release
+// lower than a prerelease, both satisfying the bound.
+func TestResolveComparisonQuery_PrefersReleaseOverHigherPrerelease(t *testing.T) {
+	listed := []string{"v1.60.0", "v1.84.0", "v1.86.0-dev"}
+	cases := []struct {
+		op, operand string
+		want        string
+		wantOK      bool
+	}{
+		// A release exists satisfying the bound: pick the highest release,
+		// never the higher-raw-semver prerelease.
+		{"<", "v2.0.0", "v1.84.0", true},
+		{"<=", "v2.0.0", "v1.84.0", true},
+		// No release satisfies ">v1.84.0" (only the prerelease does): fall
+		// back to the prerelease since releases is empty for this bound.
+		{">", "v1.84.0", "v1.86.0-dev", true},
+		{">=", "v1.86.0-dev", "v1.86.0-dev", true},
+	}
+	for _, c := range cases {
+		got, ok := resolveComparisonQuery(c.op, c.operand, listed)
+		if got != c.want || ok != c.wantOK {
+			t.Errorf("resolveComparisonQuery(%q, %q, listed) = (%q, %v), want (%q, %v)", c.op, c.operand, got, ok, c.want, c.wantOK)
+		}
+	}
+}
+
 // TestProbe_ComparisonQueryResolvesViaList is the fix for a real bug found
 // by testing goproxycheck against real documented Go version-query forms:
 // a comparison query like "<v0.20.0" (go.dev/ref/mod#version-queries).
