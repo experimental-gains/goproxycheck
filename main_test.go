@@ -308,6 +308,41 @@ func TestResolveTarget_ComparisonVersionQueryNotRejected(t *testing.T) {
 	}
 }
 
+// TestResolveTarget_InvalidComparisonOperandRejected is a regression test
+// for a real bug: a comparison-query version (go.dev/ref/mod#version-queries)
+// whose operand isn't itself a valid semantic version — e.g. "<1.2.3"
+// (missing the required "v" prefix), ">=badversion", "<v1.2.3-" (a trailing
+// hyphen with no pre-release identifier), "<=v1.2.3.4" (four components), or
+// the bare operator "<" alone — used to sail through resolveTarget
+// unrejected (isComparisonVersionQuery only checks the '<'/'>' prefix, not
+// whether the rest is a valid version) and get probed against the real
+// proxy as a literal query string, which can never succeed: confirmed live
+// (2026-09-28) that `go get golang.org/x/mod@<1.2.3` and the other examples
+// above all fail immediately and unconditionally with `invalid semantic
+// version %q in range %q`, entirely offline, before cmd/go ever contacts a
+// proxy. Before this check, goproxycheck instead diagnosed statusNotYetIndexed
+// ("retry in a minute, or use --wait") — a doomed poll, since a query shaped
+// like this never appears in @v/list no matter how long it's retried.
+func TestResolveTarget_InvalidComparisonOperandRejected(t *testing.T) {
+	for _, version := range []string{
+		"<1.2.3",       // missing "v" prefix
+		">=badversion", // not a version at all
+		"<v1.2.3-",     // trailing hyphen, no pre-release identifier
+		"<=v1.2.3.4",   // four components
+		"<",            // bare operator, empty operand
+	} {
+		t.Run(version, func(t *testing.T) {
+			_, _, err := resolveTarget([]string{"example.com/mod@" + version})
+			if err == nil {
+				t.Fatalf("expected an error for invalid comparison operand %q", version)
+			}
+			if !strings.Contains(err.Error(), "invalid semantic version") {
+				t.Errorf("error should mention the real `go` wording (\"invalid semantic version\"): %v", err)
+			}
+		})
+	}
+}
+
 func TestResolveTarget_FallbackToGoModAndGitTag(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)

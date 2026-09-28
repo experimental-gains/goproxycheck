@@ -355,7 +355,33 @@ func resolveTarget(args []string) (module, version string, err error) {
 			// statusMajorVersionMismatch, and statusUnknownRevision.
 			return "", "", fmt.Errorf(`version "patch" can only be resolved relative to a version %s already requires in some go.mod — goproxycheck has no such existing-requirement context for a bare module@version argument, and neither does a real 'go get %s@patch' run the same way: it fails immediately with `+"`can't query version \"patch\" of module %s: no existing version is required`"+`, without ever contacting the proxy. Check a concrete version, %s@latest, or %s@upgrade instead (upgrade IS well-defined with no existing requirement: it's equivalent to latest)`, parts[0], parts[0], parts[0], parts[0], parts[0])
 		}
-		if !isComparisonVersionQuery(parts[1]) {
+		if isComparisonVersionQuery(parts[1]) {
+			// A comparison query is only actually well-formed if its operand is
+			// itself a valid semantic version — confirmed live (2026-09-28) that
+			// `go get golang.org/x/mod@<1.2.3` (missing the required "v" prefix),
+			// `@>=badversion`, `@<v1.2.3-` (trailing hyphen with no pre-release
+			// identifier), `@<=v1.2.3.4` (four components), and even the bare
+			// operator `@<` all fail immediately and unconditionally with
+			// `invalid semantic version %q in range %q`, entirely offline, before
+			// cmd/go ever contacts a proxy — the same shape of offline rejection
+			// isComparisonVersionQuery's own doc comment already documents for a
+			// malformed operand containing a disallowed character (`<v0.1:9`).
+			//
+			// Before this check, resolveTarget let any string starting with '<'/'>'
+			// through unconditionally, so a comparison query with an invalid
+			// operand reached probe()'s comparisonQuery/resolveComparisonQuery,
+			// which correctly declined to resolve it locally (operand isn't valid
+			// semver) but then fell back to probing the literal query string
+			// against the real proxy — a request that can never succeed, since no
+			// real version is ever spelled with a leading '<' or '>' — and fell
+			// through to the generic statusNotYetIndexed fallback ("ordinary
+			// indexing lag ... retry in a minute, or use --wait"), the same
+			// doomed-poll shape already fixed for "patch", whitespace, and
+			// disallowed-character versions nearby in this function.
+			if _, operand, ok := comparisonQuery(parts[1]); ok && !semver.IsValid(operand) {
+				return "", "", fmt.Errorf("version %q is not a valid comparison version query (go.dev/ref/mod#version-queries) — %q is not a valid semantic version, so a real `go get`/`go install` rejects this exact string immediately with `invalid semantic version %q in range %q`, entirely offline, before ever contacting the proxy, so this could never resolve no matter how long you --wait or retry", parts[1], operand, operand, parts[1])
+			}
+		} else {
 			// Confirmed live against cmd/go's own modfetch/proxy.go
 			// (proxyRepo.Stat: `encRev, err := module.EscapeVersion(rev); if
 			// err != nil { return nil, p.versionError(rev, err) }`, called
