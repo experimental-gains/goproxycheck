@@ -33,6 +33,7 @@ const (
 	statusGovcsMalformedLocally   status = "govcs-malformed-locally"
 	statusGosumdbMalformedLocally status = "gosumdb-malformed-locally"
 	statusUnknownRevision         status = "unknown-revision"
+	statusInvalidPseudoVersion    status = "invalid-pseudo-version"
 )
 
 // isRepoCheckInconclusive reports whether a repo-reachability probe status
@@ -197,6 +198,61 @@ const unknownRevisionMarker = "invalid version: unknown revision"
 
 func isUnknownRevision(body string) bool {
 	return strings.Contains(body, unknownRevisionMarker)
+}
+
+// invalidPseudoVersionMarker is the distinctive prefix proxy.golang.org
+// includes in the plain-text body of a 404 response when the requested
+// version has the syntactic shape of a pseudo-version
+// (vX.Y.Z-yyyymmddhhmmss-abcdef123456, go.dev/ref/mod#pseudo-versions) but
+// fails a check specific to that shape, rather than naming a revision that
+// doesn't exist at all (isUnknownRevision, right above, handles that
+// separate case). Confirmed live (2026-09-28) with two distinct variants,
+// each reproduced against two independent proxy backends (a
+// go.googlesource.com-backed module and a GitHub-hosted one):
+//
+//   - A real, existing commit hash paired with a fabricated/mistyped
+//     timestamp segment: querying
+//     golang.org/x/mod/@v/v0.0.0-20200101000000-d0a27b2d4a48.info (the real
+//     v0.41.0 commit hash, wrong date) 404s with "invalid pseudo-version:
+//     does not match version-control timestamp (expected
+//     20260824205642)"; github.com/golang/protobuf/@v/
+//     v0.0.0-20200101000000-75de7c059e36.info (the real v1.5.4 commit hash,
+//     same wrong date) 404s with the identical wording, just a different
+//     expected timestamp.
+//   - A base-version segment that doesn't correspond to any real preceding
+//     tag: golang.org/x/mod/@v/v0.41.5-0.20260824205642-d0a27b2d4a48.info
+//     (correct timestamp and commit hash, but v0.41.5's implied preceding
+//     tag v0.41.4 was never tagged) 404s with "invalid pseudo-version:
+//     preceding tag (v0.41.4) not found".
+//
+// `go get` fails outright with this exact message in both cases, immediately
+// — confirmed live for the first variant: `go get
+// golang.org/x/mod@v0.0.0-20200101000000-d0a27b2d4a48` in a fresh module
+// exits 1 with "invalid pseudo-version: does not match version-control
+// timestamp (expected 20260824205642)" verbatim. Like unknownRevisionMarker,
+// this is a permanent property of the version string itself (its encoded
+// timestamp or base tag can never retroactively become correct — the real
+// commit's timestamp is fixed forever, and a tag that was never cut can't be
+// waited for at this exact version string), not the not-yet-indexed/
+// negative-cache timing conditions the fallback at the bottom of diagnose
+// assumes. A realistic way this happens in practice: a script or CI step
+// hand-constructs a pseudo-version from a commit's author date instead of
+// its commit date (git tracks both separately and `go` always uses the
+// commit date), or derives the "preceding tag" segment from the wrong
+// major/minor/patch line.
+//
+// Without this check, a malformed pseudo-version like this fell through to
+// the not-yet-indexed fallback ("ordinary indexing lag — retry in a minute,
+// or use --wait"), which is actively wrong: no amount of waiting or
+// retrying fixes a timestamp or base-tag that was wrong the moment it was
+// written, and under --wait this polled the full --timeout for an answer
+// that was already final on the first probe — the same shape of waste
+// already fixed for statusUnknownRevision, statusZipBuildError, and
+// statusMajorVersionMismatch.
+const invalidPseudoVersionMarker = "invalid pseudo-version:"
+
+func isInvalidPseudoVersion(body string) bool {
+	return strings.Contains(body, invalidPseudoVersionMarker)
 }
 
 // isProxyErrorStatus reports whether code is a "terminal error" response
@@ -485,6 +541,24 @@ func diagnose(r report) diagnosis {
 				"This isn't the negative-cache bug or ordinary indexing lag (both require the version to already be a real, existing tag/branch/commit that the proxy just hasn't picked up yet) — it's a permanent invalid-version error, and a real `go install`/`go get` fails outright with this same message right now. --wait and a retry can't fix it. "+
 				"Check for a typo in the version, tag, or commit hash, or confirm that revision actually exists in the repository.",
 			displayTarget(r), firstLine(r.versionInfo.body))}
+	}
+
+	// Checked alongside isUnknownRevision above for the same reason: a 404
+	// whose body carries this specific proxy-generated prefix means the
+	// pseudo-version string names a real revision but has a malformed
+	// timestamp or base-tag segment that can never become correct — see
+	// invalidPseudoVersionMarker's doc comment for the live verification
+	// across two distinct variants and two independent proxy backends. This
+	// is a different, more specific failure than isUnknownRevision: the
+	// named commit does exist, it's the pseudo-version encoding around it
+	// that's wrong, so it needs its own advice rather than "confirm that
+	// revision actually exists."
+	if isInvalidPseudoVersion(r.versionInfo.body) {
+		return diagnosis{statusInvalidPseudoVersion, fmt.Sprintf(
+			"%s: proxy.golang.org rejects this as a malformed pseudo-version: %s. "+
+				"This isn't the negative-cache bug or ordinary indexing lag — the named commit/tag isn't in question, but the pseudo-version's own encoded timestamp or base-tag segment doesn't match reality, which can never become correct no matter how long you wait or retry, and a real `go install`/`go get` fails outright with this same message right now. "+
+				"Check how this pseudo-version was constructed: `go mod download %s@<commit-hash-or-branch>` (or `go list -m %s@<commit>`) has the proxy compute the correct canonical pseudo-version for you, rather than hand-building the yyyymmddhhmmss-hash segment.",
+			displayTarget(r), firstLine(r.versionInfo.body), r.module, r.module)}
 	}
 
 	// The blocklist check above only sees @latest/@v/list, which catches a

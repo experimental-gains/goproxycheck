@@ -225,6 +225,27 @@ actually seeing:
   you wait. `goproxycheck` reports this as a distinct `unknown-revision`
   diagnosis and stops immediately under `--wait` instead of polling the
   full `--timeout`.
+- `invalid pseudo-version: does not match version-control timestamp` /
+  `invalid pseudo-version: preceding tag (...) not found` — the version you
+  checked has the right *shape* for a pseudo-version
+  (`vX.Y.Z-yyyymmddhhmmss-abcdef123456`) and names a commit that really
+  exists, but its encoded timestamp or base-tag segment is wrong — a
+  realistic way this happens: a script derives the timestamp from a
+  commit's author date instead of its commit date (`go` always uses the
+  commit date), or gets the preceding-tag line wrong. Verified live
+  (2026-09-28) on two independent proxy backends and two variants each: a
+  real commit hash from `golang.org/x/mod`'s v0.41.0 tag paired with a
+  fabricated date, and the identical shape against `github.com/golang/
+  protobuf`'s v1.5.4 tag, both 404 with "does not match version-control
+  timestamp"; a well-formed-looking `v0.41.5-0.<timestamp>-<hash>` 404s
+  separately with "preceding tag (v0.41.4) not found" since v0.41.5 was
+  never tagged. `go get` fails outright with the identical message
+  immediately in every case. Without this check it fell through to the
+  same `not-yet-indexed` fallback as ordinary indexing lag, which is wrong
+  — the real commit's timestamp can never retroactively match, and a tag
+  that was never cut can't start existing by waiting. `goproxycheck`
+  reports this as a distinct `invalid-pseudo-version` diagnosis and stops
+  immediately under `--wait`.
 
 ## Install
 

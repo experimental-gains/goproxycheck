@@ -1192,6 +1192,61 @@ func TestDiagnose_UnknownRevision(t *testing.T) {
 	}
 }
 
+// TestDiagnose_InvalidPseudoVersion reproduces a real, live-confirmed proxy
+// response (2026-09-28): a pseudo-version pairing a real commit hash with a
+// fabricated timestamp — e.g. querying
+// https://proxy.golang.org/golang.org/x/mod/@v/v0.0.0-20200101000000-d0a27b2d4a48.info
+// (the real v0.41.0 commit, wrong date) 404s with "invalid pseudo-version:
+// does not match version-control timestamp (expected 20260824205642)", and
+// the identical shape against github.com/golang/protobuf's v1.5.4 commit
+// hash 404s with the same wording. `go get
+// golang.org/x/mod@v0.0.0-20200101000000-d0a27b2d4a48` fails outright with
+// this exact message immediately (confirmed live). Before this check, this
+// body didn't match isUnknownRevision (no "unknown revision" substring) or
+// any other marker, so it fell through to the not-yet-indexed fallback —
+// "ordinary indexing lag ... retry in a minute, or use --wait" — for a
+// version whose encoded timestamp can never retroactively become correct.
+func TestDiagnose_InvalidPseudoVersion(t *testing.T) {
+	const module = "golang.org/x/mod"
+	const version = "v0.0.0-20200101000000-d0a27b2d4a48"
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/" + module + "/@latest":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, `{"Version":"v0.41.0"}`)
+		case "/" + module + "/@v/list":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "v0.41.0\n")
+		case "/" + module + "/@v/" + version + ".info":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = fmt.Fprintf(w, "not found: %s@%s: invalid pseudo-version: does not match version-control timestamp (expected 20260824205642)", module, version)
+		case "/" + module + "/@v/v0.41.0.mod":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "module "+module+"\n")
+		default:
+			t.Fatalf("unexpected request to %s", r.URL.Path)
+		}
+	}))
+	defer proxy.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/" + module + "@" + version: http.StatusNotFound,
+	})
+	defer sum.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, client: proxy.Client()}
+	r := ep.probe(module, version)
+	got := diagnose(r)
+	if got.status != statusInvalidPseudoVersion {
+		t.Fatalf("status = %s, want %s (a malformed pseudo-version is a permanent error, not indexing lag); message: %s", got.status, statusInvalidPseudoVersion, got.message)
+	}
+	if !strings.Contains(got.message, "does not match version-control timestamp") {
+		t.Errorf("message should quote the proxy's own error body, got: %s", got.message)
+	}
+	if strings.Contains(got.message, "retry in a minute") {
+		t.Errorf("message should not suggest retrying like ordinary indexing lag, got: %s", got.message)
+	}
+}
+
 // TestDiagnose_ProxyErrorStatus_ModuleUnknown reproduces the run #380 find:
 // per go.dev/ref/mod#goproxy-protocol, only 404/410 mean "not found" — any
 // other 4xx/5xx (429, 500, 502, 503, ...) is a terminal protocol error the

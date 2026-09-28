@@ -219,13 +219,20 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 			// (see unknownRevisionMarker's doc comment) can never resolve no
 			// matter how long this polls — there's no tag/branch/commit for
 			// the proxy to eventually pick up.
+			// statusInvalidPseudoVersion joins this list for the same reason
+			// right next to it: a pseudo-version whose encoded timestamp or
+			// base-tag segment doesn't match reality (see
+			// invalidPseudoVersionMarker's doc comment) can never become
+			// correct no matter how long this polls — the real commit's
+			// timestamp is fixed forever, and a tag that was never cut can't
+			// start existing at this exact version string by waiting.
 			// statusGosumdbMalformedLocally joins this list for the same
 			// reason as statusGovcsMalformedLocally isn't even reached by
 			// this polling loop at all (it's diagnosed before the probe):
 			// a malformed local $GOSUMDB is this machine's own config, and
 			// no amount of proxy.golang.org/sum.golang.org catching up
 			// changes it — it needs a config fix, not a wait.
-			if !*wait || d.status == statusReady || d.status == statusModuleUnknown || d.status == statusBlocklistedMalicious || d.status == statusWrongImportPath || d.status == statusRetracted || d.status == statusDeprecated || d.status == statusZipBuildError || d.status == statusMajorVersionMismatch || d.status == statusUnknownRevision || d.status == statusGosumdbMalformedLocally || time.Now().After(deadline) {
+			if !*wait || d.status == statusReady || d.status == statusModuleUnknown || d.status == statusBlocklistedMalicious || d.status == statusWrongImportPath || d.status == statusRetracted || d.status == statusDeprecated || d.status == statusZipBuildError || d.status == statusMajorVersionMismatch || d.status == statusUnknownRevision || d.status == statusInvalidPseudoVersion || d.status == statusGosumdbMalformedLocally || time.Now().After(deadline) {
 				break
 			}
 			time.Sleep(*interval)
