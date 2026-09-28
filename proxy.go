@@ -215,16 +215,51 @@ func (e endpoints) probe(module, version string) report {
 			checkVersion = info.Version
 			r.resolvedVersion = info.Version
 		}
+	} else if op, operand, ok := comparisonQuery(version); ok && r.list.ok {
+		// A comparison query ("<v1.2.3", "<=v1.2.3", ">v1.2.3", ">=v1.2.3",
+		// go.dev/ref/mod#version-queries) is, like "latest"/"upgrade" just
+		// above, resolved by cmd/go itself against the module's list of
+		// tagged versions — it is never sent to the proxy as a literal
+		// per-version query, because there is no such endpoint for it any
+		// more than there's a @v/latest.info one. Confirmed live
+		// (2026-09-28): `go get -x golang.org/x/mod@<v0.20.0` never issues a
+		// request for any "<v0.20.0"-shaped path at all; it resolves locally
+		// from @v/list to v0.19.0 (the highest listed version below
+		// v0.20.0), then fetches that version's .info/.zip/.mod normally —
+		// the same resolve-then-fetch shape "latest" uses, just against
+		// @v/list instead of @latest.
+		//
+		// This tool used to lump comparison queries in with the
+		// partial-version/revision-identifier queries handled below (a
+		// partial version like "v0.19", or a revision identifier like a
+		// branch name) on the theory that both "resolve directly against
+		// @v/<query>.info" — true for the latter, confirmed false for a
+		// comparison query: proxy.golang.org 404s
+		// .../@v/%3cv0.20.0.info with "bad request: invalid escaped version
+		// \"<v0.20.0\": invalid char '<'" (confirmed live, both via a raw
+		// HTTP request and via this tool's own escapePath, which doesn't
+		// percent-encode '<' — net/http does that automatically when the
+		// request is actually sent). That body matches none of this file's
+		// specific error markers, so it fell through to the generic
+		// not-yet-indexed fallback ("ordinary indexing lag ... retry in a
+		// minute, or use --wait") for a query that can never succeed as a
+		// literal string no matter how long it's retried — the same
+		// doomed-poll shape already fixed for "patch", whitespace, and
+		// disallowed-character versions in resolveTarget (main.go).
+		if resolved, found := resolveComparisonQuery(op, operand, r.listedVersions()); found {
+			checkVersion = resolved
+			r.resolvedVersion = resolved
+		}
 	}
 
 	r.versionInfo = e.get(fmt.Sprintf("%s/%s/@v/%s.info", e.proxyBase, mod, escapePath(checkVersion)))
 
-	// Unlike "latest" (handled above, since it has no @v/latest.info
-	// endpoint at all), other documented version queries — a partial
-	// version like "v0.19", a comparison like "<v1.2.3", or a revision
-	// identifier such as a branch name or commit hash — DO resolve
-	// directly against @v/<query>.info: confirmed live that
-	// proxy.golang.org accepts the literal query there and returns the
+	// Unlike "latest"/"upgrade" and comparison queries (both handled above,
+	// since neither has a real per-version proxy endpoint to query
+	// directly), other documented version queries — a partial version like
+	// "v0.19", or a revision identifier such as a branch name or commit
+	// hash — DO resolve directly against @v/<query>.info: confirmed live
+	// that proxy.golang.org accepts the literal query there and returns the
 	// resolved canonical version in the response body (e.g. querying
 	// .../@v/v0.19.info for golang.org/x/mod returns
 	// {"Version":"v0.19.0",...}; .../@v/master.info similarly resolves to
@@ -335,4 +370,61 @@ func normalizedMajor(v string) string {
 	default:
 		return m
 	}
+}
+
+// comparisonQuery parses a version-query string of one of the four
+// documented comparison forms (go.dev/ref/mod#version-queries): "<v1.2.3",
+// "<=v1.2.3", ">v1.2.3", or ">=v1.2.3". ok is false for anything else. The
+// two-character operators are checked first so e.g. "<=v1.2.3" is split as
+// operator "<=" with operand "v1.2.3", not operator "<" with operand
+// "=v1.2.3".
+func comparisonQuery(v string) (op, operand string, ok bool) {
+	for _, candidate := range []string{"<=", ">=", "<", ">"} {
+		if strings.HasPrefix(v, candidate) {
+			return candidate, strings.TrimPrefix(v, candidate), true
+		}
+	}
+	return "", "", false
+}
+
+// resolveComparisonQuery picks the version among listed (a module's
+// @v/list) that "op operand" selects, per go.dev/ref/mod#version-queries:
+// the highest listed version less than (or, for "<=", less than or equal
+// to) operand for "<"/"<=", or the lowest listed version greater than (or,
+// for ">=", greater than or equal to) operand for ">"/">=". ok is false if
+// operand isn't a valid semantic version or no listed version satisfies the
+// comparison — callers fall back to probing the literal query string in
+// that case, the same as for any other version query this tool can't
+// resolve up front.
+func resolveComparisonQuery(op, operand string, listed []string) (resolved string, ok bool) {
+	if !semver.IsValid(operand) {
+		return "", false
+	}
+	for _, v := range listed {
+		if !semver.IsValid(v) {
+			continue
+		}
+		cmp := semver.Compare(v, operand)
+		var matches bool
+		switch op {
+		case "<":
+			matches = cmp < 0
+		case "<=":
+			matches = cmp <= 0
+		case ">":
+			matches = cmp > 0
+		case ">=":
+			matches = cmp >= 0
+		}
+		if !matches {
+			continue
+		}
+		better := resolved == "" ||
+			(op[0] == '<' && semver.Compare(v, resolved) > 0) ||
+			(op[0] == '>' && semver.Compare(v, resolved) < 0)
+		if better {
+			resolved = v
+		}
+	}
+	return resolved, resolved != ""
 }

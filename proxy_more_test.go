@@ -106,6 +106,122 @@ func TestProbe_VersionQueryResolvesForSumLookup(t *testing.T) {
 	}
 }
 
+// TestComparisonQuery checks the operator/operand split for the four
+// documented comparison version-query forms (go.dev/ref/mod#version-queries),
+// including that "<=" and ">=" aren't mis-split as "<"/">" with a leading
+// "=" left in the operand.
+func TestComparisonQuery(t *testing.T) {
+	cases := []struct {
+		v           string
+		op, operand string
+		ok          bool
+	}{
+		{"<v1.2.3", "<", "v1.2.3", true},
+		{"<=v1.2.3", "<=", "v1.2.3", true},
+		{">v1.2.3", ">", "v1.2.3", true},
+		{">=v1.2.3", ">=", "v1.2.3", true},
+		{"v1.2.3", "", "", false},
+		{"latest", "", "", false},
+	}
+	for _, c := range cases {
+		op, operand, ok := comparisonQuery(c.v)
+		if op != c.op || operand != c.operand || ok != c.ok {
+			t.Errorf("comparisonQuery(%q) = (%q, %q, %v), want (%q, %q, %v)", c.v, op, operand, ok, c.op, c.operand, c.ok)
+		}
+	}
+}
+
+// TestResolveComparisonQuery checks the picked version for each operator
+// against a fixed @v/list, plus the two failure cases (invalid operand, no
+// listed version satisfies the comparison).
+func TestResolveComparisonQuery(t *testing.T) {
+	listed := []string{"v1.0.0", "v1.2.0", "v1.5.0", "v2.0.0"}
+	cases := []struct {
+		op, operand string
+		want        string
+		wantOK      bool
+	}{
+		{"<", "v1.5.0", "v1.2.0", true},
+		{"<=", "v1.5.0", "v1.5.0", true},
+		{">", "v1.2.0", "v1.5.0", true},
+		{">=", "v1.2.0", "v1.2.0", true},
+		{"<", "v1.0.0", "", false}, // nothing listed is lower
+		{">", "v2.0.0", "", false}, // nothing listed is higher
+		{"<", "not-a-version", "", false},
+	}
+	for _, c := range cases {
+		got, ok := resolveComparisonQuery(c.op, c.operand, listed)
+		if got != c.want || ok != c.wantOK {
+			t.Errorf("resolveComparisonQuery(%q, %q, listed) = (%q, %v), want (%q, %v)", c.op, c.operand, got, ok, c.want, c.wantOK)
+		}
+	}
+}
+
+// TestProbe_ComparisonQueryResolvesViaList is the fix for a real bug found
+// by testing goproxycheck against real documented Go version-query forms:
+// a comparison query like "<v0.20.0" (go.dev/ref/mod#version-queries).
+// Confirmed live against proxy.golang.org and a real `go get -x`: unlike a
+// partial version ("v0.19") or a revision identifier (a branch name), which
+// DO resolve directly against @v/<query>.info, a comparison query is never
+// sent to the proxy as a literal per-version query at all — `go get
+// golang.org/x/mod@<v0.20.0` resolves it locally from @v/list (to v0.19.0,
+// the highest listed version below v0.20.0) and never issues any request
+// for a "<v0.20.0"-shaped path. Querying the literal string directly
+// against the proxy — what this tool used to do — 404s with
+// proxy.golang.org's real body "bad request: invalid escaped version
+// \"<v0.20.0\": invalid char '<'" (confirmed live), which matched none of
+// diagnose's specific error markers and fell through to the generic
+// not-yet-indexed fallback: "retry in a minute, or use --wait" for a query
+// that could never succeed as a literal string no matter how long it was
+// retried.
+//
+// This fake server 404s the literal "<v0.20.0" per-version path with that
+// exact real body (so the test fails loudly, via a wrong diagnosis, if the
+// fix regresses and probe() ever falls back to probing it literally again)
+// and only serves .info/sum for the correctly resolved v0.19.0.
+func TestProbe_ComparisonQueryResolvesViaList(t *testing.T) {
+	const badEscapeBody = `bad request: invalid escaped version "<v0.20.0": invalid char '<'`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v0.21.0"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("v0.19.0\nv0.20.0\nv0.21.0\n"))
+		case strings.HasSuffix(r.URL.Path, "/@v/v0.19.0.info"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v0.19.0"}`))
+		case strings.Contains(r.URL.Path, "/lookup/") && strings.HasSuffix(r.URL.Path, "@v0.19.0"):
+			w.WriteHeader(http.StatusOK)
+		case strings.Contains(r.URL.Path, "<v0.20.0"):
+			// The literal, unresolved comparison query — real
+			// proxy.golang.org rejects this outright; it should never be
+			// requested once comparison queries are resolved up front.
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(badEscapeBody))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	ep := endpoints{proxyBase: srv.URL, sumBase: srv.URL, client: srv.Client()}
+
+	r := ep.probe("example.com/mod", "<v0.20.0")
+	if r.resolvedVersion != "v0.19.0" {
+		t.Errorf("resolvedVersion = %q, want %q", r.resolvedVersion, "v0.19.0")
+	}
+	if strings.Contains(r.versionInfo.body, "invalid escaped version") {
+		t.Errorf("versionInfo.body = %q, want the resolved v0.19.0 info, not the doomed literal-query error", r.versionInfo.body)
+	}
+	if !r.ready() {
+		t.Errorf("ready() = false, want true (versionInfo.ok=%v sum.ok=%v)", r.versionInfo.ok, r.sum.ok)
+	}
+	if d := diagnose(r); d.status != statusReady {
+		t.Errorf("diagnose(r).status = %q, want %q (message: %s)", d.status, statusReady, d.message)
+	}
+}
+
 // TestProbe_LatestModFileScopedPastSelfRetractingLatest reproduces
 // github.com/jayconrod/retract, the Go team's own canonical example of a
 // version retracting itself: v1.0.1 retracts both itself and v1.0.0, so
