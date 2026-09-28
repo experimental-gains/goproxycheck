@@ -28,7 +28,12 @@ const govcsDefault = "public:git|hg,private:all"
 // are special patterns matching the already-known private/public status
 // (not a glob against module), everything else is a plain GOPRIVATE-style
 // glob checked via matchesPrefixPattern. vcslist is "off" (block
-// entirely), "all" (allow anything), or a "|"-separated list of VCS names.
+// entirely) or a "|"-separated list of VCS names, where "all" is itself
+// just one more name in that list — matching real go's own govcsConfig.allow,
+// "all" isn't only meaningful as the *entire* vcslist by itself (e.g.
+// "public:all"); it also permits every VCS, including git, when it appears
+// as one alternative alongside others (e.g. "public:hg|all") — see the
+// live-verified case below.
 //
 // Confirmed live against a real toolchain across four cases: a specific
 // pattern before a broader public/private one ("github.com:off,public:git|hg"
@@ -93,14 +98,31 @@ func govcsAllowsGit(module string, private bool, raw string) bool {
 		if !matched {
 			continue
 		}
-		if vcslist == "off" {
-			return false
-		}
-		if vcslist == "all" {
-			return true
-		}
+		// Real cmd/go's own govcsConfig.allow (internal/vcs/vcs.go) doesn't
+		// treat "all" as a distinct whole-vcslist keyword the way this used
+		// to: it splits vcslist the same way regardless, then returns true
+		// the moment *any* individual item equals the VCS name or "all" —
+		// so "all" also permits git when it appears alongside other VCS
+		// names in a "|"-separated list, not just when it's the entire
+		// vcslist string by itself.
+		//
+		// Confirmed live (2026-09-28): with GOVCS="public:hg|all" and
+		// GOPROXY=direct against a fresh GOMODCACHE, `go mod download -x
+		// github.com/golang/protobuf@v1.5.0` succeeds — a full git
+		// ls-remote/fetch/archive trace, no "GOVCS disallows" error — because
+		// the "all" item in the list permits every VCS, including git, even
+		// though "hg" (the other, git-excluding item) precedes it. Before
+		// this fix, vcslist == "all" was only checked as an exact match
+		// against the *whole* vcslist string, so "hg|all" fell through to
+		// the per-item loop below, which only ever looked for a literal
+		// "git" entry and never recognized "all" as one of the alternatives
+		// — so this function reported the fetch as disallowed
+		// (statusGovcsDisallowedLocally, "GOVCS disallows using git for
+		// public github.com/golang/protobuf") for a fetch the real `go`
+		// command actually performs successfully.
 		for _, vcs := range strings.Split(vcslist, "|") {
-			if strings.TrimSpace(vcs) == "git" {
+			vcs = strings.TrimSpace(vcs)
+			if vcs == "git" || vcs == "all" {
 				return true
 			}
 		}

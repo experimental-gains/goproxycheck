@@ -76,6 +76,32 @@ func TestGovcsAllowsGit(t *testing.T) {
 			"github.com/golang/protobuf", false,
 			"public: git | hg", true,
 		},
+		{
+			// Confirmed live (2026-09-28, `GOPROXY=direct go mod download -x`
+			// against github.com/golang/protobuf@v1.5.0 with a fresh
+			// GOMODCACHE): real cmd/go's govcsConfig.allow doesn't treat
+			// "all" as meaningful only when it's the *entire* vcslist string
+			// — it splits vcslist the same way regardless of what's in it,
+			// then permits the fetch the moment any individual item equals
+			// the VCS name or "all". With GOVCS="public:hg|all", the direct
+			// fetch succeeds (full git ls-remote/fetch/archive trace, no
+			// "GOVCS disallows" error) because "all" is one of the two
+			// alternatives, even though "hg" (the other one) doesn't itself
+			// include git. This function used to only special-case vcslist
+			// == "all" as an exact match against the whole string, so
+			// "hg|all" fell through to a loop that only ever looked for a
+			// literal "git" entry — never recognizing "all" as one of the
+			// pipe-separated alternatives — and wrongly reported the fetch
+			// as disallowed.
+			"all as one alternative in a pipe-separated vcslist still allows git",
+			"github.com/golang/protobuf", false,
+			"public:hg|all", true,
+		},
+		{
+			"all as one alternative works for a private module's rule too",
+			"github.com/myorg/priv", true,
+			"private:off|all", true,
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
