@@ -259,6 +259,22 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 			// which threw away a real, checkable answer).
 			d.message = fallbackCaveat(precedingCustom, anyErrorFallback) + " " + d.message
 		}
+		// See negativeCacheDirectFallbackNote's doc comment: a negative-cache
+		// verdict (module-level or per-version) means proxy.golang.org 404s
+		// right now, but that alone doesn't mean a real `go install`/`go get`
+		// on this machine is stuck — under the ordinary, unmodified default
+		// GOPROXY chain (or any chain shaped like it), the exact same 404
+		// makes the go command itself retry via a direct VCS fetch, which a
+		// real public GitHub repo typically satisfies immediately. Append
+		// this as a note rather than replacing the message: the negative
+		// cache is still real (and still what every other GOPROXY=off/
+		// proxy-only user or CI system sees), this only qualifies what
+		// *this* invocation would actually do.
+		if d.status == statusModuleNegativeCache || d.status == statusNegativeCache {
+			if note := negativeCacheDirectFallbackNote(module); note != "" {
+				d.message += " " + note
+			}
+		}
 	}
 
 	if *jsonOut {
@@ -873,6 +889,81 @@ func fallbackCaveat(precedingCustom []string, anyErrorFallback bool) string {
 		"Note: your local `GOPROXY` tries %s before proxy.golang.org, in that order — the documented go.dev/ref/mod#goproxy-protocol fallback-chain pattern (e.g. a company proxy for private modules, falling back to the public proxy for everything else). "+
 			"This tool can only check proxy.golang.org directly, not your own %s, so the result below only applies once every entry ahead of it %s.",
 		strings.Join(precedingCustom, ", "), strings.Join(precedingCustom, ", "), trigger)
+}
+
+// localGoproxyDirectFallback reports whether the local `go` command's
+// effective GOPROXY chain places "direct" as the very next entry right
+// after the public proxy.golang.org entry this tool actually probes. This
+// is deliberately narrow (only the *immediately following* entry, not
+// "direct appears somewhere later"): an intervening custom proxy this tool
+// has no way to probe could itself swallow the 404 differently, so only
+// the unambiguous, directly-adjacent case is claimed here.
+//
+// This matters because of how real cmd/go's own proxy-list fallback
+// actually behaves (confirmed directly against cmd/go/internal/modfetch's
+// TryProxies/lookup source, and live end-to-end): a 404 from one proxy in
+// the chain doesn't just fail that one HTTP request, it makes the go
+// command retry the *entire* module lookup (Stat/GoMod/Zip — everything
+// this tool's negative-cache diagnoses are built on) against the next
+// entry in the chain. Reproduced live (2026-09-29): with
+// GOPROXY="<a proxy that 404s everything>,direct", `go install
+// github.com/experimental-gains/goproxycheck@v0.1.55` (a real, live tag)
+// still succeeds outright — go falls back to a direct git fetch and
+// installs the binary normally, exactly as it would for a module that's
+// genuinely negative-cached on the real proxy.golang.org. The overwhelming
+// majority of installs never override GOPROXY at all, and the *default*
+// value is exactly this shape: "https://proxy.golang.org,direct" (`go help
+// goproxy`).
+//
+// Before this existed, a negative-cache verdict (module-level or
+// per-version) told the user flatly that nothing but waiting or a new tag
+// would help and that "GOPROXY=direct works around it for your own local
+// build" as if that required deliberately overriding GOPROXY — when in
+// fact the ordinary, completely unmodified default config a plain `go
+// install` uses out of the box already ends in ",direct" and would very
+// likely succeed right now, no override needed.
+func localGoproxyDirectFallback() bool {
+	out, err := exec.Command("go", "env", "GOPROXY").Output()
+	if err != nil {
+		return false // best-effort: don't block the real check on this
+	}
+	entries, _ := parseGoproxyChain(strings.TrimSpace(string(out)))
+	for i, url := range entries {
+		switch normalizeGoproxyURL(url) {
+		case defaultProxyBase, defaultProxyBase + "/":
+			return i+1 < len(entries) && entries[i+1] == "direct"
+		}
+	}
+	return false
+}
+
+// negativeCacheDirectFallbackNote returns an additional caveat to append to
+// a negative-cache diagnosis (module-level or per-version) when a plain
+// `go install`/`go get` run on this exact machine right now would likely
+// still succeed via cmd/go's own automatic direct-VCS fallback, despite the
+// proxy negative cache — see localGoproxyDirectFallback's doc comment.
+// Returns "" when that isn't actually established: either the GOPROXY
+// chain doesn't fall back to direct immediately after the public proxy, the
+// module isn't rooted at github.com (the only host this tool has VCS-type
+// certainty for — see githubRepoPattern's doc comment), or the local GOVCS
+// setting would itself block or fail to parse for a direct git fetch of
+// this module (mirroring the same two-stage GOVCS check used elsewhere in
+// run(): a malformed GOVCS blocks every direct fetch outright, regardless
+// of whether any one rule would otherwise have allowed this module).
+func negativeCacheDirectFallbackNote(module string) string {
+	if !localGoproxyDirectFallback() {
+		return ""
+	}
+	if !githubRepoPattern.MatchString(module) {
+		return ""
+	}
+	if localGovcsConfigError() != nil {
+		return ""
+	}
+	if !localGovcsAllowsGit(module, localGovcsPrivate(module)) {
+		return ""
+	}
+	return "Note: your local `GOPROXY` chain falls back to `direct` immediately after proxy.golang.org (this is the out-of-the-box default, unless you've deliberately changed it) — real cmd/go retries the *entire* lookup against the next entry on a 404 like this one, not just this single request, so a plain `go install`/`go get` run here right now will likely still succeed via a direct git fetch, without waiting for the cache to clear or cutting a new tag. This is specific to this exact local/CI config, though: it says nothing about what someone with GOPROXY=off, a proxy-only chain, or a GOVCS rule blocking git would see from the same negative cache."
 }
 
 // localModulePrivate reports whether module matches the local `go`

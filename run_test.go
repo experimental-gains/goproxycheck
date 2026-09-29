@@ -54,6 +54,44 @@ func notYetIndexedEndpoints(t *testing.T) endpoints {
 	return endpoints{proxyBase: srv.URL, sumBase: srv.URL, client: srv.Client()}
 }
 
+// perVersionNegativeCacheEndpoints simulates the per-version negative-cache
+// pattern this tool exists to detect: the module is known (@latest/@v/list
+// both succeed and list the requested version) but that exact version's
+// @v/<version>.info still 404s.
+func perVersionNegativeCacheEndpoints(t *testing.T) endpoints {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v0.2.0"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("v0.1.0\nv0.2.0\n"))
+		default: // .info, sum lookup
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return endpoints{proxyBase: srv.URL, sumBase: srv.URL, client: srv.Client()}
+}
+
+// moduleNegativeCacheEndpoints simulates the whole-module negative-cache
+// pattern: @latest and @v/list both 404, but the repo-reachability check
+// (repoCheckBase) reports the underlying repo as live and public.
+func moduleNegativeCacheEndpoints(t *testing.T) endpoints {
+	t.Helper()
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(proxy.Close)
+	repoCheck := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(repoCheck.Close)
+	return endpoints{proxyBase: proxy.URL, sumBase: proxy.URL, repoCheckBase: repoCheck.URL, client: proxy.Client()}
+}
+
 func TestRun_ReadyText(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, readyEndpoints(t))
@@ -1091,5 +1129,122 @@ func TestRun_SumdbLagWithGonosumdbPattern(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "GONOSUMDB pattern") {
 		t.Errorf("stdout = %q, want it to explain the GONOSUMDB reason", stdout.String())
+	}
+}
+
+// TestRun_NegativeCache_DirectFallbackNote is the fix for a real gap in this
+// tool's core negative-cache diagnosis: it told the user flatly that
+// nothing but waiting (or, for the per-version case, cutting a new tag)
+// would help, and that `GOPROXY=direct` was a deliberate opt-in workaround
+// — but real cmd/go's own proxy-list fallback (confirmed directly against
+// cmd/go/internal/modfetch's TryProxies/lookup source, and live
+// end-to-end: with GOPROXY="<a proxy that 404s everything>,direct", `go
+// install github.com/experimental-gains/goproxycheck@v0.1.55` — a real,
+// live tag — still succeeds via an automatic direct git fetch) retries the
+// *entire* module lookup against the next entry in the chain on a 404, not
+// just that one request. The default GOPROXY value nearly every install
+// leaves untouched, "https://proxy.golang.org,direct", already ends in
+// exactly that fallback — so a plain `go install` on an ordinary,
+// unmodified machine will very likely still succeed right now, without
+// waiting for anything. Before this fix, goproxycheck's message actively
+// implied the opposite: that only a deliberate GOPROXY override would work
+// around it.
+func TestRun_NegativeCache_DirectFallbackNote(t *testing.T) {
+	t.Setenv("GOPROXY", "https://proxy.golang.org,direct")
+	t.Setenv("GOVCS", "")
+	t.Setenv("GOPRIVATE", "")
+	t.Setenv("GONOPROXY", "")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"github.com/example-gains-test/negcache@v0.1.0"}, &stdout, &stderr, perVersionNegativeCacheEndpoints(t))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "negative-cache-suspected") {
+		t.Fatalf("stdout = %q, want it to mention negative-cache-suspected", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "falls back to `direct`") {
+		t.Errorf("stdout = %q, want it to mention the automatic direct-fallback note", stdout.String())
+	}
+}
+
+// TestRun_ModuleNegativeCache_DirectFallbackNote covers the same gap as
+// TestRun_NegativeCache_DirectFallbackNote above, for the whole-module
+// negative-cache verdict (statusModuleNegativeCache) instead of the
+// per-version one — a separate code path in diagnose() that needed the
+// same note.
+func TestRun_ModuleNegativeCache_DirectFallbackNote(t *testing.T) {
+	t.Setenv("GOPROXY", "https://proxy.golang.org,direct")
+	t.Setenv("GOVCS", "")
+	t.Setenv("GOPRIVATE", "")
+	t.Setenv("GONOPROXY", "")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"github.com/example-gains-test/negcache@v0.1.0"}, &stdout, &stderr, moduleNegativeCacheEndpoints(t))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "module-negative-cache-suspected") {
+		t.Fatalf("stdout = %q, want it to mention module-negative-cache-suspected", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "falls back to `direct`") {
+		t.Errorf("stdout = %q, want it to mention the automatic direct-fallback note", stdout.String())
+	}
+}
+
+// TestRun_NegativeCache_NoDirectFallbackNote_NonGithub guards against
+// negativeCacheDirectFallbackNote overclaiming for a module this tool has
+// no VCS-type certainty for (see githubRepoPattern's doc comment) — a
+// non-github.com host might not resolve via direct-fetch discovery at all,
+// so no fallback claim should be made for it.
+func TestRun_NegativeCache_NoDirectFallbackNote_NonGithub(t *testing.T) {
+	t.Setenv("GOPROXY", "https://proxy.golang.org,direct")
+	t.Setenv("GOVCS", "")
+	t.Setenv("GOPRIVATE", "")
+	t.Setenv("GONOPROXY", "")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, perVersionNegativeCacheEndpoints(t))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stdout.String(), "falls back to `direct`") {
+		t.Errorf("stdout = %q, want it NOT to claim a direct fallback for a non-github.com module", stdout.String())
+	}
+}
+
+// TestRun_NegativeCache_NoDirectFallbackNote_GovcsDisallows guards against
+// overclaiming when the local GOVCS setting would itself block a direct
+// git fetch of this (public) module — the same rule real `go` applies via
+// checkGOVCS, mirrored here by localGovcsAllowsGit.
+func TestRun_NegativeCache_NoDirectFallbackNote_GovcsDisallows(t *testing.T) {
+	t.Setenv("GOPROXY", "https://proxy.golang.org,direct")
+	t.Setenv("GOVCS", "public:off")
+	t.Setenv("GOPRIVATE", "")
+	t.Setenv("GONOPROXY", "")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"github.com/example-gains-test/negcache@v0.1.0"}, &stdout, &stderr, perVersionNegativeCacheEndpoints(t))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stdout.String(), "falls back to `direct`") {
+		t.Errorf("stdout = %q, want it NOT to claim a direct fallback when GOVCS disallows git for public modules", stdout.String())
+	}
+}
+
+// TestRun_NegativeCache_NoDirectFallbackNote_NoDirectInChain guards against
+// overclaiming when the local GOPROXY chain simply doesn't have "direct"
+// as the next entry after the public proxy (here: no next entry at all) —
+// the note only applies to a chain actually shaped like the documented
+// default.
+func TestRun_NegativeCache_NoDirectFallbackNote_NoDirectInChain(t *testing.T) {
+	t.Setenv("GOPROXY", "https://proxy.golang.org")
+	t.Setenv("GOVCS", "")
+	t.Setenv("GOPRIVATE", "")
+	t.Setenv("GONOPROXY", "")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"github.com/example-gains-test/negcache@v0.1.0"}, &stdout, &stderr, perVersionNegativeCacheEndpoints(t))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stdout.String(), "falls back to `direct`") {
+		t.Errorf("stdout = %q, want it NOT to claim a direct fallback when GOPROXY has no further entry", stdout.String())
 	}
 }
