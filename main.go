@@ -307,6 +307,33 @@ func isComparisonVersionQuery(v string) bool {
 	return strings.HasPrefix(v, "<") || strings.HasPrefix(v, ">")
 }
 
+// isVersionPrefix reports whether v — already confirmed valid semver by the
+// caller — is an incomplete ("prefix") version rather than a fully-specified
+// one: bare major ("v1"), major.minor ("v1.2"), but not major.minor.patch
+// ("v1.2.3") or anything carrying a pre-release/build suffix. Ported
+// verbatim from cmd/go's own gover.ModIsPrefix (mod.go), restricted to the
+// ordinary-module (non "go"/"toolchain" path) case, since goproxycheck never
+// checks either of those special pseudo-modules: fewer than two dots, and no
+// '-'/'+' anywhere (a version with either of those is always a complete,
+// unambiguous version, never a prefix — see ModIsPrefix's own doc comment,
+// "the caller is assumed to have checked that ModIsValid(path, vers) is
+// true").
+func isVersionPrefix(v string) bool {
+	dots := 0
+	for i := 0; i < len(v); i++ {
+		switch v[i] {
+		case '-', '+':
+			return false
+		case '.':
+			dots++
+			if dots >= 2 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // resolveTarget parses "module@version" from args, or falls back to reading
 // the module path from ./go.mod and the version from the most recent git
 // tag — the shape of "just tagged a release, is it live yet?" this tool is
@@ -421,8 +448,41 @@ func resolveTarget(args []string) (module, version string, err error) {
 			// indexing lag ... retry in a minute, or use --wait"), the same
 			// doomed-poll shape already fixed for "patch", whitespace, and
 			// disallowed-character versions nearby in this function.
-			if _, operand, ok := comparisonQuery(parts[1]); ok && !semver.IsValid(operand) {
-				return "", "", fmt.Errorf("version %q is not a valid comparison version query (go.dev/ref/mod#version-queries) — %q is not a valid semantic version, so a real `go get`/`go install` rejects this exact string immediately with `invalid semantic version %q in range %q`, entirely offline, before ever contacting the proxy, so this could never resolve no matter how long you --wait or retry", parts[1], operand, operand, parts[1])
+			if op, operand, ok := comparisonQuery(parts[1]); ok {
+				if !semver.IsValid(operand) {
+					return "", "", fmt.Errorf("version %q is not a valid comparison version query (go.dev/ref/mod#version-queries) — %q is not a valid semantic version, so a real `go get`/`go install` rejects this exact string immediately with `invalid semantic version %q in range %q`, entirely offline, before ever contacting the proxy, so this could never resolve no matter how long you --wait or retry", parts[1], operand, operand, parts[1])
+				}
+				// "<=" and ">" specifically (not "<" or ">=") are also rejected
+				// when operand is an incomplete ("prefix") version — missing its
+				// patch component, or bare major-only, per cmd/go's own
+				// gover.ModIsPrefix (mod.go): fewer than two dots and no
+				// pre-release/build suffix. Confirmed live (2026-09-29):
+				// `go get golang.org/x/mod@<=v0.19` and `go get golang.org/x/mod@>v0`
+				// both fail immediately and unconditionally with `ambiguous
+				// semantic version %q in range %q`, entirely offline, before ever
+				// contacting the proxy — real cmd/go's own newQueryMatcher
+				// (modload/query.go) comment explains why: "@v1.2 might mean
+				// v1.2.3", so it refuses to guess whether the bound is meant as
+				// exactly vX.Y(.0) or as the whole vX.Y.* line, rather than
+				// resolving one way silently. "<" and ">=" have no such ambiguity
+				// (excluding/including everything from vX.Y.0 up is unambiguous
+				// either way) and were both confirmed live to succeed normally
+				// with the identical prefix-shaped operand (`go get
+				// golang.org/x/mod@<v0.19` and `@>=v0.19` both resolve and
+				// install fine).
+				//
+				// Before this check, resolveTarget let a comparison query like
+				// this through unconditionally (operand is valid semver, so the
+				// check above doesn't catch it), so it reached probe()'s
+				// resolveComparisonQuery, which happily resolved it against
+				// @v/list using plain semver.Compare — no notion of "ambiguous"
+				// exists there — and reported the module statusReady with a
+				// concrete resolved version, when the real `go get`/`go install`
+				// invocation for that exact argument fails outright and installs
+				// nothing.
+				if (op == "<=" || op == ">") && isVersionPrefix(operand) {
+					return "", "", fmt.Errorf("version %q is not a valid comparison version query (go.dev/ref/mod#version-queries) — %q is an incomplete (major or major.minor only) version, and paired with %q a real `go get`/`go install` refuses to guess whether that means exactly %[2]s.0(.0) or the whole %[2]s.* line, rejecting this exact string immediately with `ambiguous semantic version %[2]q in range %[1]q`, entirely offline, before ever contacting the proxy, so this could never resolve no matter how long you --wait or retry. Use a complete major.minor.patch version instead, or switch to `<` / `>=`, neither of which is ambiguous for an incomplete operand", parts[1], operand, op)
+				}
 			}
 		} else {
 			// Confirmed live against cmd/go's own modfetch/proxy.go

@@ -395,6 +395,71 @@ func TestResolveTarget_InvalidComparisonOperandRejected(t *testing.T) {
 	}
 }
 
+// TestResolveTarget_AmbiguousComparisonPrefixRejected is a regression test
+// for a real bug: "<=" and ">" (unlike "<" and ">=") paired with an
+// incomplete ("prefix") semantic-version operand — bare major ("v1") or
+// major.minor ("v1.2"), missing the patch component — used to sail through
+// resolveTarget unrejected (the operand is valid semver, just incomplete, so
+// the invalid-operand check above doesn't catch it) and get resolved against
+// @v/list by probe()'s resolveComparisonQuery, which has no notion of
+// "ambiguous" and just picks a concrete version via plain semver.Compare.
+// Confirmed live (2026-09-29) against cmd/go's own newQueryMatcher
+// (modload/query.go): `go get golang.org/x/mod@<=v0.19` and `go get
+// golang.org/x/mod@>v0` both fail immediately and unconditionally with
+// `ambiguous semantic version %q in range %q`, entirely offline, before ever
+// contacting the proxy — real go refuses to guess whether the bound means
+// exactly vX.Y(.0) or the whole vX.Y.* line. Before this check, goproxycheck
+// instead reported these as statusReady with a concrete resolved version, the
+// opposite of what a real `go get`/`go install` does for that exact argument.
+func TestResolveTarget_AmbiguousComparisonPrefixRejected(t *testing.T) {
+	for _, version := range []string{
+		"<=v0.19", // major.minor only
+		">v0.19",
+		"<=v1", // bare major
+		">v1",
+	} {
+		t.Run(version, func(t *testing.T) {
+			_, _, err := resolveTarget([]string{"example.com/mod@" + version})
+			if err == nil {
+				t.Fatalf("expected an error for ambiguous comparison query %q", version)
+			}
+			if !strings.Contains(err.Error(), "ambiguous") {
+				t.Errorf("error should mention the real `go` wording (\"ambiguous\"): %v", err)
+			}
+		})
+	}
+}
+
+// TestResolveTarget_UnambiguousComparisonPrefixNotRejected guards the two
+// shapes TestResolveTarget_AmbiguousComparisonPrefixRejected's fix must NOT
+// reject: "<" and ">=" paired with the identical incomplete-version operand
+// shape are NOT ambiguous (excluding/including everything from vX.Y.0 up
+// reads the same way either way real `go` could interpret the prefix), and a
+// *complete* major.minor.patch operand paired with "<=" or ">" isn't
+// incomplete at all, so neither triggers the new check. Confirmed live
+// (2026-09-29): `go get golang.org/x/mod@<v0.19` and `go get
+// golang.org/x/mod@>=v0.19` both resolve and install successfully, matching
+// the exact operator/operand combinations exercised here.
+func TestResolveTarget_UnambiguousComparisonPrefixNotRejected(t *testing.T) {
+	for _, version := range []string{
+		"<v0.19",       // "<" with a prefix operand: unambiguous
+		">=v0.19",      // ">=" with a prefix operand: unambiguous
+		"<=v1.2.3",     // "<=" with a complete operand: not a prefix at all
+		">v1.2.3",      // ">" with a complete operand: not a prefix at all
+		"<=v1.2.3-rc1", // "<=" with a complete pre-release operand: not a prefix
+	} {
+		t.Run(version, func(t *testing.T) {
+			_, gotVersion, err := resolveTarget([]string{"example.com/mod@" + version})
+			if err != nil {
+				t.Fatalf("resolveTarget wrongly rejected unambiguous comparison query %q: %v", version, err)
+			}
+			if gotVersion != version {
+				t.Errorf("got version %q, want %q", gotVersion, version)
+			}
+		})
+	}
+}
+
 func TestResolveTarget_FallbackToGoModAndGitTag(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
