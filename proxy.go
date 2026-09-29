@@ -184,11 +184,63 @@ func (e endpoints) probe(module, version string) report {
 		if info, err := parseVersionInfo(r.latest.body); err == nil && info.Version != "" {
 			modVersion := info.Version
 			if r.list.ok {
+				// Walk @v/list for the module's real highest tag in @latest's
+				// own major-version line, the same "past a self-retracting
+				// @latest" search TestProbe_LatestModFileScopedPastSelfRetractingLatest
+				// documents — but split into releases/prereleases and try
+				// releases first, exactly like resolveComparisonQuery below:
+				// real cmd/go's own "latest" query (go.dev/ref/mod#version-queries,
+				// "the latest available, allowed tagged version, with
+				// non-prereleases preferred over prereleases") only ever
+				// falls back to a prerelease tag when the module has no
+				// release tags at all — confirmed reading
+				// modload/query.go's lookup directly: as long as len(releases)
+				// > 0, it returns releases[len(releases)-1] outright and
+				// never even looks at prereleases, regardless of raw semver
+				// ordering. A plain semver.Compare walk here (the old
+				// behavior) can walk right past the correct release target to
+				// a higher-raw-semver prerelease instead — live-confirmed
+				// (2026-09-29) against google.golang.org/grpc, whose @v/list
+				// carries v1.84.0-dev/v1.85.0-dev/v1.86.0-dev prerelease
+				// "next minor" marker tags that all out-rank the real
+				// v1.84.0 release by raw semver, while @latest itself still
+				// correctly names v1.84.0 — see
+				// TestProbe_LatestModFilePrefersReleaseOverHigherPrerelease.
 				wantMajor := normalizedMajor(modVersion)
+				var releases, prereleases []string
 				for _, v := range r.listedVersions() {
-					if normalizedMajor(v) == wantMajor && semver.Compare(v, modVersion) > 0 {
-						modVersion = v
+					// Skip anything that isn't valid semver at all: unlike
+					// the old plain semver.Compare walk (where an invalid
+					// string always compared as "less than" the valid
+					// modVersion and so was silently never selected), this
+					// function's own highest() picks its very first
+					// candidate unconditionally — an unfiltered garbage
+					// entry would otherwise win outright instead of losing
+					// by comparison. normalizedMajor("") already collapses
+					// an invalid v into the v0/v1 line, so this check must
+					// come first.
+					if !semver.IsValid(v) || normalizedMajor(v) != wantMajor {
+						continue
 					}
+					if semver.Prerelease(v) != "" {
+						prereleases = append(prereleases, v)
+					} else {
+						releases = append(releases, v)
+					}
+				}
+				highest := func(candidates []string) string {
+					best := ""
+					for _, v := range candidates {
+						if best == "" || semver.Compare(v, best) > 0 {
+							best = v
+						}
+					}
+					return best
+				}
+				if best := highest(releases); best != "" {
+					modVersion = best
+				} else if best := highest(prereleases); best != "" {
+					modVersion = best
 				}
 			}
 			r.latestModFile = e.get(fmt.Sprintf("%s/%s/@v/%s.mod", e.proxyBase, mod, escapePath(modVersion)))

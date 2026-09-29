@@ -409,6 +409,68 @@ func TestProbe_LatestModFileScopedToMajorLine(t *testing.T) {
 	}
 }
 
+// TestProbe_LatestModFilePrefersReleaseOverHigherPrerelease reproduces a
+// real, live shape on google.golang.org/grpc (2026-09-29): @latest correctly
+// returns v1.84.0 (the actual latest release), but @v/list also carries
+// v1.84.0-dev/v1.85.0-dev/v1.86.0-dev — pre-release "next minor" marker tags
+// that all raw-semver-compare *higher* than v1.84.0 despite having no
+// release behind them yet (confirmed live: `curl
+// https://proxy.golang.org/google.golang.org/grpc/@v/list` lists all four
+// alongside v1.84.0, and `.../@latest` still names v1.84.0).
+//
+// probe()'s latestModFile search exists to walk past a self-retracting
+// @latest to the module's real highest tag (see
+// TestProbe_LatestModFileScopedPastSelfRetractingLatest), but before this
+// fix it did that with a plain semver.Compare walk over every listed
+// version, release or prerelease alike — so on a module shaped like this,
+// it would walk right past the correct v1.84.0 target to the higher-raw-
+// semver v1.86.0-dev prerelease tag instead. That's the same
+// release-preferred-over-prerelease rule already fixed three times in this
+// tool family for version-query resolution (resolveComparisonQuery here,
+// modslop's Lookup and its own resolveComparisonQuery) — go.dev/ref/mod's
+// own "latest" query semantics say "the latest available, allowed tagged
+// version, with non-prereleases preferred over prereleases" even when
+// retraction is deliberately ignored (cmd/go/internal/modload/query.go's
+// queryLatestVersionIgnoringRetractions still resolves via the ordinary
+// "latest" query, which always prefers any release over any prerelease
+// through filterVersions/lookup — confirmed reading that source directly),
+// so fetching the prerelease tag's go.mod instead of the release's is a
+// real divergence, not just an internal implementation detail: a retract or
+// deprecation notice present only in the true latest release's go.mod (and
+// not yet copied into the interim dev tag, or vice versa) would be read
+// from the wrong version entirely.
+func TestProbe_LatestModFilePrefersReleaseOverHigherPrerelease(t *testing.T) {
+	const module = "google.golang.org/grpc"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v1.84.0"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("v1.84.0\nv1.84.0-dev\nv1.85.0-dev\nv1.86.0-dev\n"))
+		case strings.HasSuffix(r.URL.Path, "/@v/v1.84.0.mod"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("module " + module + "\n\ngo 1.25\n\n// REALRELEASE\n"))
+		case strings.HasSuffix(r.URL.Path, "/@v/v1.86.0-dev.mod"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("module " + module + "\n\ngo 1.25\n\n// WRONGPRERELEASE\n"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	ep := endpoints{proxyBase: srv.URL, sumBase: srv.URL, client: srv.Client()}
+
+	r := ep.probe(module, "v1.84.0")
+	if !r.latestModFile.ok {
+		t.Fatalf("latestModFile.ok = false, want true")
+	}
+	if !strings.Contains(r.latestModFile.body, "REALRELEASE") || strings.Contains(r.latestModFile.body, "WRONGPRERELEASE") {
+		t.Errorf("latestModFile.body = %q, want v1.84.0's go.mod (the highest *release* tag, matching real cmd/go's own \"latest\" query semantics), not the higher-raw-semver v1.86.0-dev prerelease tag's go.mod", r.latestModFile.body)
+	}
+}
+
 func TestReady(t *testing.T) {
 	cases := []struct {
 		name string
