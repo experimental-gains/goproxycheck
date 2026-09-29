@@ -469,9 +469,34 @@ func diagnose(r report) diagnosis {
 	// this gate, the exact opposite of what a real `go install` does.
 	if r.versionInfo.ok && r.latestModFile.ok {
 		if rationale, retracted := retraction(r.latestModFile.body, r.checkVersion()); retracted {
-			explain := "no rationale was given in the retract directive"
+			// "retracted by module author" — not "no rationale was given"
+			// (this tool's wording before this fix) — matching the real go
+			// command's own phrasing exactly (cmd/go/internal/modload/
+			// modfile.go's ModuleRetractedError.Error(): msg := "retracted by
+			// module author"; only appended ": "+rationale when one was
+			// actually attributed to *this* entry). The distinction matters
+			// because an empty rationale here doesn't mean the go.mod gave no
+			// explanation at all — golang.org/x/mod/modfile.Parse (the same
+			// parser retraction() uses) only attributes a retract block's
+			// leading "//" comment to the first version immediately following
+			// it, not to every version in a multi-version group sharing that
+			// comment. Confirmed live, 2026-09, against the real, current
+			// github.com/klauspost/compress go.mod, which groups
+			// v1.14.3/v1.14.2/v1.14.1 under one shared comment
+			// ("https://github.com/klauspost/compress/pull/503"):
+			// mf.Retract[i].Rationale is "" for v1.14.2 and v1.14.1 even
+			// though the go.mod plainly explains the whole group. `go list -m
+			// -u -retracted -f '{{.Retracted}}'` and `go get` against the real
+			// proxy (go1.25.1) both confirm real go never makes the false "no
+			// rationale" claim either — they print "retracted by module
+			// author" for v1.14.2, the same fixed fallback string used
+			// whether or not a sibling entry in the same go.mod happens to
+			// carry a comment. See modslop's identical fix for the same
+			// underlying x/mod/modfile behavior (check.go's
+			// evaluateModuleStatus).
+			explain := "retracted by module author"
 			if rationale != "" {
-				explain = fmt.Sprintf("rationale given: %q", rationale)
+				explain = fmt.Sprintf("retracted by module author: %q", rationale)
 			}
 			// r.versionInfo.ok only confirms the proxy has this version; a
 			// still-inflight sum.golang.org (r.sum.ok false) means it hasn't

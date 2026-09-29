@@ -753,7 +753,7 @@ func TestDiagnose_Retracted(t *testing.T) {
 	if got.status != statusRetracted {
 		t.Fatalf("status = %s, want %s; message: %s", got.status, statusRetracted, got.message)
 	}
-	if !strings.Contains(got.message, `rationale given: "Accidental; no major changes or features."`) {
+	if !strings.Contains(got.message, `retracted by module author: "Accidental; no major changes or features."`) {
 		t.Fatalf("expected the retraction rationale to be quoted, got: %s", got.message)
 	}
 	if !strings.Contains(got.message, "go install") {
@@ -811,8 +811,95 @@ func TestDiagnose_RetractedPastSelfRetractingLatest(t *testing.T) {
 	if got.status != statusRetracted {
 		t.Fatalf("status = %s, want %s; message: %s", got.status, statusRetracted, got.message)
 	}
-	if !strings.Contains(got.message, `rationale given: "Published accidentally."`) {
+	if !strings.Contains(got.message, `retracted by module author: "Published accidentally."`) {
 		t.Fatalf("expected the retraction rationale to be quoted, got: %s", got.message)
+	}
+}
+
+// TestDiagnose_RetractedGroupedCommentNotAttributedToThisVersion is modeled
+// on a real, live-verified case: github.com/klauspost/compress's actual
+// go.mod (fetched from proxy.golang.org, 2026-09, at its latest tag
+// v1.20.1) groups several retracted versions under one shared leading
+// comment:
+//
+//	retract (
+//		// https://github.com/klauspost/compress/issues/1114
+//		v1.18.1
+//
+//		// https://github.com/klauspost/compress/pull/503
+//		v1.14.3
+//		v1.14.2
+//		v1.14.1
+//	)
+//
+// Confirmed live against golang.org/x/mod/modfile.Parse (the same parser
+// retraction() in retract.go uses): it attributes the "pull/503" comment
+// only to the *first* version immediately following it (v1.14.3) —
+// mf.Retract[i].Rationale is "" for v1.14.2 and v1.14.1, even though the
+// go.mod plainly explains the retraction for the whole group. Before this
+// fix, diagnose() took that empty Rationale at face value and reported "no
+// rationale was given in the retract directive" for v1.14.2 — false: a
+// rationale was given, golang.org/x/mod/modfile just doesn't re-attach a
+// group comment to every sibling entry it covers.
+//
+// Confirmed live against the real go command too (`go list -m -u
+// -retracted -f '{{.Retracted}}'` and `go get`, go1.25.1, against the real
+// proxy for github.com/klauspost/compress@v1.14.2): both print "retracted
+// by module author" — cmd/go/internal/modload/modfile.go's own
+// ModuleRetractedError.Error() always starts from that fixed string and
+// only appends ": <rationale>" when one was actually attributed to that
+// specific entry — never the false "no rationale was given" claim this
+// tool used to make. See modslop's identical fix for the same underlying
+// x/mod/modfile behavior (check.go's evaluateModuleStatus).
+func TestDiagnose_RetractedGroupedCommentNotAttributedToThisVersion(t *testing.T) {
+	const module = "github.com/klauspost/compress"
+	const version = "v1.14.2"
+	const latest = "v1.20.1"
+	retractBlock := "module " + module + "\n\ngo 1.25\n\nretract (\n" +
+		"\t// https://github.com/klauspost/compress/issues/1114\n" +
+		"\tv1.18.1\n\n" +
+		"\t// https://github.com/klauspost/compress/pull/503\n" +
+		"\tv1.14.3\n" +
+		"\tv1.14.2\n" +
+		"\tv1.14.1\n)\n"
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/" + module + "/@latest":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2026-09-25T08:00:35Z"}`, latest)
+		case "/" + module + "/@v/list":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, "%s\n%s\n", version, latest)
+		case "/" + module + "/@v/" + version + ".info":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2022-01-01T00:00:00Z"}`, version)
+		case "/" + module + "/@v/" + version + ".mod":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "module "+module+"\n\ngo 1.17\n")
+		case "/" + module + "/@v/" + latest + ".mod":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, retractBlock)
+		default:
+			t.Fatalf("unexpected request to %s", r.URL.Path)
+		}
+	}))
+	defer proxy.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/" + module + "@" + version: http.StatusOK,
+	})
+	defer sum.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, client: proxy.Client()}
+	r := ep.probe(module, version)
+	got := diagnose(r)
+	if got.status != statusRetracted {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusRetracted, got.message)
+	}
+	if strings.Contains(got.message, "no rationale was given") {
+		t.Fatalf("message falsely claims no rationale exists, even though the go.mod's retract block plainly explains this group of versions — got: %s", got.message)
+	}
+	if !strings.Contains(got.message, "retracted by module author") {
+		t.Fatalf("expected the message to match the real go command's own ModuleRetractedError phrasing (%q), got: %s", "retracted by module author", got.message)
 	}
 }
 
