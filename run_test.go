@@ -1248,3 +1248,43 @@ func TestRun_NegativeCache_NoDirectFallbackNote_NoDirectInChain(t *testing.T) {
 		t.Errorf("stdout = %q, want it NOT to claim a direct fallback when GOPROXY has no further entry", stdout.String())
 	}
 }
+
+// TestRun_NotYetIndexed_DirectFallbackNote covers a real gap left behind by
+// the negative-cache fix above (TestRun_NegativeCache_DirectFallbackNote):
+// statusNotYetIndexed is mechanically the same situation from cmd/go's own
+// perspective as statusNegativeCache/statusModuleNegativeCache — a 404 on
+// the @v/<version>.info request that triggered this diagnosis. Real cmd/go's
+// TryProxies (cmd/go/internal/modfetch/proxy.go, confirmed directly against
+// that source) falls back to the next GOPROXY chain entry on any
+// fs.ErrNotExist-equivalent error, with no distinction between "the proxy
+// cached a stale failure" and "the proxy just hasn't indexed this tag yet" —
+// both are just a 404. By the time diagnose() reaches the not-yet-indexed
+// fallback, every permanent-failure marker (isUnknownRevision and friends)
+// has already been ruled out, so — like the negative-cache case — this is
+// overwhelmingly a real, just-pushed tag the automatic direct-VCS fallback
+// can already fetch: confirmed live (2026-09-29) against a real, warm
+// module (golang.org/x/mod/@v/v0.999.999.info and .../@v/totallyfake...info)
+// that a genuinely nonexistent version/branch 404s with the distinct
+// isUnknownRevision marker instead, so it would never reach this fallback in
+// the first place. Before this fix, a freshly-tagged release under the
+// ordinary default GOPROXY chain ("https://proxy.golang.org,direct") got
+// "retry in a minute, or use --wait" with no mention that a plain
+// `go install` right now would likely already succeed via direct git fetch —
+// exactly the caveat the negative-cache statuses already got.
+func TestRun_NotYetIndexed_DirectFallbackNote(t *testing.T) {
+	t.Setenv("GOPROXY", "https://proxy.golang.org,direct")
+	t.Setenv("GOVCS", "")
+	t.Setenv("GOPRIVATE", "")
+	t.Setenv("GONOPROXY", "")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"github.com/example-gains-test/freshtag@v0.1.0"}, &stdout, &stderr, notYetIndexedEndpoints(t))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "not-yet-indexed") {
+		t.Fatalf("stdout = %q, want it to mention not-yet-indexed", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "falls back to `direct`") {
+		t.Errorf("stdout = %q, want it to mention the automatic direct-fallback note", stdout.String())
+	}
+}

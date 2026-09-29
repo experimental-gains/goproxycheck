@@ -270,7 +270,31 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 		// cache is still real (and still what every other GOPROXY=off/
 		// proxy-only user or CI system sees), this only qualifies what
 		// *this* invocation would actually do.
-		if d.status == statusModuleNegativeCache || d.status == statusNegativeCache {
+		//
+		// statusNotYetIndexed belongs in this same list, not just the two
+		// negative-cache statuses: mechanically, cmd/go's own TryProxies
+		// (confirmed directly against cmd/go/internal/modfetch/proxy.go)
+		// falls back to the next chain entry on *any* fs.ErrNotExist-
+		// equivalent error (404/410) from a comma-separated proxy — it has
+		// no notion of "negative cache" vs. "not yet indexed" at all, both
+		// are just a 404 on the @v/<version>.info request that triggered
+		// this diagnosis. By the time diagnose() reaches the not-yet-indexed
+		// fallback, every permanent-failure marker (isUnknownRevision,
+		// isZipBuildError, majorVersionMismatchMarker, ...) has already been
+		// ruled out — confirmed live (2026-09-29) against a real, warm
+		// module (golang.org/x/mod) that a genuinely nonexistent version or
+		// branch name 404s with the isUnknownRevision marker specifically
+		// ("invalid version: unknown revision ..."), so a not-yet-indexed
+		// verdict reaching this point is, like the negative-cache case,
+		// overwhelmingly a real tag the direct-VCS fallback can already
+		// fetch — this tool's own top-of-file comment names exactly this
+		// scenario ("just tagged a release, is it live yet") as the reason
+		// it exists. Before this, a freshly-pushed tag under the ordinary
+		// default GOPROXY chain got the same "retry in a minute, or use
+		// --wait" wording with no mention that a plain `go install` right
+		// now would likely already succeed via automatic direct fetch,
+		// while the mechanically-identical negative-cache case got the note.
+		if d.status == statusModuleNegativeCache || d.status == statusNegativeCache || d.status == statusNotYetIndexed {
 			if note := negativeCacheDirectFallbackNote(module); note != "" {
 				d.message += " " + note
 			}
