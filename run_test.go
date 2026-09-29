@@ -798,6 +798,63 @@ func TestRun_WaitStopsOnNegativeCache(t *testing.T) {
 	}
 }
 
+// noMatchingVersionEndpoints simulates a comparison version query (e.g.
+// "<v0.5.0") for which no published version satisfies the bound — @v/list
+// only lists versions the query excludes. Counts @v/list requests, since a
+// real doomed-poll regression here would show up as repeated @v/list hits
+// (probe() has no per-version endpoint to poll for this case at all — see
+// TestProbe_ComparisonQueryNoMatchSkipsLiteralProbe).
+func noMatchingVersionEndpoints(t *testing.T, listHits *int) endpoints {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v1.5.0"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			*listHits++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("v1.0.0\nv1.5.0\n"))
+		case strings.HasSuffix(r.URL.Path, "/@v/v1.5.0.mod"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("module example.com/mod\n"))
+		default:
+			t.Errorf("unexpected request for %s — a comparison query with no matching version should never reach a per-version endpoint", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return endpoints{proxyBase: srv.URL, sumBase: srv.URL, client: srv.Client()}
+}
+
+// TestRun_WaitStopsOnNoMatchingVersion guards the run()-level early-break
+// list in the --wait polling loop the same way TestRun_WaitStopsOnZipBuildError
+// and TestRun_WaitStopsOnNegativeCache do for their own statuses: a
+// comparison query with no satisfying published version at all (e.g.
+// "<v0.5.0" against a module whose lowest version is v1.0.0) is a permanent,
+// offline-provable failure — real `go get`/`go install` fails immediately
+// with "no matching versions for query", the same "waiting is not the fix"
+// property the other statuses in this list already have. Before the fix,
+// this fell through to statusNotYetIndexed, which was NOT in the early-break
+// list, so --wait polled a doomed @v/list for the full --timeout. Asserting
+// listHits == 1 (not an elapsed-time bound) keeps this deterministic instead
+// of timing-flaky, matching the sibling tests above.
+func TestRun_WaitStopsOnNoMatchingVersion(t *testing.T) {
+	var listHits int
+	ep := noMatchingVersionEndpoints(t, &listHits)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--wait", "--interval=1ms", "--timeout=5s", "example.com/mod@<v0.5.0"}, &stdout, &stderr, ep)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "no-matching-version") {
+		t.Errorf("stdout = %q, want it to mention no-matching-version", stdout.String())
+	}
+	if listHits != 1 {
+		t.Fatalf("@v/list was probed %d times; want exactly 1 — --wait should stop immediately on a no-matching-version verdict instead of polling the full 5s timeout", listHits)
+	}
+}
+
 // majorVersionMismatchEndpoints simulates a version whose go.mod exists but
 // lacks the /vN major-version suffix the proxy requires (the real
 // github.com/osrg/gobgp@v2.16.0 shape) — a permanent property of that tag,

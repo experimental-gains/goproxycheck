@@ -266,6 +266,66 @@ func TestProbe_ComparisonQueryResolvesViaList(t *testing.T) {
 	}
 }
 
+// TestProbe_ComparisonQueryNoMatchSkipsLiteralProbe is a regression test for
+// a real bug found by testing goproxycheck against a comparison version
+// query with a bound no published version satisfies at all — e.g. "<v0.5.0"
+// for a module whose lowest published version is v1.0.0. Confirmed live
+// (2026-09-29) that `go get -x golang.org/x/mod@<v0.0.1` (golang.org/x/mod's
+// lowest published version is well above v0.0.1) issues only @v/list
+// requests and then fails immediately with `no matching versions for query
+// "<v0.0.1"` — it never issues any request for a "<v0.0.1"-shaped path.
+//
+// Before this fix, probe() fell back to sending the literal, never-
+// satisfiable comparison string to the proxy exactly like the doomed-request
+// bug TestProbe_ComparisonQueryResolvesViaList already fixed for the
+// *resolvable* case just above — this fake server fails the test if that
+// literal path is ever requested, or if @v/list is polled more than once.
+func TestProbe_ComparisonQueryNoMatchSkipsLiteralProbe(t *testing.T) {
+	var listHits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v1.5.0"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			listHits++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("v1.0.0\nv1.5.0\n"))
+		case strings.HasSuffix(r.URL.Path, "/@v/v1.5.0.mod"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("module example.com/mod\n"))
+		default:
+			// The literal, never-satisfiable comparison query ("<v0.5.0") —
+			// real cmd/go never requests any path shaped like this; it fails
+			// locally from @v/list alone. If probe() still fell back to
+			// probing it, this 404 (real proxy.golang.org's actual body for
+			// an un-percent-encoded '<') would land here.
+			t.Errorf("unexpected request for %s — the doomed literal comparison query should never reach the proxy", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`bad request: invalid escaped version "<v0.5.0": invalid char '<'`))
+		}
+	}))
+	defer srv.Close()
+	ep := endpoints{proxyBase: srv.URL, sumBase: srv.URL, client: srv.Client()}
+
+	r := ep.probe("example.com/mod", "<v0.5.0")
+	if !r.comparisonQueryNoMatch {
+		t.Errorf("comparisonQueryNoMatch = false, want true (no listed version satisfies \"<v0.5.0\")")
+	}
+	if r.versionInfo.ok || r.versionInfo.statusCode != 0 {
+		t.Errorf("versionInfo = %+v, want a zero value — no per-version probe should have been made", r.versionInfo)
+	}
+	if r.sum.ok || r.sum.statusCode != 0 {
+		t.Errorf("sum = %+v, want a zero value — no sum lookup should have been made", r.sum)
+	}
+	if d := diagnose(r); d.status != statusNoMatchingVersion {
+		t.Errorf("diagnose(r).status = %q, want %q (message: %s)", d.status, statusNoMatchingVersion, d.message)
+	}
+	if listHits != 1 {
+		t.Errorf("@v/list was requested %d times, want exactly 1", listHits)
+	}
+}
+
 // TestProbe_LatestModFileScopedPastSelfRetractingLatest reproduces
 // github.com/jayconrod/retract, the Go team's own canonical example of a
 // version retracting itself: v1.0.1 retracts both itself and v1.0.0, so

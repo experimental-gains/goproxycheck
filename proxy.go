@@ -155,6 +155,20 @@ type report struct {
 	// concrete, canonical version. sum is probed against this resolved
 	// version, not the literal query string. See probe().
 	resolvedVersion string
+	// comparisonQueryNoMatch is set when version is a well-formed comparison
+	// query (see comparisonQuery) whose operand is valid semver, @v/list
+	// fetched successfully, but zero listed versions actually satisfy the
+	// bound — e.g. "<v0.5.0" against a module whose lowest published version
+	// is v1.0.0. Real cmd/go's own query resolution (modload/query.go) fails
+	// immediately and permanently for this with "no matching versions for
+	// query %q", entirely offline once it already has @v/list, never issuing
+	// any request for the literal query string. See diagnose's
+	// statusNoMatchingVersion and probe()'s comparison-query handling, which
+	// skips the versionInfo/sum/modFile probes entirely in this case rather
+	// than sending the doomed literal string to the proxy the way it already
+	// avoids doing for a comparison query that DOES resolve (see
+	// TestProbe_ComparisonQueryResolvesViaList).
+	comparisonQueryNoMatch bool
 }
 
 func (e endpoints) probe(module, version string) report {
@@ -249,51 +263,64 @@ func (e endpoints) probe(module, version string) report {
 		if resolved, found := resolveComparisonQuery(op, operand, r.listedVersions()); found {
 			checkVersion = resolved
 			r.resolvedVersion = resolved
+		} else if semver.IsValid(operand) {
+			// operand is well-formed but no listed version (release or
+			// prerelease) satisfies "op operand" at all — confirmed live
+			// (2026-09-29) that `go get golang.org/x/mod@<v0.0.1` fails
+			// immediately with "no matching versions for query \"<v0.0.1\"",
+			// and its -x trace shows only @v/list requests, never one for any
+			// "<v0.0.1"-shaped path — so unlike the resolvable case just
+			// above, there is no real per-version fetch to fall back to here
+			// at all. See report.comparisonQueryNoMatch's doc comment and
+			// diagnose's statusNoMatchingVersion.
+			r.comparisonQueryNoMatch = true
 		}
 	}
 
-	r.versionInfo = e.get(fmt.Sprintf("%s/%s/@v/%s.info", e.proxyBase, mod, escapePath(checkVersion)))
+	if !r.comparisonQueryNoMatch {
+		r.versionInfo = e.get(fmt.Sprintf("%s/%s/@v/%s.info", e.proxyBase, mod, escapePath(checkVersion)))
 
-	// Unlike "latest"/"upgrade" and comparison queries (both handled above,
-	// since neither has a real per-version proxy endpoint to query
-	// directly), other documented version queries — a partial version like
-	// "v0.19", or a revision identifier such as a branch name or commit
-	// hash — DO resolve directly against @v/<query>.info: confirmed live
-	// that proxy.golang.org accepts the literal query there and returns the
-	// resolved canonical version in the response body (e.g. querying
-	// .../@v/v0.19.info for golang.org/x/mod returns
-	// {"Version":"v0.19.0",...}; .../@v/master.info similarly resolves to
-	// whatever the current tip tag is). sum.golang.org's lookup endpoint,
-	// unlike the proxy, only accepts a canonical version and returns 400
-	// for a query string — so without this, any such query got a
-	// permanently-failing sum.golang.org probe misdiagnosed as
-	// statusSumdbLag ("retry shortly", and under --wait, polls to
-	// timeout), when the module was actually fully ready right now via
-	// its resolved canonical version. Verified live end-to-end: `go get
-	// golang.org/x/mod@v0.19` and `go get golang.org/x/mod@master` both
-	// succeed immediately, and their -x traces show the sum.golang.org
-	// lookup made against the *resolved* canonical version, never the
-	// literal query string.
-	if r.versionInfo.ok && checkVersion == version {
-		if info, err := parseVersionInfo(r.versionInfo.body); err == nil && info.Version != "" && info.Version != checkVersion {
-			checkVersion = info.Version
-			r.resolvedVersion = info.Version
+		// Unlike "latest"/"upgrade" and comparison queries (both handled above,
+		// since neither has a real per-version proxy endpoint to query
+		// directly), other documented version queries — a partial version like
+		// "v0.19", or a revision identifier such as a branch name or commit
+		// hash — DO resolve directly against @v/<query>.info: confirmed live
+		// that proxy.golang.org accepts the literal query there and returns the
+		// resolved canonical version in the response body (e.g. querying
+		// .../@v/v0.19.info for golang.org/x/mod returns
+		// {"Version":"v0.19.0",...}; .../@v/master.info similarly resolves to
+		// whatever the current tip tag is). sum.golang.org's lookup endpoint,
+		// unlike the proxy, only accepts a canonical version and returns 400
+		// for a query string — so without this, any such query got a
+		// permanently-failing sum.golang.org probe misdiagnosed as
+		// statusSumdbLag ("retry shortly", and under --wait, polls to
+		// timeout), when the module was actually fully ready right now via
+		// its resolved canonical version. Verified live end-to-end: `go get
+		// golang.org/x/mod@v0.19` and `go get golang.org/x/mod@master` both
+		// succeed immediately, and their -x traces show the sum.golang.org
+		// lookup made against the *resolved* canonical version, never the
+		// literal query string.
+		if r.versionInfo.ok && checkVersion == version {
+			if info, err := parseVersionInfo(r.versionInfo.body); err == nil && info.Version != "" && info.Version != checkVersion {
+				checkVersion = info.Version
+				r.resolvedVersion = info.Version
+			}
 		}
-	}
 
-	r.sum = e.get(fmt.Sprintf("%s/lookup/%s@%s", e.sumBase, mod, escapePath(checkVersion)))
+		r.sum = e.get(fmt.Sprintf("%s/lookup/%s@%s", e.sumBase, mod, escapePath(checkVersion)))
 
-	if r.versionInfo.ok {
-		// The proxy resolves @latest/@v/<version>.info by VCS origin
-		// discovery against the requested import path, not by checking
-		// the module directive in that version's go.mod — confirmed live
-		// (2026-09) that github.com/grpc/grpc-go/@latest and
-		// google.golang.org/grpc/@latest return the identical
-		// Version/Origin, even though grpc-go's go.mod has declared
-		// "module google.golang.org/grpc" since it moved off the
-		// github.com path. Fetching the actual .mod file here is the only
-		// way to catch that: see canonicalModuleNote.
-		r.modFile = e.get(fmt.Sprintf("%s/%s/@v/%s.mod", e.proxyBase, mod, escapePath(checkVersion)))
+		if r.versionInfo.ok {
+			// The proxy resolves @latest/@v/<version>.info by VCS origin
+			// discovery against the requested import path, not by checking
+			// the module directive in that version's go.mod — confirmed live
+			// (2026-09) that github.com/grpc/grpc-go/@latest and
+			// google.golang.org/grpc/@latest return the identical
+			// Version/Origin, even though grpc-go's go.mod has declared
+			// "module google.golang.org/grpc" since it moved off the
+			// github.com path. Fetching the actual .mod file here is the only
+			// way to catch that: see canonicalModuleNote.
+			r.modFile = e.get(fmt.Sprintf("%s/%s/@v/%s.mod", e.proxyBase, mod, escapePath(checkVersion)))
+		}
 	}
 
 	if !r.moduleKnown() {

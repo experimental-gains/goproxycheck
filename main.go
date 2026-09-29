@@ -244,6 +244,16 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 			// a malformed local $GOSUMDB is this machine's own config, and
 			// no amount of proxy.golang.org/sum.golang.org catching up
 			// changes it — it needs a config fix, not a wait.
+			// statusNoMatchingVersion joins this list for the same reason as
+			// statusUnknownRevision/statusInvalidPseudoVersion right above:
+			// a comparison version query (e.g. "<v0.0.1") for which zero
+			// published versions satisfy the bound can never resolve no
+			// matter how long this polls — the set of already-tagged
+			// versions below/above the bound doesn't change just because
+			// the proxy catches up on indexing; a real `go get`/`go install`
+			// fails immediately and permanently with "no matching versions
+			// for query" for the identical reason. See
+			// report.comparisonQueryNoMatch's doc comment.
 			// statusNegativeCache (the per-version case) belongs in this
 			// list too, and was the one permanent-failure status missing
 			// from it: diagnose's own message for it says outright "It has
@@ -268,7 +278,7 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 			// fix to its whole-module sibling; check each status's own
 			// diagnosis text for what it actually claims about waiting
 			// before assuming they share the same answer.
-			if !*wait || d.status == statusReady || d.status == statusModuleUnknown || d.status == statusBlocklistedMalicious || d.status == statusWrongImportPath || d.status == statusRetracted || d.status == statusDeprecated || d.status == statusZipBuildError || d.status == statusMajorVersionMismatch || d.status == statusUnknownRevision || d.status == statusInvalidPseudoVersion || d.status == statusGosumdbMalformedLocally || d.status == statusNegativeCache || time.Now().After(deadline) {
+			if !*wait || d.status == statusReady || d.status == statusModuleUnknown || d.status == statusBlocklistedMalicious || d.status == statusWrongImportPath || d.status == statusRetracted || d.status == statusDeprecated || d.status == statusZipBuildError || d.status == statusMajorVersionMismatch || d.status == statusUnknownRevision || d.status == statusInvalidPseudoVersion || d.status == statusGosumdbMalformedLocally || d.status == statusNegativeCache || d.status == statusNoMatchingVersion || time.Now().After(deadline) {
 				break
 			}
 			time.Sleep(*interval)

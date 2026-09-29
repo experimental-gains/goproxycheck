@@ -34,6 +34,7 @@ const (
 	statusGosumdbMalformedLocally status = "gosumdb-malformed-locally"
 	statusUnknownRevision         status = "unknown-revision"
 	statusInvalidPseudoVersion    status = "invalid-pseudo-version"
+	statusNoMatchingVersion       status = "no-matching-version"
 )
 
 // isRepoCheckInconclusive reports whether a repo-reachability probe status
@@ -354,6 +355,38 @@ func diagnose(r report) diagnosis {
 		return diagnosis{statusModuleUnknown, "proxy.golang.org has never heard of this module (both @latest and @v/list failed). " +
 			"Check: is the repo public? does the module path in go.mod exactly match the repo (case matters)? " +
 			"is it covered by a GOPRIVATE/GONOSUMDB pattern that's intentionally excluding it from the public proxy?"}
+	}
+
+	// Checked ahead of every other "module known" diagnosis below: a
+	// comparison query (comparisonQuery/resolveComparisonQuery in proxy.go)
+	// for which zero published versions satisfy the bound is a permanent,
+	// offline-provable failure, not the not-yet-indexed/negative-cache timing
+	// conditions the fallback at the bottom of this function assumes. Real
+	// cmd/go's own query resolution (modload/query.go) fails immediately with
+	// `no matching versions for query %q` the moment @v/list comes back with
+	// nothing satisfying the bound — confirmed live (2026-09-29): `go get -x
+	// golang.org/x/mod@<v0.0.1` issues only @v/list requests (golang.org/x/mod's
+	// lowest published version is well above v0.0.1), then fails with that
+	// exact message, never requesting any "<v0.0.1"-shaped path at all.
+	//
+	// Before this check, probe() fell back to sending the literal,
+	// never-satisfiable comparison string to the proxy as if it were an
+	// ordinary version (the same doomed-request shape
+	// TestProbe_ComparisonQueryResolvesViaList already exists to prevent for
+	// the *resolvable* comparison-query case) — proxy.golang.org 404s that
+	// with a "bad request: invalid escaped version ... invalid char" body
+	// matching none of this file's markers, so it fell through all the way to
+	// the generic not-yet-indexed fallback ("ordinary indexing lag ... retry
+	// in a minute, or use --wait") for a query that could never resolve no
+	// matter how long it's retried — the same shape of waste already fixed
+	// for "patch", whitespace, and the other permanent failures this file
+	// special-cases.
+	if r.comparisonQueryNoMatch {
+		return diagnosis{statusNoMatchingVersion, fmt.Sprintf(
+			"%s@%s: no published version of %s satisfies this comparison query — proxy.golang.org's @v/list has nothing in range. "+
+				"A real `go get`/`go install` fails immediately and permanently with `no matching versions for query %q`, without ever contacting the proxy for this literal string. "+
+				"This isn't the negative-cache bug or ordinary indexing lag (both require the version to already exist) — --wait and a retry can't fix it. Check the comparison bound, or run `go list -m -versions %s` to see what's actually published.",
+			r.module, r.version, r.module, r.version, r.module)}
 	}
 
 	// Checked ahead of every "module known" diagnosis below, specifically for
