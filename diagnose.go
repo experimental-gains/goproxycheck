@@ -588,6 +588,27 @@ func diagnose(r report) diagnosis {
 		return proxyErrorDiagnosis("proxy.golang.org", fmt.Sprintf("@v/%s.info", escapePath(r.checkVersion())), r.versionInfo.statusCode)
 	}
 
+	// The fallback below distinguishes not-yet-indexed from negative-cache
+	// by searching r.listedVersions(), which only ever returns data when
+	// r.list.ok is a clean 200 — a genuine proxy-error status here (429,
+	// 500, 502, 503, ...) reads exactly like an empty/absent list (the same
+	// zero-information shape as a clean-but-empty 200), silently telling the
+	// caller "not in @v/list yet ... ordinary indexing lag" when the truth
+	// is "@v/list itself errored, so whether this version is listed is
+	// unknown" — it could just as easily be the negative-cache case this
+	// tool exists to catch. Every other endpoint already gets this same
+	// proxy-error check (see the !moduleKnown() branch above for
+	// r.latest/r.list when both fail, and r.versionInfo/r.sum below/above)
+	// — the one gap was @v/list's own status when r.latest.ok alone already
+	// satisfies moduleKnown(), so the !moduleKnown() branch's list check
+	// above is never reached. Reproduced with a fake proxy: @latest 200,
+	// @v/list 503, @v/<version>.info a clean 404 — pre-fix this reported
+	// statusNotYetIndexed ("retry in a minute, or use --wait") with no
+	// mention that @v/list had errored at all.
+	if isProxyErrorStatus(r.list.statusCode) {
+		return proxyErrorDiagnosis("proxy.golang.org", "@v/list", r.list.statusCode)
+	}
+
 	// versionInfo failed but the module itself is known. Distinguish "never
 	// published" from "published but poisoned/not-yet-indexed" using @v/list.
 	// Compare against checkVersion(), not the raw r.version: for a "latest"

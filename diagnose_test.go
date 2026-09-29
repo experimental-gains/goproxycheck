@@ -1503,3 +1503,59 @@ func TestDiagnose_Gone_TreatedAsNotFound(t *testing.T) {
 		t.Fatalf("410 Gone is a documented not-found status, must not be diagnosed as a proxy error: %s", got.message)
 	}
 }
+
+// TestDiagnose_ListProxyError_WhileLatestSucceeds covers the one remaining
+// gap in the proxy-error-status coverage the tests above exercise for every
+// other endpoint: @latest succeeds outright (so r.moduleKnown() is already
+// true via r.latest.ok, and the !moduleKnown() branch's own @v/list
+// proxy-error check up top is never reached), the checked version's
+// @v/<version>.info cleanly 404s (an ordinary, ambiguous "not found" that
+// could be either not-yet-indexed or negative-cache), and @v/list ITSELF
+// returns a genuine proxy-error status (429/500/502/503/...) instead of a
+// clean 200 or 404. Since the not-yet-indexed/negative-cache split at the
+// bottom of diagnose() decides purely by searching r.listedVersions() — nil
+// whenever r.list.ok is false, exactly the same zero-information shape a
+// clean-but-empty @v/list produces — this used to silently report
+// statusNotYetIndexed ("ordinary indexing lag ... retry in a minute, or use
+// --wait") with no indication @v/list had errored at all, even though the
+// truth is genuinely unknown: this exact version could just as easily be
+// sitting in a real, un-erroring @v/list this probe simply couldn't read,
+// i.e. the negative-cache case this tool exists to catch.
+func TestDiagnose_ListProxyError_WhileLatestSucceeds(t *testing.T) {
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/example.com/mod/@latest":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, `{"Version":"v1.2.0","Time":"2024-01-01T00:00:00Z"}`)
+		case "/example.com/mod/@v/list":
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = fmt.Fprint(w, "service unavailable")
+		case "/example.com/mod/@v/v1.2.0.mod":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "module example.com/mod\n")
+		case "/example.com/mod/@v/v1.3.0.info":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = fmt.Fprint(w, "not found: unrecognized import path")
+		default:
+			t.Fatalf("unexpected request to %s", r.URL.Path)
+		}
+	}))
+	defer proxy.Close()
+	sum := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer sum.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, client: proxy.Client()}
+	r := ep.probe("example.com/mod", "v1.3.0")
+	got := diagnose(r)
+	if got.status != statusProxyError {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusProxyError, got.message)
+	}
+	if !strings.Contains(got.message, "503") || !strings.Contains(got.message, "@v/list") {
+		t.Fatalf("message should name the actual endpoint and status code: %s", got.message)
+	}
+	if strings.Contains(got.message, "not in @v/list yet") || strings.Contains(got.message, "retry in a minute") {
+		t.Fatalf("must not present a @v/list proxy error as ordinary indexing lag: %s", got.message)
+	}
+}
