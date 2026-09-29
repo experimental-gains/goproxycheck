@@ -171,6 +171,33 @@ func TestModuleFromGoMod_CommentOnlyValue(t *testing.T) {
 	}
 }
 
+// TestModuleFromGoMod_InvalidPath is a regression test for a real bug:
+// moduleFromGoMod (the no-argument mode's read of ./go.mod) never validated
+// the extracted module path via golang.org/x/mod/module.CheckPath, the same
+// check resolveTarget already runs for an explicit `module@version` CLI
+// argument (see TestResolveTarget's CheckPath coverage). Confirmed live
+// against a real go1.24.4 toolchain that `go list -m`/`go build` both Fatal
+// immediately with `malformed module path "example.com/foo!bar": invalid
+// char '!'` for a go.mod written exactly this way — entirely offline, before
+// ever resolving a requirement or contacting a proxy. Before this fix,
+// moduleFromGoMod returned the invalid path unchanged, and goproxycheck's
+// no-argument mode went on to probe the real proxy with it, reporting the
+// generic "module-unknown... check for a typo or GOPRIVATE" verdict instead
+// of the real, unconditional, already-broken-before-any-network-call answer.
+func TestModuleFromGoMod_InvalidPath(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "go.mod")
+	_ = os.WriteFile(path, []byte("module example.com/foo!bar\n\ngo 1.24\n"), 0o644)
+
+	_, err := moduleFromGoMod(path)
+	if err == nil {
+		t.Fatal("expected an error for a go.mod whose module directive is a syntactically invalid import path, got none")
+	}
+	if !strings.Contains(err.Error(), "invalid path") {
+		t.Errorf("error %q doesn't mention the invalid path", err)
+	}
+}
+
 func TestModuleFromGoMod_Missing(t *testing.T) {
 	if _, err := moduleFromGoMod(filepath.Join(t.TempDir(), "go.mod")); err == nil {
 		t.Fatal("expected an error for a missing go.mod")

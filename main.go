@@ -627,6 +627,28 @@ func moduleFromGoMod(path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("%s %w", path, err)
 	}
+	if err := modulepkg.CheckPath(mod); err != nil {
+		// Mirrors resolveTarget's identical check on an explicit
+		// module@version argument (bca7487) — but that check only ever ran
+		// for the args[0] case, not this one. Confirmed live (see
+		// TestModuleFromGoMod_InvalidPath) against a real go1.24.4 toolchain:
+		// a go.mod whose own `module` directive is a syntactically invalid
+		// import path (a stray '!', a leading/trailing dot, a non-ASCII
+		// letter, ...) makes `go list -m`/`go build`/every other
+		// module-aware command Fatal immediately with `malformed module path
+		// %q: %v`, entirely offline, before ever resolving a single
+		// requirement or contacting a proxy — the exact same "the real
+		// toolchain would Fatal first" shape already checked for the
+		// explicit-argument case. Without this check, goproxycheck's
+		// no-argument mode (reading ./go.mod, the shipped GitHub Action's
+		// default invocation) sent the literal invalid path straight to
+		// probe(), which reported the generic statusModuleUnknown ("check:
+		// is the repo public? does the module path... typo? GOPRIVATE?") —
+		// actively misdirecting the user away from the real, unconditional
+		// answer that the module path itself can never resolve, regardless
+		// of the repo or proxy config.
+		return "", fmt.Errorf("%s has a 'module' directive with an invalid path %q — a real `go list -m`/`go build` rejects this exact string immediately with `%v`, entirely offline, before ever contacting the proxy, so this could never resolve regardless of the repo or proxy config. Check for a stray character, leading/trailing dot, or non-ASCII letter in the module path", path, mod, err)
+	}
 	return mod, nil
 }
 
