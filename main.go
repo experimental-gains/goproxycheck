@@ -244,7 +244,31 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 			// a malformed local $GOSUMDB is this machine's own config, and
 			// no amount of proxy.golang.org/sum.golang.org catching up
 			// changes it — it needs a config fix, not a wait.
-			if !*wait || d.status == statusReady || d.status == statusModuleUnknown || d.status == statusBlocklistedMalicious || d.status == statusWrongImportPath || d.status == statusRetracted || d.status == statusDeprecated || d.status == statusZipBuildError || d.status == statusMajorVersionMismatch || d.status == statusUnknownRevision || d.status == statusInvalidPseudoVersion || d.status == statusGosumdbMalformedLocally || time.Now().After(deadline) {
+			// statusNegativeCache (the per-version case) belongs in this
+			// list too, and was the one permanent-failure status missing
+			// from it: diagnose's own message for it says outright "It has
+			// been observed not to clear on its own within 30+ minutes.
+			// Fix: cut a new patch tag ... rather than waiting" — the
+			// identical "waiting is not the fix, don't poll for it"
+			// rationale as every other status in this list, just never
+			// wired in. Reproduced live before the fix with a fake proxy
+			// serving the per-version negative-cache pattern under --wait
+			// --timeout=300ms --interval=10ms: it polled ~28 times over the
+			// full 300ms instead of returning after the first probe, the
+			// same doomed-poll waste already fixed for
+			// statusZipBuildError/statusMajorVersionMismatch/etc. above.
+			//
+			// statusModuleNegativeCache (the whole-module case) is
+			// deliberately NOT added alongside it, despite sharing most of
+			// its name and code path: its own message reaches the opposite
+			// conclusion — "there's no known trick that reliably clears
+			// it... Waiting is the only broadly-effective known fix" —
+			// because cutting a new tag doesn't help when @latest itself
+			// is what's cached negative. Don't generalize the per-version
+			// fix to its whole-module sibling; check each status's own
+			// diagnosis text for what it actually claims about waiting
+			// before assuming they share the same answer.
+			if !*wait || d.status == statusReady || d.status == statusModuleUnknown || d.status == statusBlocklistedMalicious || d.status == statusWrongImportPath || d.status == statusRetracted || d.status == statusDeprecated || d.status == statusZipBuildError || d.status == statusMajorVersionMismatch || d.status == statusUnknownRevision || d.status == statusInvalidPseudoVersion || d.status == statusGosumdbMalformedLocally || d.status == statusNegativeCache || time.Now().After(deadline) {
 				break
 			}
 			time.Sleep(*interval)

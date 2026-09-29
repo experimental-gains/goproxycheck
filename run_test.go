@@ -745,6 +745,59 @@ func TestRun_WaitStopsOnZipBuildError(t *testing.T) {
 	}
 }
 
+// negativeCacheEndpoints simulates the per-version negative-cache pattern
+// (like perVersionNegativeCacheEndpoints) but also counts .info requests, so
+// TestRun_WaitStopsOnNegativeCache can assert on hits instead of elapsed
+// time.
+func negativeCacheEndpoints(t *testing.T, hits *int) endpoints {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v0.2.0"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("v0.1.0\nv0.2.0\n"))
+		case strings.HasSuffix(r.URL.Path, ".info"):
+			*hits++
+			w.WriteHeader(http.StatusNotFound)
+		default: // sum lookup
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return endpoints{proxyBase: srv.URL, sumBase: srv.URL, client: srv.Client()}
+}
+
+// TestRun_WaitStopsOnNegativeCache guards the run()-level early-break list in
+// the --wait polling loop the same way TestRun_WaitStopsOnZipBuildError does
+// for statusZipBuildError: before this, statusNegativeCache (the per-version
+// case) was missing from that list even though diagnose's own message for it
+// says outright "It has been observed not to clear on its own within 30+
+// minutes. Fix: cut a new patch tag ... rather than waiting" — the same
+// "waiting is not the fix" property every other status in the list already
+// has. Reproduced live before the fix: with --wait --timeout=300ms
+// --interval=10ms against a fake proxy serving this exact pattern, it polled
+// .info about 28 times over the full 300ms instead of returning after the
+// first probe. Asserting hits == 1 (not an elapsed-time bound) keeps this
+// deterministic instead of timing-flaky, matching the sibling tests above.
+func TestRun_WaitStopsOnNegativeCache(t *testing.T) {
+	var hits int
+	ep := negativeCacheEndpoints(t, &hits)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--wait", "--interval=1ms", "--timeout=5s", "example.com/mod@v0.1.0"}, &stdout, &stderr, ep)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stdout.String(), "negative-cache-suspected") {
+		t.Errorf("stdout = %q, want it to mention negative-cache-suspected", stdout.String())
+	}
+	if hits != 1 {
+		t.Fatalf(".info was probed %d times; want exactly 1 — --wait should stop immediately on a negative-cache verdict instead of polling the full 5s timeout", hits)
+	}
+}
+
 // majorVersionMismatchEndpoints simulates a version whose go.mod exists but
 // lacks the /vN major-version suffix the proxy requires (the real
 // github.com/osrg/gobgp@v2.16.0 shape) — a permanent property of that tag,
