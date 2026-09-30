@@ -955,6 +955,57 @@ func TestDiagnose_RetractedGroupedCommentNotAttributedToThisVersion(t *testing.T
 	}
 }
 
+// TestDiagnose_RetractedEarlierEntryHasNoRationaleLaterEntryDoes is the
+// end-to-end counterpart of TestRetraction_LaterEntryCarriesRationaleFirstDoesNot
+// (retract_test.go): two separate `retract` directives — not one shared-
+// comment group — both cover the checked version; the first, in file order,
+// carries no comment, but a second, broader range does. Real cmd/go collects
+// the first non-empty rationale across *every* matching entry (see
+// retraction's doc comment for the live `go list -m -u -retracted` trace),
+// not just whichever entry happens to match first — before the fix,
+// diagnose() surfaced the bare "retracted by module author" here, silently
+// dropping the real explanation the second entry gives.
+func TestDiagnose_RetractedEarlierEntryHasNoRationaleLaterEntryDoes(t *testing.T) {
+	const module = "example.com/retracttest"
+	const version = "v1.2.3"
+	const latest = "v1.2.3"
+	modBody := "module " + module + "\n\ngo 1.21\n\nretract " + version + "\n\nretract [v1.0.0, v2.0.0] // big incident, avoid this whole range\n"
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/" + module + "/@latest":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2026-09-30T00:00:00Z"}`, latest)
+		case "/" + module + "/@v/list":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, "v1.0.0\n%s\n", version)
+		case "/" + module + "/@v/" + version + ".info":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2026-01-01T00:00:00Z"}`, version)
+		case "/" + module + "/@v/" + version + ".mod":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, modBody)
+		default:
+			t.Fatalf("unexpected request to %s", r.URL.Path)
+		}
+	}))
+	defer proxy.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/" + module + "@" + version: http.StatusOK,
+	})
+	defer sum.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, client: proxy.Client()}
+	r := ep.probe(module, version)
+	got := diagnose(r)
+	if got.status != statusRetracted {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusRetracted, got.message)
+	}
+	const want = `retracted by module author: "big incident, avoid this whole range"`
+	if !strings.Contains(got.message, want) {
+		t.Fatalf("expected the message to quote the second, explained entry's rationale (%q), got: %s", want, got.message)
+	}
+}
+
 // TestDiagnose_RetractedRangeDoesNotCoverVersion checks the negative case:
 // a go.mod with a retract directive that exists but doesn't cover the
 // checked version (the common case for any module with retractions at

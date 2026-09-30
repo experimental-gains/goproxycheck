@@ -32,6 +32,33 @@ import (
 // isBlocklistedMalicious) — reports statusReady exactly like a healthy
 // one, on the one signal (the go.mod this tool already fetches) that
 // would have caught it.
+// A go.mod can carry more than one `retract` directive whose ranges both
+// cover the same version — not just the single shared-comment-group case
+// TestDiagnose_RetractedGroupedCommentNotAttributedToThisVersion already
+// covers (one `retract (...)` block, one leading comment attributed to only
+// the first entry in the group), but genuinely separate `retract` statements
+// written anywhere in the file. Real cmd/go's own CheckRetractions
+// (modload/modfile.go) walks *every* retract entry unconditionally — it
+// never stops at the first match — ORing `isRetracted` across all of them
+// and collecting every matching entry's non-empty Rationale, in file order,
+// into a slice; ModuleRetractedError.Error() (and modinfo.ModulePublic.Retracted,
+// what `go list -m -u -retracted` actually prints) then uses Rationale[0],
+// the first non-empty one collected — not necessarily the rationale on the
+// first *matching* entry, if that one happens to carry none.
+//
+// Before this loop matched real go's, this function returned on the first
+// matching entry outright, rationale or not, so a go.mod like:
+//
+//	retract v1.2.3
+//	retract [v1.0.0, v2.0.0] // big incident, avoid this whole range
+//
+// — where the first, commentless entry covers v1.2.3 and a second, broader,
+// explained entry also covers it — reported the bare "retracted by module
+// author" for v1.2.3, silently dropping the real explanation. Confirmed live
+// (2026-09-30) against a from-scratch module served by a local fake proxy:
+// `go list -m -u -retracted -f '{{.Retracted}}'` for this exact go.mod
+// prints `[big incident, avoid this whole range]` for v1.2.3, never the bare
+// "retracted by module author" this function used to produce.
 func retraction(modBody, checkVersion string) (rationale string, retracted bool) {
 	mf, err := modfile.Parse("go.mod", []byte(modBody), nil)
 	if err != nil || mf == nil {
@@ -46,8 +73,11 @@ func retraction(modBody, checkVersion string) (rationale string, retracted bool)
 		// rules — confirmed against the go-sqlite3 case above, where the
 		// checked version and both interval bounds all carry it.
 		if semver.Compare(checkVersion, r.Low) >= 0 && semver.Compare(checkVersion, r.High) <= 0 {
-			return r.Rationale, true
+			retracted = true
+			if rationale == "" && r.Rationale != "" {
+				rationale = r.Rationale
+			}
 		}
 	}
-	return "", false
+	return rationale, retracted
 }
