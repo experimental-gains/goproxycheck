@@ -312,7 +312,56 @@ func (e endpoints) probe(module, version string) report {
 		// literal string no matter how long it's retried — the same
 		// doomed-poll shape already fixed for "patch", whitespace, and
 		// disallowed-character versions in resolveTarget (main.go).
-		if resolved, found := resolveComparisonQuery(op, operand, r.listedVersions()); found {
+		// isRetracted skips a comparison-query candidate the module's own
+		// go.mod retracts, mirroring real cmd/go's own automatic
+		// version-query resolution exactly: Query (modload/query.go) filters
+		// every candidate through an AllowedFunc before ever picking among
+		// releases/prereleases, and for `go get`'s own resolver that
+		// AllowedFunc is modload.CheckAllowed, which calls CheckRetractions
+		// -- so a retracted version is never automatically selected by a
+		// query, even though (per retraction()'s own doc comment) it's
+		// still installable if named explicitly and literally.
+		//
+		// Confirmed live (2026-09-30) against github.com/jayconrod/retract
+		// -- the Go team's own canonical self-retraction example, already
+		// used by TestProbe_LatestModFileScopedPastSelfRetractingLatest
+		// above -- whose v1.0.0 and v1.0.1 are both retracted, leaving only
+		// v0.9.9 unretracted: `go get github.com/jayconrod/retract@<v2.0.0`
+		// and `@<=v1.0.1` both resolve to v0.9.9 (confirmed via `go: added
+		// ... v0.9.9`), never touching v1.0.1 even though it's the highest
+		// listed version satisfying either bound by raw semver; `go get
+		// ...@>=v1.0.0` -- where every version satisfying the bound is
+		// retracted -- fails outright with `no matching versions for query
+		// ">=v1.0.0"`, the same offline-provable failure
+		// statusNoMatchingVersion already exists to report.
+		//
+		// Before this fix, resolveComparisonQuery picked purely from
+		// @v/list with no notion of retraction, so goproxycheck resolved
+		// all three of those queries to a retracted version and reported
+		// statusRetracted -- actively wrong: a real `go get`/`go install`
+		// for the identical query either succeeds silently against a
+		// different, non-retracted version (the first two cases) or fails
+		// immediately with "no matching versions" (the third), and never
+		// surfaces the retracted version or its rationale to the user at
+		// all, since it was never a candidate to begin with. This only ever
+		// matters for a comparison query specifically: "latest"/"upgrade"
+		// already resolve through the proxy's own @latest endpoint (see the
+		// branch above), which is already retraction-aware server-side --
+		// confirmed by this exact module, whose @latest reports v0.9.9
+		// directly, never v1.0.1.
+		isRetracted := func(v string) bool {
+			if !r.latestModFile.ok {
+				// No retract data available (e.g. @latest itself failed) --
+				// best-effort: don't block resolution on a signal this tool
+				// couldn't fetch, matching every other latestModFile-gated
+				// check in this codebase (see retraction()'s callers in
+				// diagnose.go).
+				return false
+			}
+			_, retracted := retraction(r.latestModFile.body, v)
+			return retracted
+		}
+		if resolved, found := resolveComparisonQuery(op, operand, r.listedVersions(), isRetracted); found {
 			checkVersion = resolved
 			r.resolvedVersion = resolved
 		} else if semver.IsValid(operand) {
@@ -476,6 +525,17 @@ func comparisonQuery(v string) (op, operand string, ok bool) {
 // that case, the same as for any other version query this tool can't
 // resolve up front.
 //
+// retracted (nil-safe: a nil func matches nothing) reports whether a
+// candidate version is covered by the module's own `retract` directive —
+// such a candidate is skipped entirely, before the release/prerelease
+// split below, mirroring real cmd/go's own AllowedFunc filtering (see this
+// function's caller in probe() for the live verification against
+// github.com/jayconrod/retract). Skipping happens ahead of, not as a
+// tie-break within, the release/prerelease preference immediately below:
+// a retracted release doesn't fall back to being treated as a candidate
+// prerelease, it's simply never a candidate at all, exactly like a
+// go.mod-excluded version isn't for real cmd/go.
+//
 // Restricted to non-prerelease ("release") versions first, only falling
 // back to prerelease versions (anything with a semver.Prerelease suffix —
 // "-rc.1", "-beta2", "-dev", "-alpha.0", etc.) when zero release versions
@@ -503,7 +563,7 @@ func comparisonQuery(v string) (op, operand string, ok bool) {
 // google.golang.org/grpc@<v2.0.0 as "resolved to v1.86.0-dev" — a
 // different version than the one a real `go get`/`go install` actually
 // resolves and fetches for the identical query.
-func resolveComparisonQuery(op, operand string, listed []string) (resolved string, ok bool) {
+func resolveComparisonQuery(op, operand string, listed []string, retracted func(string) bool) (resolved string, ok bool) {
 	if !semver.IsValid(operand) {
 		return "", false
 	}
@@ -537,6 +597,9 @@ func resolveComparisonQuery(op, operand string, listed []string) (resolved strin
 	var releases, prereleases []string
 	for _, v := range listed {
 		if !semver.IsValid(v) {
+			continue
+		}
+		if retracted != nil && retracted(v) {
 			continue
 		}
 		if semver.Prerelease(v) != "" {

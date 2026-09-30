@@ -210,7 +210,7 @@ func TestResolveComparisonQuery(t *testing.T) {
 		{"<", "not-a-version", "", false},
 	}
 	for _, c := range cases {
-		got, ok := resolveComparisonQuery(c.op, c.operand, listed)
+		got, ok := resolveComparisonQuery(c.op, c.operand, listed, nil)
 		if got != c.want || ok != c.wantOK {
 			t.Errorf("resolveComparisonQuery(%q, %q, listed) = (%q, %v), want (%q, %v)", c.op, c.operand, got, ok, c.want, c.wantOK)
 		}
@@ -254,7 +254,7 @@ func TestResolveComparisonQuery_PrefersReleaseOverHigherPrerelease(t *testing.T)
 		{">=", "v1.86.0-dev", "v1.86.0-dev", true},
 	}
 	for _, c := range cases {
-		got, ok := resolveComparisonQuery(c.op, c.operand, listed)
+		got, ok := resolveComparisonQuery(c.op, c.operand, listed, nil)
 		if got != c.want || ok != c.wantOK {
 			t.Errorf("resolveComparisonQuery(%q, %q, listed) = (%q, %v), want (%q, %v)", c.op, c.operand, got, ok, c.want, c.wantOK)
 		}
@@ -425,6 +425,145 @@ func TestProbe_LatestModFileScopedPastSelfRetractingLatest(t *testing.T) {
 	}
 	if !strings.Contains(r.latestModFile.body, "retract") {
 		t.Errorf("latestModFile.body = %q, want it to be v1.0.1's go.mod (the highest tag, past self-retracting @latest), which carries the retract directive", r.latestModFile.body)
+	}
+}
+
+// TestResolveComparisonQuery_SkipsRetractedVersions is the fix for a real
+// bug found by testing goproxycheck's comparison-query resolution against
+// github.com/jayconrod/retract, the Go team's own canonical self-retraction
+// example (already used by TestProbe_LatestModFileScopedPastSelfRetractingLatest
+// above): v1.0.0 and v1.0.1 are both retracted, leaving only v0.9.9
+// unretracted. resolveComparisonQuery used to pick purely from @v/list with
+// no notion of retraction at all — see this function's own doc comment and
+// its caller in probe() for the full live verification against a real `go
+// get`, which never automatically selects a retracted version for any
+// comparison query, exactly like it never does for "latest"/"upgrade".
+func TestResolveComparisonQuery_SkipsRetractedVersions(t *testing.T) {
+	listed := []string{"v0.9.9", "v1.0.0", "v1.0.1"}
+	retracted := func(v string) bool { return v == "v1.0.0" || v == "v1.0.1" }
+	cases := []struct {
+		op, operand string
+		want        string
+		wantOK      bool
+	}{
+		// v1.0.1 is the highest listed version satisfying either bound by
+		// raw semver, but it's retracted (and so is v1.0.0) — v0.9.9 is the
+		// only real candidate, matching real `go get`'s resolution to it.
+		{"<", "v2.0.0", "v0.9.9", true},
+		{"<=", "v1.0.1", "v0.9.9", true},
+		// Every version satisfying this bound (v1.0.0, v1.0.1) is
+		// retracted — real `go get ...@>=v1.0.0` fails outright with "no
+		// matching versions for query", not a silent pick of a retracted
+		// version.
+		{">=", "v1.0.0", "", false},
+	}
+	for _, c := range cases {
+		got, ok := resolveComparisonQuery(c.op, c.operand, listed, retracted)
+		if got != c.want || ok != c.wantOK {
+			t.Errorf("resolveComparisonQuery(%q, %q, listed, retracted) = (%q, %v), want (%q, %v)", c.op, c.operand, got, ok, c.want, c.wantOK)
+		}
+	}
+
+	// A nil predicate must behave exactly like the pre-fix code (no
+	// filtering at all) — every existing caller that has no retract data
+	// available (e.g. latestModFile itself failed to fetch) relies on this.
+	if got, ok := resolveComparisonQuery("<", "v2.0.0", listed, nil); got != "v1.0.1" || !ok {
+		t.Errorf("resolveComparisonQuery with a nil predicate = (%q, %v), want (%q, %v) (no filtering)", got, ok, "v1.0.1", true)
+	}
+}
+
+// TestProbe_ComparisonQuerySkipsRetractedVersion is the end-to-end version
+// of TestResolveComparisonQuery_SkipsRetractedVersions: reproduces
+// github.com/jayconrod/retract's exact shape (v1.0.0 and v1.0.1 both
+// retracted, only v0.9.9 isn't) through the full probe()/diagnose() path,
+// confirming the resolved version — and therefore the reported status — is
+// the real, installable v0.9.9, not the retracted v1.0.1 a raw semver.Compare
+// walk would have picked. Confirmed live (2026-09-30): `go get
+// github.com/jayconrod/retract@<v2.0.0` resolves to v0.9.9 (`go: added
+// github.com/jayconrod/retract v0.9.9`), never v1.0.1.
+func TestProbe_ComparisonQuerySkipsRetractedVersion(t *testing.T) {
+	const module = "github.com/jayconrod/retract"
+	const retractModFile = "module " + module + "\n\ngo 1.16\n\nretract (\n\tv1.0.0 // Published accidentally.\n\tv1.0.1 // For retractions only.\n)\n"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v0.9.9","Time":"2021-01-26T16:46:49Z"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("v1.0.0\nv0.9.9\nv1.0.1\n"))
+		case strings.HasSuffix(r.URL.Path, "/@v/v1.0.1.mod"):
+			// The highest tag in the major line — probe()'s latestModFile
+			// fetch, same as TestProbe_LatestModFileScopedPastSelfRetractingLatest.
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(retractModFile))
+		case strings.HasSuffix(r.URL.Path, "/@v/v0.9.9.info"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v0.9.9"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/v0.9.9.mod"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("module " + module + "\n\ngo 1.16\n"))
+		case strings.Contains(r.URL.Path, "/lookup/") && strings.HasSuffix(r.URL.Path, "@v0.9.9"):
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/@v/v1.0.1.info"), strings.HasSuffix(r.URL.Path, "/@v/v1.0.0.info"):
+			// The two retracted versions must never be probed as the
+			// resolved checkVersion — if resolveComparisonQuery regresses to
+			// picking one of them, this test should fail loudly via a wrong
+			// resolvedVersion/status rather than silently succeeding against
+			// the wrong version's .info.
+			t.Errorf("unexpected request for a retracted version's .info: %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	ep := endpoints{proxyBase: srv.URL, sumBase: srv.URL, client: srv.Client()}
+
+	r := ep.probe(module, "<v2.0.0")
+	if r.resolvedVersion != "v0.9.9" {
+		t.Errorf("resolvedVersion = %q, want %q (the only unretracted candidate — real `go get` resolves here, never to the retracted v1.0.1)", r.resolvedVersion, "v0.9.9")
+	}
+	if d := diagnose(r); d.status != statusReady {
+		t.Errorf("diagnose(r).status = %q, want %q (message: %s)", d.status, statusReady, d.message)
+	}
+}
+
+// TestProbe_ComparisonQueryAllCandidatesRetracted covers the other real
+// `go get` outcome confirmed live for github.com/jayconrod/retract: a bound
+// where every listed version satisfying it is retracted (only v1.0.0 and
+// v1.0.1 satisfy ">=v1.0.0", and both are retracted) fails immediately with
+// "no matching versions for query ">=v1.0.0"" — the same offline-provable
+// failure as a bound nothing at all satisfies, not a silent pick of a
+// retracted version.
+func TestProbe_ComparisonQueryAllCandidatesRetracted(t *testing.T) {
+	const module = "github.com/jayconrod/retract"
+	const retractModFile = "module " + module + "\n\ngo 1.16\n\nretract (\n\tv1.0.0 // Published accidentally.\n\tv1.0.1 // For retractions only.\n)\n"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v0.9.9","Time":"2021-01-26T16:46:49Z"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("v1.0.0\nv0.9.9\nv1.0.1\n"))
+		case strings.HasSuffix(r.URL.Path, "/@v/v1.0.1.mod"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(retractModFile))
+		default:
+			t.Errorf("unexpected request for %s — nothing satisfying \">=v1.0.0\" should ever be probed once every candidate is known to be retracted", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	ep := endpoints{proxyBase: srv.URL, sumBase: srv.URL, client: srv.Client()}
+
+	r := ep.probe(module, ">=v1.0.0")
+	if !r.comparisonQueryNoMatch {
+		t.Errorf("comparisonQueryNoMatch = false, want true (every version satisfying \">=v1.0.0\" is retracted)")
+	}
+	if d := diagnose(r); d.status != statusNoMatchingVersion {
+		t.Errorf("diagnose(r).status = %q, want %q (message: %s)", d.status, statusNoMatchingVersion, d.message)
 	}
 }
 
