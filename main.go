@@ -1435,6 +1435,39 @@ func localSumdbSkipped(module string) (skipped bool, reason string) {
 // clear error asking for an explicit module@version instead of silently
 // choosing when that's still ambiguous (none, or more than one, look like a
 // real version).
+//
+// A module defined in a repository subdirectory needs one more step before
+// that semver check: real Go module versioning (go.dev/ref/mod#vcs-version)
+// requires such a module's tags to be written "<subdir>/vX.Y.Z", with the
+// subdirectory path (relative to the repo root) as a literal prefix — the
+// module version itself is only the "vX.Y.Z" part after it, never the raw
+// tag. Confirmed live against a real nested module, golang.org/x/tools/gopls
+// (module path golang.org/x/tools/gopls, defined in the "gopls" subdirectory
+// of github.com/golang/tools): proxy.golang.org's own @latest response for
+// it names the underlying tag "refs/tags/gopls/v0.23.0" for module version
+// "v0.23.0" — the "gopls/" prefix is part of the git tag, not part of the
+// version the proxy indexes it under (confirmed the mismatch is fatal to a
+// direct request too: GET .../golang.org/x/tools/gopls/@v/gopls/v0.23.0.info
+// 404s with "bad request: invalid escaped version ...: invalid char '/'",
+// while .../@v/v0.23.0.info succeeds). Before this, gitDescribeTag knew
+// nothing about the module's subdirectory and returned a lone matching tag
+// exactly as git wrote it — so goproxycheck's no-argument mode, run from
+// inside such a subdirectory right after tagging a real, already-live
+// release, reported "not-yet-indexed ... retry in a minute, or use --wait"
+// for a version that could never be indexed under that literal (prefixed)
+// spelling no matter how long it was polled.
+//
+// gitTagPrefix (git rev-parse --show-prefix) gives exactly this
+// subdirectory, already in the "dir/" form real Go's tag convention uses,
+// empty at the repo root. Root-module behavior (the common case, and the
+// only case any existing test covers) is deliberately unchanged: this only
+// narrows the semver-shaped candidate set to those additionally carrying the
+// module's own prefix, then re-applies the exact same
+// zero/one/many decision the root case already used — including the
+// existing single-arbitrary-tag pass-through (return the lone tag exactly
+// as written) when nothing at HEAD looks like a real version tag for this
+// module either way, preserving support for checking an arbitrary
+// non-semver revision tag.
 func gitDescribeTag() (string, error) {
 	out, err := exec.Command("git", "tag", "--points-at", "HEAD").Output()
 	if err != nil {
@@ -1449,18 +1482,52 @@ func gitDescribeTag() (string, error) {
 	if len(tags) == 0 {
 		return "", fmt.Errorf("no tag points at HEAD (HEAD may not be tagged — pass module@version explicitly)")
 	}
-	if len(tags) == 1 {
-		return tags[0], nil
-	}
+
+	prefix := gitTagPrefix()
 
 	var versionTags []string
 	for _, t := range tags {
-		if semver.IsValid(t) {
-			versionTags = append(versionTags, t)
+		if prefix == "" {
+			if semver.IsValid(t) {
+				versionTags = append(versionTags, t)
+			}
+			continue
+		}
+		if rest, ok := strings.CutPrefix(t, prefix); ok && semver.IsValid(rest) {
+			versionTags = append(versionTags, rest)
 		}
 	}
-	if len(versionTags) == 1 {
+
+	switch len(versionTags) {
+	case 1:
 		return versionTags[0], nil
+	case 0:
+		if len(tags) == 1 {
+			return tags[0], nil
+		}
+		return "", fmt.Errorf("HEAD has more than one tag (%s) and it's ambiguous which one is the release version — pass module@version explicitly", strings.Join(tags, ", "))
+	default:
+		return "", fmt.Errorf("HEAD has more than one tag (%s) and it's ambiguous which one is the release version — pass module@version explicitly", strings.Join(tags, ", "))
 	}
-	return "", fmt.Errorf("HEAD has more than one tag (%s) and it's ambiguous which one is the release version — pass module@version explicitly", strings.Join(tags, ", "))
+}
+
+// gitTagPrefix returns the module's own version-tag prefix, per real Go's
+// subdirectory-tag convention (see gitDescribeTag's doc comment): "" for a
+// module at the repository root, or "<subdir>/" for one defined in a
+// subdirectory. Backed by `git rev-parse --show-prefix`, which already
+// reports the path from the repo root to the current directory in exactly
+// that "dir/" form (confirmed live: empty output at the repo root, "sub/
+// dir/" — trailing slash included — from within ./sub/dir). Errors are
+// deliberately swallowed to "" (root-module behavior, this function's
+// existing, well-tested behavior before subdirectory-awareness existed)
+// rather than failing gitDescribeTag outright — by the time this is called,
+// `git tag --points-at HEAD` already succeeded, so this realistically only
+// fails for a git old enough to lack --show-prefix, not a validity problem
+// worth surfacing as a hard error.
+func gitTagPrefix() string {
+	out, err := exec.Command("git", "rev-parse", "--show-prefix").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }

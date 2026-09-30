@@ -587,6 +587,89 @@ func TestResolveTarget_MultipleVersionTagsAtHead_Ambiguous(t *testing.T) {
 	}
 }
 
+// TestResolveTarget_NestedModuleSubdirTag_StripsPrefix is a regression test
+// for a real bug: gitDescribeTag used to return a module-in-subdirectory's
+// git tag exactly as written, including its required subdirectory prefix
+// (real Go module versioning, go.dev/ref/mod#vcs-version, requires such
+// tags to be named "<subdir>/vX.Y.Z") — but the *module version* real `go`
+// and proxy.golang.org actually index it under is only the "vX.Y.Z" part.
+// Confirmed live against golang.org/x/tools/gopls (a real nested module):
+// proxy.golang.org's own @latest response names the tag
+// "refs/tags/gopls/v0.23.0" for module version "v0.23.0", and a direct
+// request for "gopls/v0.23.0" as a literal version 404s ("invalid char
+// '/'") while "v0.23.0" alone succeeds. Before the fix, running with no
+// arguments from inside such a subdirectory right after tagging a real,
+// already-live release reported "not-yet-indexed ... retry in a minute, or
+// use --wait" — a doomed poll, since the raw prefixed string could never be
+// indexed under that spelling no matter how long it was retried.
+func TestResolveTarget_NestedModuleSubdirTag_StripsPrefix(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	run := func(name string, args ...string) {
+		t.Helper()
+		if out, err := exec.Command(name, args...).CombinedOutput(); err != nil {
+			t.Fatalf("%s %v: %v\n%s", name, args, err, out)
+		}
+	}
+	run("git", "init", "-q")
+	run("git", "config", "user.email", "test@example.com")
+	run("git", "config", "user.name", "test")
+	if err := os.MkdirAll(filepath.Join(dir, "gopls"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(dir, "gopls", "go.mod"), []byte("module golang.org/x/tools/gopls\n\ngo 1.21\n"), 0o644)
+	run("git", "add", "gopls/go.mod")
+	run("git", "commit", "-q", "-m", "init")
+	run("git", "tag", "gopls/v0.23.0")
+
+	t.Chdir(filepath.Join(dir, "gopls"))
+	module, version, err := resolveTarget(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if module != "golang.org/x/tools/gopls" || version != "v0.23.0" {
+		t.Errorf("got (%q, %q), want (%q, %q) — the subdirectory prefix should have been stripped from the tag", module, version, "golang.org/x/tools/gopls", "v0.23.0")
+	}
+}
+
+// TestResolveTarget_NestedModuleSubdirTag_IgnoresForeignRootTag covers the
+// case where a root-level version tag and this nested module's own
+// correctly-prefixed tag both point at the same commit (e.g. a monorepo
+// cutting simultaneous releases) — only the prefixed one is this module's
+// own version; the bare root tag belongs to a different module entirely and
+// must not be picked (and must not make the answer ambiguous either).
+func TestResolveTarget_NestedModuleSubdirTag_IgnoresForeignRootTag(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	run := func(name string, args ...string) {
+		t.Helper()
+		if out, err := exec.Command(name, args...).CombinedOutput(); err != nil {
+			t.Fatalf("%s %v: %v\n%s", name, args, err, out)
+		}
+	}
+	run("git", "init", "-q")
+	run("git", "config", "user.email", "test@example.com")
+	run("git", "config", "user.name", "test")
+	if err := os.MkdirAll(filepath.Join(dir, "gopls"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module golang.org/x/tools\n\ngo 1.21\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "gopls", "go.mod"), []byte("module golang.org/x/tools/gopls\n\ngo 1.21\n"), 0o644)
+	run("git", "add", "go.mod", "gopls/go.mod")
+	run("git", "commit", "-q", "-m", "init")
+	run("git", "tag", "v1.0.0")        // the repo-root module's own tag
+	run("git", "tag", "gopls/v0.23.0") // the nested module's own tag
+
+	t.Chdir(filepath.Join(dir, "gopls"))
+	module, version, err := resolveTarget(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if module != "golang.org/x/tools/gopls" || version != "v0.23.0" {
+		t.Errorf("got (%q, %q), want (%q, %q) — should have picked this module's own prefixed tag, not the sibling root tag", module, version, "golang.org/x/tools/gopls", "v0.23.0")
+	}
+}
+
 // TestLocalGoproxyOff covers localGoproxyOff's parsing of `go env GOPROXY`
 // output, including the comma/pipe list case: confirmed live against the
 // real `go` command that "off" only disables lookup when it's the *first*
