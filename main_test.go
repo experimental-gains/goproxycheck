@@ -171,6 +171,76 @@ func TestModuleFromGoMod_CommentOnlyValue(t *testing.T) {
 	}
 }
 
+// TestModuleFromGoMod_BareModuleDirective is a regression test for a real
+// bug: a "module" keyword with nothing real after it — end of line, only
+// trailing whitespace, or a same-line "//" comment glued directly onto the
+// keyword with no separating space — fell through moduleDirective's
+// single-line-form check entirely (the leading strings.TrimSpace(raw)
+// silently collapses "module " / "module\t" down to exactly "module" before
+// the check ever runs, and a bare "//" right after the keyword starts with
+// '/', a byte the check's separator set didn't include) and was
+// misdiagnosed as "has no 'module' directive" — implying the file is
+// missing the directive entirely. Confirmed live (2026-09-30) against
+// golang.org/x/mod/modfile.Parse that every one of these shapes instead
+// Fatals with `usage: module module/path`: a directive that IS present,
+// just missing its required path argument, the identical failure the
+// already-existing "module // comment" (space then comment) and "module
+// (\n)" (empty block) cases correctly report as "has a 'module' directive
+// with no path" rather than "no directive at all."
+func TestModuleFromGoMod_BareModuleDirective(t *testing.T) {
+	for name, content := range map[string]string{
+		"bare, no trailing newline": "module",
+		"bare, with blank line":     "module\n\ngo 1.24\n",
+		"trailing space only":       "module \n\ngo 1.24\n",
+		"trailing tab only":         "module\t\n\ngo 1.24\n",
+		"no-space comment":          "module//oops, no path here\n\ngo 1.24\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "go.mod")
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := moduleFromGoMod(path)
+			if err == nil {
+				t.Fatalf("expected an error for a bare 'module' directive with no path, got module %q with no error", got)
+			}
+			if strings.Contains(err.Error(), "has no 'module' directive") {
+				t.Errorf("error %q wrongly claims there's no module directive at all, for a go.mod that has one (just malformed, missing its path) — real go Fatals with `usage: module module/path`, not \"no directive\"", err)
+			}
+			if !strings.Contains(err.Error(), "has a 'module' directive with no path") {
+				t.Errorf("error %q doesn't match the existing 'directive with no path' wording used for the same underlying failure shape", err)
+			}
+		})
+	}
+}
+
+// TestModuleFromGoMod_SingleSlashIsNotACommentSeparator makes sure the fix
+// for TestModuleFromGoMod_BareModuleDirective stays narrowly scoped to a
+// genuine "//" comment glued onto the keyword, not any byte starting with
+// '/'. Confirmed live (2026-09-30) that real go tokenizes "module/foo" (one
+// slash, not a comment) as a single unrecognized identifier token —
+// `unknown directive: module/foo` — a completely different failure this
+// function was never meant to diagnose, not "module directive with no
+// path." moduleDirective can't distinguish "unknown directive" from "no
+// module directive" either way (it only recognizes the module verb, not a
+// general directive-verb checklist), so this just confirms the fix doesn't
+// misfire into the wrong specific error for this shape.
+func TestModuleFromGoMod_SingleSlashIsNotACommentSeparator(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "go.mod")
+	_ = os.WriteFile(path, []byte("module/foo\n\ngo 1.24\n"), 0o644)
+
+	_, err := moduleFromGoMod(path)
+	if err == nil {
+		t.Fatal("expected an error for a go.mod with no real 'module' directive, got none")
+	}
+	if strings.Contains(err.Error(), "has a 'module' directive with no path") {
+		t.Errorf("error %q wrongly claims a 'module' directive was found with a missing path — \"module/foo\" is a single unrecognized token to real go, not the module directive at all", err)
+	}
+}
+
 // TestModuleFromGoMod_InvalidPath is a regression test for a real bug:
 // moduleFromGoMod (the no-argument mode's read of ./go.mod) never validated
 // the extracted module path via golang.org/x/mod/module.CheckPath, the same

@@ -735,6 +735,41 @@ func moduleFromGoMod(path string) (string, error) {
 // directive" for a go.mod the real toolchain reads fine — the same
 // dropped-block failure mode as the space-before-paren bug fixed above,
 // just one character earlier.
+//
+// Also treats a bare "module" keyword with nothing (real) after it at all —
+// end of line, only trailing whitespace, or a same-line "//" comment with no
+// separating space — as the single-line form's already-existing "directive
+// present but no path" case, not as "no directive at all." Confirmed live
+// (2026-09-30) against golang.org/x/mod/modfile.Parse: a go.mod whose sole
+// content is "module" (no newline), "module\n", "module \n" (trailing
+// space), "module\t\n" (trailing tab), or "module//no path\n" (a comment
+// glued straight onto the keyword, no space) all Fatal identically with
+// `usage: module module/path` — the same hard, offline, before-any-network
+// parse error the existing "module (\n)" (empty block) and "module //
+// comment" (space then comment) cases already produce, just missing their
+// own dedicated check. The bug: `line := strings.TrimSpace(raw)` at the top
+// of this loop's body strips a bare trailing space/tab BEFORE the CutPrefix
+// check ever runs, collapsing "module " and "module\t" down to exactly
+// "module" — so `rest` becomes "" and the existing `rest != ""` guard
+// rejected them outright, same as an unadorned bare "module" with nothing
+// after it to begin with. And a same-line comment with no leading space
+// ("module//...") starts with '/', which the guard's byte set (' ', '\t',
+// '(') never included, exactly the same "separator-character check misses a
+// zero-space variant" shape as the no-space-block-paren fix right above,
+// just for a genuinely empty argument instead of a block open. A single '/'
+// that ISN'T the start of "//" (e.g. "module/foo", no comment) is
+// deliberately NOT included here — confirmed live that real go tokenizes
+// that as one unrecognized identifier ("unknown directive: module/foo"), a
+// completely different failure this function has no way to diagnose
+// (it isn't even about the module directive at that point), not "module
+// directive with no path."
+//
+// Before this fix, moduleFromGoMod's no-argument-mode callers got "go.mod
+// has no 'module' directive" for a go.mod that plainly has one — just a
+// malformed, argument-less one — misdirecting a user or CI log into
+// thinking a module directive needs to be added from scratch, instead of
+// the accurate, `go`-shaped answer that an existing directive's path is
+// missing or was accidentally deleted.
 func moduleDirective(data string) (string, error) {
 	inBlock := false
 	blockMod := ""
@@ -760,7 +795,14 @@ func moduleDirective(data string) (string, error) {
 		// rest[0] == '(' (no space) is included alongside the ordinary
 		// space/tab separator: "module(" is real, accepted go.mod syntax
 		// for the block-open line — see this function's doc comment.
-		if rest, ok := strings.CutPrefix(line, "module"); ok && rest != "" && (rest[0] == ' ' || rest[0] == '\t' || rest[0] == '(') {
+		//
+		// rest == "" (bare "module", nothing left after trimming) and
+		// strings.HasPrefix(rest, "//") (a same-line comment glued directly
+		// onto the keyword) are both included for the same reason, one
+		// paragraph further down in this function's doc comment: both are
+		// real go.mod shapes real `go` Fatals on as a malformed module
+		// directive, not evidence there's no directive here at all.
+		if rest, ok := strings.CutPrefix(line, "module"); ok && (rest == "" || rest[0] == ' ' || rest[0] == '\t' || rest[0] == '(' || strings.HasPrefix(rest, "//")) {
 			rest = strings.TrimSpace(rest)
 			if stripLineComment(rest) == "(" {
 				inBlock = true
