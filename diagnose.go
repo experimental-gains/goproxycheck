@@ -166,6 +166,51 @@ func majorVersionMismatchSuggestion(body string) string {
 	return m[1]
 }
 
+// modPathWrongMajorMarker is the distinctive substring proxy.golang.org
+// includes in the plain-text body of a 404 response when the requested
+// version's go.mod, if any, declares a DIFFERENT major-version path than
+// the one actually requested — the mirror image of
+// majorVersionMismatchMarker right above (a go.mod committed with NO
+// major-version suffix at all, for a version that requires one): this is a
+// go.mod that does carry a suffix, just not the one that was asked for.
+//
+// Confirmed live (2026-09-30), a common real-world shape: a module that
+// renamed itself and bumped its major-version path (e.g. a repo moving
+// from an unsuffixed/lower-major import path to a new /vN one) leaves its
+// OLD tags — still reachable by an explicit version query — with their
+// own go.mod still naming the prior path. Querying
+// github.com/redis/go-redis/v9@v8.0.0 (v8.0.0 is a real, currently-tagged
+// go-redis release, from before the repo's v9 rename) 404s with `invalid
+// version: go.mod has non-.../v9 module path "github.com/go-redis/redis/v8"
+// (and .../v9/go.mod does not exist) at revision v8.0.0` — and a real `go
+// get github.com/redis/go-redis/v9@v8.0.0` fails outright with this exact
+// message right now, under the real, unmodified default GOPROXY chain
+// (proxy.golang.org then direct both agree, since this is evaluated from
+// the tag's own committed go.mod content, not a proxy-side cache — so
+// unlike the negative-cache/not-yet-indexed cases, a direct-VCS fallback
+// doesn't help either). v8.0.0 can never retroactively declare a /v9 path:
+// only an actual v9.x.y tag (at the /v9 path) resolves.
+//
+// Without this check, this 404 matched none of this file's other markers —
+// isUnknownRevision requires "unknown revision", majorVersionMismatchMarker
+// requires "so module path must match major version" (a completely
+// different phrase for the opposite direction) — and fell through to the
+// generic not-yet-indexed fallback ("ordinary indexing lag ... retry in a
+// minute, or use --wait"), the same doomed-poll shape
+// majorVersionMismatchMarker already exists to prevent for the other
+// direction.
+const modPathWrongMajorMarker = "has non-"
+
+// isModPathWrongMajor reports whether body is the modPathWrongMajorMarker
+// shape. Requiring "module path" alongside the marker (rather than the bare
+// substring alone) keeps this from ever colliding with
+// majorVersionMismatchMarker's own body, which also happens to contain
+// "module path" but never "has non-" — the two markers are checked as
+// alternatives, in either order, with no shared body ever matching both.
+func isModPathWrongMajor(body string) bool {
+	return strings.Contains(body, modPathWrongMajorMarker) && strings.Contains(body, "module path")
+}
+
 // unknownRevisionMarker is the distinctive substring proxy.golang.org
 // includes in the plain-text body of a 404 response when the requested
 // version query — a branch name, a raw or embedded commit hash, or a
@@ -620,6 +665,17 @@ func diagnose(r report) diagnosis {
 			"%s: this version has a go.mod file, but its module path doesn't carry the major-version suffix Go's semantic import versioning rule requires (go.dev/ref/mod#major-version-suffix) — proxy.golang.org refuses to serve it: %s. "+
 				"This isn't the negative-cache bug or ordinary indexing lag: it's a permanent property of the go.mod committed at this tag, so --wait and a retry can't fix it. %s.",
 			displayTarget(r), firstLine(r.versionInfo.body), advice)}
+	}
+
+	// Checked alongside majorVersionMismatchMarker right above for the same
+	// reason, just for the mirror-image mismatch direction — see
+	// modPathWrongMajorMarker's doc comment for the live verification
+	// against a real, currently-tagged github.com/redis/go-redis version.
+	if isModPathWrongMajor(r.versionInfo.body) {
+		return diagnosis{statusMajorVersionMismatch, fmt.Sprintf(
+			"%s: this version exists, but the go.mod committed at this tag declares a different major-version path than the one requested — proxy.golang.org refuses to serve it: %s. "+
+				"This isn't the negative-cache bug or ordinary indexing lag, and a direct-VCS fallback won't help either: it's a permanent property of the go.mod committed at this exact tag (most likely an old tag from before the module renamed/bumped its major-version path), so --wait and a retry can't fix it. Run `go list -m -versions %s` to see what's actually published at this path, or use the module path/version the go.mod at this tag actually declares.",
+			displayTarget(r), firstLine(r.versionInfo.body), r.module)}
 	}
 
 	// Checked alongside isZipBuildError and majorVersionMismatchMarker above

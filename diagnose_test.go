@@ -224,6 +224,58 @@ func TestDiagnose_MajorVersionMismatch_NoSuggestion(t *testing.T) {
 	}
 }
 
+// TestDiagnose_ModPathWrongMajor covers a real proxy.golang.org response
+// found by testing against github.com/redis/go-redis/v9@v8.0.0: @latest/
+// @v/list for the /v9 path are both healthy (the module has real v9.x.y
+// tags), but @v/v8.0.0.info 404s because that revision's own go.mod still
+// declares the module's OLD, pre-rename path ("github.com/go-redis/
+// redis/v8") — the mirror image of TestDiagnose_MajorVersionMismatch's
+// shape (a go.mod with no suffix at all), here a go.mod with the WRONG
+// suffix. Before this fix, this body matched none of diagnose's markers
+// (majorVersionMismatchMarker requires "so module path must match major
+// version", never present here) and fell through to statusNotYetIndexed —
+// "ordinary indexing lag ... retry in a minute" — when the real `go get
+// github.com/redis/go-redis/v9@v8.0.0` fails outright with this exact
+// message and will never succeed no matter how long you wait.
+func TestDiagnose_ModPathWrongMajor(t *testing.T) {
+	const body = `not found: github.com/redis/go-redis/v9@v8.0.0: invalid version: go.mod has non-.../v9 module path "github.com/go-redis/redis/v8" (and .../v9/go.mod does not exist) at revision v8.0.0`
+	listSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/github.com/redis/go-redis/v9/@latest":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, `{"Version":"v9.22.0","Time":"2026-06-01T00:00:00Z"}`)
+		case "/github.com/redis/go-redis/v9/@v/list":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "v9.0.1\nv9.0.2\nv9.22.0\n")
+		case "/github.com/redis/go-redis/v9/@v/v8.0.0.info":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = fmt.Fprint(w, body)
+		case "/github.com/redis/go-redis/v9/@v/v9.22.0.mod":
+			// probe() fetches @latest's own .mod unconditionally to check
+			// for retract directives; this test isn't about that.
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "module github.com/redis/go-redis/v9\n")
+		default:
+			t.Fatalf("unexpected request to %s", r.URL.Path)
+		}
+	}))
+	defer listSrv.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/github.com/redis/go-redis/v9@v8.0.0": http.StatusNotFound,
+	})
+	defer sum.Close()
+
+	ep := endpoints{proxyBase: listSrv.URL, sumBase: sum.URL, client: listSrv.Client()}
+	r := ep.probe("github.com/redis/go-redis/v9", "v8.0.0")
+	got := diagnose(r)
+	if got.status != statusMajorVersionMismatch {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusMajorVersionMismatch, got.message)
+	}
+	if !strings.Contains(got.message, "different major-version path") {
+		t.Errorf("message = %q, want it to explain the mismatch direction", got.message)
+	}
+}
+
 // TestDiagnose_BlocklistedMalicious is the regression for a real, verified
 // misdiagnosis (run #122): proxy.golang.org returns 403 with a distinctive
 // plain-text body when it has flagged a specific module as malicious.
