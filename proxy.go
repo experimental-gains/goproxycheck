@@ -243,7 +243,7 @@ func (e endpoints) probe(module, version string) report {
 					modVersion = best
 				}
 			}
-			r.latestModFile = e.get(fmt.Sprintf("%s/%s/@v/%s.mod", e.proxyBase, mod, escapePath(modVersion)))
+			r.latestModFile = e.get(fmt.Sprintf("%s/%s/@v/%s.mod", e.proxyBase, mod, urlPathEscape(escapePath(modVersion))))
 		}
 	}
 
@@ -330,7 +330,7 @@ func (e endpoints) probe(module, version string) report {
 	}
 
 	if !r.comparisonQueryNoMatch {
-		r.versionInfo = e.get(fmt.Sprintf("%s/%s/@v/%s.info", e.proxyBase, mod, escapePath(checkVersion)))
+		r.versionInfo = e.get(fmt.Sprintf("%s/%s/@v/%s.info", e.proxyBase, mod, urlPathEscape(escapePath(checkVersion))))
 
 		// Unlike "latest"/"upgrade" and comparison queries (both handled above,
 		// since neither has a real per-version proxy endpoint to query
@@ -359,7 +359,7 @@ func (e endpoints) probe(module, version string) report {
 			}
 		}
 
-		r.sum = e.get(fmt.Sprintf("%s/lookup/%s@%s", e.sumBase, mod, escapePath(checkVersion)))
+		r.sum = e.get(fmt.Sprintf("%s/lookup/%s@%s", e.sumBase, mod, urlPathEscape(escapePath(checkVersion))))
 
 		if r.versionInfo.ok {
 			// The proxy resolves @latest/@v/<version>.info by VCS origin
@@ -371,7 +371,7 @@ func (e endpoints) probe(module, version string) report {
 			// "module google.golang.org/grpc" since it moved off the
 			// github.com path. Fetching the actual .mod file here is the only
 			// way to catch that: see canonicalModuleNote.
-			r.modFile = e.get(fmt.Sprintf("%s/%s/@v/%s.mod", e.proxyBase, mod, escapePath(checkVersion)))
+			r.modFile = e.get(fmt.Sprintf("%s/%s/@v/%s.mod", e.proxyBase, mod, urlPathEscape(escapePath(checkVersion))))
 		}
 	}
 

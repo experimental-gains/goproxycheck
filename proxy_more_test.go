@@ -106,6 +106,66 @@ func TestProbe_VersionQueryResolvesForSumLookup(t *testing.T) {
 	}
 }
 
+// TestProbe_HashInVersionReachesFullPath is a regression test for a real bug
+// found by testing goproxycheck's URL construction against a version string
+// containing '#' — a character golang.org/x/mod/module.EscapeVersion (the
+// same offline check resolveTarget already uses to reject a disallowed
+// version string like '?', see TestResolveTarget's disallowed-character
+// cases) explicitly allows: EscapeVersion validates against fileNameOK,
+// whose documented allowed-punctuation set includes '#'. And it's realistic
+// input, not just a technicality: real git accepts a tag/branch name
+// containing it (confirmed live with `git check-ref-format --branch
+// release#123`, a plausible way to fold an issue/PR number into a branch
+// name), so a revision-identifier version query shaped like this sails past
+// every existing check in resolveTarget and reaches probe()'s URL
+// construction completely unescaped.
+//
+// Before this fix, probe() built every proxy/sumdb URL as a plain
+// fmt.Sprintf'd string handed to (*http.Client).Get, which parses it with
+// url.Parse — and url.Parse treats an unescaped '#' as the start of a URL
+// fragment, silently discarding it and everything after it before the
+// request is ever sent. Confirmed live: building the URL
+// ".../example.com/mod/@v/v1.2.3#issue456.info" this way and issuing it
+// actually reached the server as a GET for only
+// ".../example.com/mod/@v/v1.2.3" — not even the ".info" suffix survived.
+// This fake server only answers the correctly-escaped, full path (decoded
+// server-side back to ".../@v/v1.2.3#issue456.info", exactly what a real
+// `go get` would request per cmd/go's own pathEscape) with a real 200 — any
+// other path, including the truncated one this tool sent pre-fix, gets a
+// 404, so this test fails pre-fix and passes post-fix.
+func TestProbe_HashInVersionReachesFullPath(t *testing.T) {
+	const version = "v1.2.3#issue456"
+	wantInfoPath := "/example.com/mod/@v/v1.2.3#issue456.info"
+	wantSumPath := "/lookup/example.com/mod@v1.2.3#issue456"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case wantInfoPath:
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v1.2.3#issue456"}`))
+		case wantSumPath:
+			w.WriteHeader(http.StatusOK)
+		default:
+			// Includes @latest, @v/list, and (pre-fix) the truncated
+			// ".../@v/v1.2.3" path url.Parse actually sent.
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	ep := endpoints{proxyBase: srv.URL, sumBase: srv.URL, client: srv.Client()}
+
+	r := ep.probe("example.com/mod", version)
+	if !r.versionInfo.ok {
+		t.Errorf("versionInfo.ok = false, want true — the request should have reached %s (got body %q)", wantInfoPath, r.versionInfo.body)
+	}
+	if !r.sum.ok {
+		t.Errorf("sum.ok = false, want true — the sum lookup should have reached %s", wantSumPath)
+	}
+	if !r.ready() {
+		t.Errorf("ready() = false, want true")
+	}
+}
+
 // TestComparisonQuery checks the operator/operand split for the four
 // documented comparison version-query forms (go.dev/ref/mod#version-queries),
 // including that "<=" and ">=" aren't mis-split as "<"/">" with a leading
