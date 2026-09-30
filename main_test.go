@@ -324,6 +324,30 @@ func TestResolveTarget_PatchVersionRejected(t *testing.T) {
 	}
 }
 
+// TestResolveTarget_NoneVersionRejected is a regression test for a real bug
+// found by testing goproxycheck against real documented Go version queries
+// beyond "latest"/"upgrade"/"patch": "none" (go.dev/ref/mod#version-queries)
+// is the "empty" version query — it removes a module's requirement (or is a
+// no-op if there wasn't one) rather than naming any real, fetchable version.
+// Confirmed live (2026-09-30) that `go get module@none` succeeds immediately
+// and touches the network not at all, even under GOPROXY=off and even for a
+// module that doesn't exist, so there's no proxy/sumdb-availability question
+// for this tool to answer. Before this check, goproxycheck sent "none" to
+// the proxy as a literal version string, which 404s with the same "invalid
+// version: unknown revision none" body a genuinely bogus revision gets, and
+// reported statusUnknownRevision ("Check for a typo in the version, tag, or
+// commit hash...") and exited 1 — the opposite of reality, since a real `go
+// get module@none` for that same module always succeeds trivially.
+func TestResolveTarget_NoneVersionRejected(t *testing.T) {
+	_, _, err := resolveTarget([]string{"example.com/mod@none"})
+	if err == nil {
+		t.Fatal(`expected an error for version "none", which this tool has nothing to check`)
+	}
+	if !strings.Contains(err.Error(), "none") {
+		t.Errorf("error should mention the none query: %v", err)
+	}
+}
+
 // TestResolveTarget_DisallowedVersionCharsRejected is a regression test for a
 // real bug: a version string containing a character real `go` disallows
 // outright (a colon, question mark, semicolon, asterisk, pipe, backslash,

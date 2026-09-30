@@ -499,6 +499,42 @@ func resolveTarget(args []string) (module, version string, err error) {
 			// statusMajorVersionMismatch, and statusUnknownRevision.
 			return "", "", fmt.Errorf(`version "patch" can only be resolved relative to a version %s already requires in some go.mod — goproxycheck has no such existing-requirement context for a bare module@version argument, and neither does a real 'go get %s@patch' run the same way: it fails immediately with `+"`can't query version \"patch\" of module %s: no existing version is required`"+`, without ever contacting the proxy. Check a concrete version, %s@latest, or %s@upgrade instead (upgrade IS well-defined with no existing requirement: it's equivalent to latest)`, parts[0], parts[0], parts[0], parts[0], parts[0])
 		}
+		if parts[1] == "none" {
+			// "none" is the documented "empty" version query
+			// (go.dev/ref/mod#version-queries): unlike every other query this
+			// tool resolves or rejects above/below, it doesn't name any real,
+			// fetchable version at all — it means "no version": `go get
+			// module@none` removes module's requirement from go.mod (or is
+			// simply a no-op if there wasn't one), rather than checking or
+			// fetching anything. So there's no proxy/sumdb-availability
+			// question here for this tool to answer, unlike "latest"/"upgrade"
+			// (resolved against a real version) or "patch" (meaningfully
+			// rejected right above for lacking an existing requirement to be
+			// relative to).
+			//
+			// Confirmed live (2026-09-30): `go get module@none` succeeds
+			// immediately (exit 0) and touches the network not at all —
+			// verified even with GOPROXY=off, and even for a module path that
+			// doesn't exist or is completely unreachable
+			// (`example.com/totally/nonexistent/module@none` succeeds the exact
+			// same way, offline). With an existing requirement already in
+			// go.mod, it likewise succeeds instantly under GOPROXY=off and
+			// simply drops the requirement line — no proxy or sumdb lookup
+			// either way.
+			//
+			// Before this check, goproxycheck sent "none" to the proxy as a
+			// literal version string, which 404s with the identical "invalid
+			// version: unknown revision none" body a genuinely bogus
+			// revision/branch/commit gets (confirmed live against
+			// golang.org/x/mod), so it reported statusUnknownRevision —
+			// "proxy.golang.org says this isn't a revision that exists in the
+			// module's repository at all ... Check for a typo in the version,
+			// tag, or commit hash" and exited 1 — the exact opposite of
+			// reality: a real `go get module@none` for this same module always
+			// succeeds trivially and instantly, no repository or proxy lookup
+			// involved at all.
+			return "", "", fmt.Errorf(`version "none" is the documented "empty" version query (go.dev/ref/mod#version-queries) — it removes %s's requirement (or is a no-op if there wasn't one) rather than naming any real, fetchable version, so there's no proxy/sumdb availability question here for this tool to check: a real 'go get %s@none' always succeeds immediately without ever contacting the proxy, regardless of whether %s even exists. Check a concrete version, %s@latest, or %s@upgrade instead`, parts[0], parts[0], parts[0], parts[0], parts[0])
+		}
 		if isComparisonVersionQuery(parts[1]) {
 			// A comparison query is only actually well-formed if its operand is
 			// itself a valid semantic version — confirmed live (2026-09-28) that
