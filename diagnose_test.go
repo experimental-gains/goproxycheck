@@ -1334,6 +1334,61 @@ func TestDiagnose_InvalidPseudoVersion(t *testing.T) {
 	}
 }
 
+// TestDiagnose_NoMatchingVersionsForPrefixQuery reproduces a real
+// proxy.golang.org response for a bare prefix version query (e.g. "v0.99")
+// that no published version satisfies — confirmed live (2026-09-30) against
+// github.com/pkg/errors (whose real @v/list tops out at v0.9.1): querying
+// @v/v0.99.info 404s with `not found: module github.com/pkg/errors: no
+// matching versions for query "v0.99"`, and a real `go list -m
+// github.com/pkg/errors@v0.99` fails immediately with the identical
+// message. Unlike a comparison query ("<v1.2.3"), this tool never resolves
+// a prefix query like "v0.99" against @v/list itself — probe() deliberately
+// sends it straight to @v/<query>.info, relying on proxy.golang.org's own
+// server-side resolution (see probe()'s doc comment on that delegation) —
+// so the "no matching versions" failure can only ever be caught by
+// recognizing this specific 404 body, not by any client-side check ahead of
+// the network request the way comparisonQueryNoMatch works.
+func TestDiagnose_NoMatchingVersionsForPrefixQuery(t *testing.T) {
+	const module = "example.com/mod"
+	const version = "v0.99"
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/" + module + "/@latest":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, `{"Version":"v0.9.0"}`)
+		case "/" + module + "/@v/list":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "v0.9.0\n")
+		case "/" + module + "/@v/" + version + ".info":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = fmt.Fprintf(w, "not found: module %s: no matching versions for query %q", module, version)
+		case "/" + module + "/@v/v0.9.0.mod":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "module "+module+"\n")
+		default:
+			t.Fatalf("unexpected request to %s", r.URL.Path)
+		}
+	}))
+	defer proxy.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/" + module + "@" + version: http.StatusNotFound,
+	})
+	defer sum.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, client: proxy.Client()}
+	r := ep.probe(module, version)
+	got := diagnose(r)
+	if got.status != statusNoMatchingVersion {
+		t.Fatalf("status = %s, want %s (proxy.golang.org itself says no version satisfies this query — permanent, not indexing lag); message: %s", got.status, statusNoMatchingVersion, got.message)
+	}
+	if !strings.Contains(got.message, "no matching versions for query") {
+		t.Errorf("message should quote the proxy's own error body, got: %s", got.message)
+	}
+	if strings.Contains(got.message, "retry in a minute") {
+		t.Errorf("message should not suggest retrying like ordinary indexing lag, got: %s", got.message)
+	}
+}
+
 // TestDiagnose_ProxyErrorStatus_ModuleUnknown reproduces the run #380 find:
 // per go.dev/ref/mod#goproxy-protocol, only 404/410 mean "not found" — any
 // other 4xx/5xx (429, 500, 502, 503, ...) is a terminal protocol error the

@@ -256,6 +256,45 @@ func isInvalidPseudoVersion(body string) bool {
 	return strings.Contains(body, invalidPseudoVersionMarker)
 }
 
+// noMatchingVersionsMarker is the distinctive substring proxy.golang.org
+// includes in the plain-text body of a 404 response when a version query it
+// resolves server-side (a partial/prefix version like "v1.2" or "v1", or a
+// branch/revision identifier — see probe()'s doc comment on why those are
+// sent to @v/<query>.info directly rather than resolved client-side the way
+// comparisonQueryNoMatch/resolveComparisonQuery handle "<v1.2.3"-shaped
+// queries) has zero published versions satisfying it. This is the same
+// underlying "no matching versions" failure statusNoMatchingVersion already
+// exists to report for a comparison query — proxy.golang.org just surfaces
+// it through a different endpoint for a prefix/revision query, since this
+// tool never resolves those against @v/list itself.
+//
+// Confirmed live (2026-09-30) two ways, both against the real
+// proxy.golang.org: an ordinary nonexistent-prefix query (github.com/pkg/
+// errors's real @v/list tops out at v0.9.1; querying @v/v0.99.info 404s with
+// `not found: module github.com/pkg/errors: no matching versions for query
+// "v0.99"`, and a real `go list -m github.com/pkg/errors@v0.99` fails
+// immediately with the identical message, entirely independent of any
+// caching/indexing state), and a retraction-driven case (github.com/
+// jayconrod/retract's real v1.0.0 and v1.0.1 — the only two versions the
+// prefix "v1.0" could match — are both retracted, so @v/v1.0.info 404s the
+// same way, and a real `go list -m github.com/jayconrod/retract@v1.0` fails
+// with the identical message: proxy.golang.org's server-side resolution for
+// this endpoint applies the same retraction-aware algorithm cmd/go's own
+// client-side resolution does, not a separate, potentially-diverging one).
+//
+// Before this check, either shape 404'd with a body matching none of this
+// file's other markers, so it fell through all the way to the generic
+// not-yet-indexed fallback ("ordinary indexing lag ... retry in a minute, or
+// use --wait") — wrong in the same way already fixed for a comparison query
+// with no matching version: the query can't resolve no matter how long it's
+// retried unless the underlying set of published/retracted versions actually
+// changes, which --wait's polling loop cannot cause or detect.
+const noMatchingVersionsMarker = "no matching versions for query"
+
+func isNoMatchingVersionsQuery(body string) bool {
+	return strings.Contains(body, noMatchingVersionsMarker)
+}
+
 // isProxyErrorStatus reports whether code is a "terminal error" response
 // per the documented GOPROXY protocol (go.dev/ref/mod#goproxy-protocol):
 // "Responses with status codes 4xx and 5xx are treated as errors. The
@@ -617,6 +656,23 @@ func diagnose(r report) diagnosis {
 				"This isn't the negative-cache bug or ordinary indexing lag — the named commit/tag isn't in question, but the pseudo-version's own encoded timestamp or base-tag segment doesn't match reality, which can never become correct no matter how long you wait or retry, and a real `go install`/`go get` fails outright with this same message right now. "+
 				"Check how this pseudo-version was constructed: `go mod download %s@<commit-hash-or-branch>` (or `go list -m %s@<commit>`) has the proxy compute the correct canonical pseudo-version for you, rather than hand-building the yyyymmddhhmmss-hash segment.",
 			displayTarget(r), firstLine(r.versionInfo.body), r.module, r.module)}
+	}
+
+	// Checked alongside isUnknownRevision/isInvalidPseudoVersion above for the
+	// same reason: a 404 whose body carries this specific proxy-generated
+	// message means the query itself (resolved server-side by
+	// proxy.golang.org, not client-side by this tool — see
+	// noMatchingVersionsMarker's doc comment) has nothing that satisfies it,
+	// the same terminal condition comparisonQueryNoMatch/statusNoMatchingVersion
+	// already exists to report for a "<"/">"-style comparison query, just
+	// reached through a different endpoint for a prefix or revision-shaped
+	// query this tool delegates to the proxy instead of resolving itself.
+	if isNoMatchingVersionsQuery(r.versionInfo.body) {
+		return diagnosis{statusNoMatchingVersion, fmt.Sprintf(
+			"%s: proxy.golang.org says no published version satisfies this query: %s. "+
+				"This isn't the negative-cache bug or ordinary indexing lag — a real `go get`/`go install` for the identical query fails immediately and the same way right now, regardless of proxy caching or indexing state. "+
+				"Check for a typo, or run `go list -m -versions %s` to see what's actually published (a version can still be retracted and excluded from every query's own resolution — see the retracted diagnosis — while still being installable if named explicitly and literally).",
+			displayTarget(r), firstLine(r.versionInfo.body), r.module)}
 	}
 
 	// The blocklist check above only sees @latest/@v/list, which catches a
