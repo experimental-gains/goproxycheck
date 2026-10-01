@@ -348,6 +348,43 @@ func TestModuleFromGoMod_QuotedPathWithSpace(t *testing.T) {
 	}
 }
 
+// TestModuleFromGoMod_RepeatedModuleDirective is a regression test for a
+// real bug: moduleDirective returned as soon as it finished parsing the
+// FIRST 'module' directive in a go.mod, so a go.mod carrying a second
+// 'module' directive never got flagged at all — its first path was
+// silently returned and probed against the proxy as an ordinary module.
+// Confirmed live (2026-10-01, go1.24.4) against a real go.mod: `go list -m`
+// Fatals immediately and offline with "go.mod:N: repeated module
+// statement" for every one of these shapes — two single-line directives,
+// two block directives, one of each, and two path lines inside a single
+// block — never reaching the proxy at all, regardless of which of the two
+// (or more) module paths a user might expect to be "the real one."
+func TestModuleFromGoMod_RepeatedModuleDirective(t *testing.T) {
+	for name, content := range map[string]string{
+		"two single-line directives": "module example.com/foo\n\nmodule example.com/bar\n\ngo 1.21\n",
+		"two block directives":       "module (\n\texample.com/foo\n)\n\nmodule (\n\texample.com/bar\n)\n\ngo 1.21\n",
+		"single-line then block":     "module example.com/foo\n\nmodule (\n\texample.com/bar\n)\n\ngo 1.21\n",
+		"block then single-line":     "module (\n\texample.com/foo\n)\n\nmodule example.com/bar\n\ngo 1.21\n",
+		"two paths inside one block": "module (\n\texample.com/foo\n\texample.com/bar\n)\n\ngo 1.21\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "go.mod")
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			_, err := moduleFromGoMod(path)
+			if err == nil {
+				t.Fatal("expected an error for a go.mod with more than one 'module' directive, got none")
+			}
+			if !strings.Contains(err.Error(), "repeated module statement") {
+				t.Errorf("error %q doesn't describe this as a repeated module statement", err)
+			}
+		})
+	}
+}
+
 func TestModuleFromGoMod_Missing(t *testing.T) {
 	if _, err := moduleFromGoMod(filepath.Join(t.TempDir(), "go.mod")); err == nil {
 		t.Fatal("expected an error for a missing go.mod")

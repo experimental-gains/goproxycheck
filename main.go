@@ -831,9 +831,36 @@ func moduleFromGoMod(path string) (string, error) {
 // thinking a module directive needs to be added from scratch, instead of
 // the accurate, `go`-shaped answer that an existing directive's path is
 // missing or was accidentally deleted.
+//
+// Also rejects a go.mod carrying more than one 'module' directive — in any
+// combination of single-line and parenthesized-block form, including two
+// path lines inside a single block — as "repeated module statement",
+// mirroring go/toolchain/module directive repeated-more-than-once being a
+// Fatal in sibling tool goprivaudit, confirmed to have the exact same shape
+// here: a repeated 'go' or 'toolchain' directive already Fatals this way
+// (not goproxycheck's concern, it never parses those directives itself),
+// and live testing (2026-10-01, go1.24.4) against a real go.mod shows a
+// repeated 'module' directive Fatals identically —
+//
+//	go: errors parsing go.mod:
+//	go.mod:3: repeated module statement
+//
+// — regardless of whether the two directives are both single-line, both
+// block form, one of each, or two path lines inside one block. Before this
+// fix, this function returned as soon as it finished parsing the FIRST
+// 'module' directive it found, so a go.mod with a second (necessarily
+// invalid, per the above) 'module' directive never hit this check at all:
+// moduleFromGoMod's no-argument-mode callers silently got the first
+// directive's path and probed it against the proxy as if the go.mod were
+// perfectly ordinary, instead of the accurate, `go`-shaped answer that the
+// real toolchain would Fatal immediately and offline, before ever
+// resolving anything or contacting a proxy, no matter which of the two (or
+// more) module paths a user might expect to be "the real one."
 func moduleDirective(data string) (string, error) {
 	inBlock := false
 	blockMod := ""
+	mod := ""
+	foundLine := ""
 	for _, raw := range strings.Split(data, "\n") {
 		line := strings.TrimSpace(raw)
 		if inBlock {
@@ -841,18 +868,26 @@ func moduleDirective(data string) (string, error) {
 				if blockMod == "" {
 					return "", fmt.Errorf("has a 'module' block with no path")
 				}
-				return blockMod, nil
+				if mod != "" {
+					return "", fmt.Errorf("has more than one 'module' directive (%q and %q) — real `go list -m`/`go build` Fatals immediately with `repeated module statement`, entirely offline, before ever contacting the proxy", foundLine, line)
+				}
+				mod, foundLine = blockMod, line
+				inBlock = false
+				continue
 			}
 			if content := stripLineComment(line); moduleLineHasExtraArgs(content) {
 				return "", fmt.Errorf("has a 'module' block entry with more than one argument: %q — real `go list -m`/`go build` Fatals immediately with `usage: module module/path`, entirely offline, before ever contacting the proxy", line)
 			}
-			if mod := parseModulePath(line); mod != "" {
-				// A second non-empty line here is malformed (real go
-				// errors with "repeated module statement"), so this can't
-				// happen against a go.mod real `go` accepts — last one
-				// wins is a harmless fallback, matching this function's
-				// existing best-effort handling of malformed input.
-				blockMod = mod
+			if m := parseModulePath(line); m != "" {
+				// A second non-empty path line inside the same block is
+				// just as much a repeated module statement to real go as
+				// two separate top-level directives (confirmed live, see
+				// this function's doc comment) — report it the same way
+				// instead of silently letting the last one win.
+				if blockMod != "" {
+					return "", fmt.Errorf("has more than one 'module' directive (%q and %q) — real `go list -m`/`go build` Fatals immediately with `repeated module statement`, entirely offline, before ever contacting the proxy", blockMod, line)
+				}
+				blockMod = m
 			}
 			continue
 		}
@@ -867,9 +902,13 @@ func moduleDirective(data string) (string, error) {
 		// real go.mod shapes real `go` Fatals on as a malformed module
 		// directive, not evidence there's no directive here at all.
 		if rest, ok := strings.CutPrefix(line, "module"); ok && (rest == "" || rest[0] == ' ' || rest[0] == '\t' || rest[0] == '(' || strings.HasPrefix(rest, "//")) {
+			if mod != "" {
+				return "", fmt.Errorf("has more than one 'module' directive (%q and %q) — real `go list -m`/`go build` Fatals immediately with `repeated module statement`, entirely offline, before ever contacting the proxy", foundLine, line)
+			}
 			rest = strings.TrimSpace(rest)
 			if stripLineComment(rest) == "(" {
 				inBlock = true
+				blockMod = ""
 				continue
 			}
 			if content := stripLineComment(rest); moduleLineHasExtraArgs(content) {
@@ -883,8 +922,8 @@ func moduleDirective(data string) (string, error) {
 				// there being a second argument at all.
 				return "", fmt.Errorf("has a 'module' directive with more than one argument: %q — real `go list -m`/`go build` Fatals immediately with `usage: module module/path`, entirely offline, before ever contacting the proxy", line)
 			}
-			mod := parseModulePath(rest)
-			if mod == "" {
+			m := parseModulePath(rest)
+			if m == "" {
 				// e.g. a "module" line whose entire value is a "//"
 				// comment (found via mutation testing, run #125: the
 				// comment-stripping boundary at index 0 is exercised,
@@ -893,13 +932,17 @@ func moduleDirective(data string) (string, error) {
 				// request to the proxy instead of a clear error.
 				return "", fmt.Errorf("has a 'module' directive with no path: %q", line)
 			}
-			return mod, nil
+			mod, foundLine = m, line
+			continue
 		}
 	}
 	if inBlock {
 		return "", fmt.Errorf("has an unterminated 'module' block")
 	}
-	return "", fmt.Errorf("has no 'module' directive")
+	if mod == "" {
+		return "", fmt.Errorf("has no 'module' directive")
+	}
+	return mod, nil
 }
 
 // moduleLineHasExtraArgs reports whether content — a go.mod module-directive
