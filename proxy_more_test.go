@@ -670,6 +670,132 @@ func TestProbe_LatestModFilePrefersReleaseOverHigherPrerelease(t *testing.T) {
 	}
 }
 
+// TestResolveIncompatibleLatest reproduces github.com/minio/minio-go's real,
+// live shape (2026-10-01): every version from v1.0.0 through
+// v6.0.14+incompatible carries only the fake one-line go.mod stub
+// (modfetch.LegacyGoMod), so per https://golang.org/issue/34165 every
+// "+incompatible" tag stays eligible for "latest" and the true highest —
+// v6.0.14+incompatible — must win, even though proxy.golang.org's own
+// @latest endpoint reports the stale v3.0.2+incompatible (confirmed live,
+// repeatedly, against the real proxy).
+func TestResolveIncompatibleLatest(t *testing.T) {
+	const module = "github.com/minio/minio-go"
+	const legacy = "module " + module + "\n"
+	listed := []string{
+		"v0.1.0", "v0.2.0", "v1.0.0",
+		"v2.0.0+incompatible", "v2.1.0+incompatible",
+		"v3.0.0+incompatible", "v3.0.2+incompatible",
+		"v6.0.2+incompatible", "v6.0.14+incompatible",
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Every version here — compatible or incompatible — carries only the
+		// fake stub, matching the real module exactly.
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(legacy))
+	}))
+	defer srv.Close()
+	ep := endpoints{proxyBase: srv.URL, sumBase: srv.URL, client: srv.Client()}
+
+	got, ok := ep.resolveIncompatibleLatest(escapePath(module), module, listed, nil)
+	if !ok || got != "v6.0.14+incompatible" {
+		t.Errorf("resolveIncompatibleLatest(...) = (%q, %v), want (%q, true)", got, ok, "v6.0.14+incompatible")
+	}
+}
+
+// TestResolveIncompatibleLatest_StopsAtRealGoMod reproduces the opposite,
+// also-real shape: github.com/mattn/go-sqlite3's highest compatible version,
+// v1.14.52, has a real go.mod (a `go` directive plus a `retract` block,
+// confirmed live) — so every higher "+incompatible" v2.x tag must be
+// excluded, and the correct answer is v1.14.52 itself, not the higher-by-raw-
+// semver v2.0.3+incompatible.
+func TestResolveIncompatibleLatest_StopsAtRealGoMod(t *testing.T) {
+	const module = "github.com/mattn/go-sqlite3"
+	listed := []string{"v1.14.52", "v2.0.0+incompatible", "v2.0.1+incompatible", "v2.0.2+incompatible", "v2.0.3+incompatible"}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@v/v1.14.52.mod"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("module " + module + "\n\ngo 1.21\n\nretract (\n\t[v2.0.0+incompatible, v2.0.7+incompatible] // Accidental.\n)\n"))
+		default:
+			t.Errorf("unexpected request for %s: incompatible candidates above a real-go.mod compatible version must never be fetched", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	ep := endpoints{proxyBase: srv.URL, sumBase: srv.URL, client: srv.Client()}
+
+	got, ok := ep.resolveIncompatibleLatest(escapePath(module), module, listed, nil)
+	if !ok || got != "v1.14.52" {
+		t.Errorf("resolveIncompatibleLatest(...) = (%q, %v), want (%q, true)", got, ok, "v1.14.52")
+	}
+}
+
+// TestResolveIncompatibleLatest_SkipsRetracted mirrors
+// TestResolveComparisonQuery_SkipsRetractedVersions for the "latest" path: a
+// retracted "+incompatible" candidate must never be the corrected answer.
+func TestResolveIncompatibleLatest_SkipsRetracted(t *testing.T) {
+	const module = "example.com/legacy"
+	const legacy = "module " + module + "\n"
+	listed := []string{"v1.0.0", "v2.0.0+incompatible", "v2.1.0+incompatible"}
+	retracted := func(v string) bool { return v == "v2.1.0+incompatible" }
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(legacy))
+	}))
+	defer srv.Close()
+	ep := endpoints{proxyBase: srv.URL, sumBase: srv.URL, client: srv.Client()}
+
+	got, ok := ep.resolveIncompatibleLatest(escapePath(module), module, listed, retracted)
+	if !ok || got != "v2.0.0+incompatible" {
+		t.Errorf("resolveIncompatibleLatest(...) = (%q, %v), want (%q, true) (v2.1.0+incompatible is retracted)", got, ok, "v2.0.0+incompatible")
+	}
+}
+
+// TestProbe_LatestQueryReconsidersIncompatibleVersion is the end-to-end
+// version of TestResolveIncompatibleLatest, through the full probe() path —
+// the actual bug as goproxycheck users would see it: a bare `module@latest`
+// argument (the natural, documented CLI invocation) resolving to and
+// diagnosing the wrong version entirely. Before this fix, probe() trusted
+// the fake server's stale @latest response (v3.0.2+incompatible, mirroring
+// proxy.golang.org's real one for this exact module) verbatim.
+func TestProbe_LatestQueryReconsidersIncompatibleVersion(t *testing.T) {
+	const module = "github.com/minio/minio-go"
+	const legacy = "module " + module + "\n"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v3.0.2+incompatible","Time":"2017-09-01T08:51:27Z"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("v1.0.0\nv2.0.0+incompatible\nv3.0.2+incompatible\nv6.0.14+incompatible\n"))
+		case strings.HasSuffix(r.URL.Path, "/@v/v6.0.14+incompatible.info"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v6.0.14+incompatible"}`))
+		case strings.Contains(r.URL.Path, "/lookup/"):
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, ".mod"):
+			// Every version's go.mod here is the fake stub, matching the real
+			// module — including whatever version probe() ends up fetching a
+			// .mod for (latestModFile and/or the resolved checkVersion).
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(legacy))
+		case strings.HasSuffix(r.URL.Path, "/@v/v3.0.2+incompatible.info"):
+			t.Errorf("unexpected request for the stale @latest version's .info (%s): checkVersion must be corrected before any per-version probe", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	ep := endpoints{proxyBase: srv.URL, sumBase: srv.URL, client: srv.Client()}
+
+	r := ep.probe(module, "latest")
+	if r.resolvedVersion != "v6.0.14+incompatible" {
+		t.Errorf("resolvedVersion = %q, want %q (the real latest — proxy.golang.org's own stale @latest response must not be trusted verbatim for a +incompatible result)", r.resolvedVersion, "v6.0.14+incompatible")
+	}
+}
+
 func TestReady(t *testing.T) {
 	cases := []struct {
 		name string

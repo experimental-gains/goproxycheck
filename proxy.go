@@ -278,8 +278,29 @@ func (e endpoints) probe(module, version string) report {
 		// --wait, polling to timeout for a literal "upgrade" that can never
 		// appear in @v/list.
 		if info, err := parseVersionInfo(r.latest.body); err == nil && info.Version != "" {
-			checkVersion = info.Version
-			r.resolvedVersion = info.Version
+			resolved := info.Version
+			// proxy.golang.org's own @latest endpoint is not always
+			// authoritative when it names a "+incompatible" version: see
+			// resolveIncompatibleLatest's doc comment for the live-confirmed
+			// divergence (github.com/minio/minio-go) and the real cmd/go rule
+			// it replicates. Gated on the "+incompatible" suffix so every
+			// module without any pre-modules legacy major-version tags — the
+			// overwhelming majority — takes zero extra requests and sees zero
+			// behavior change.
+			if r.list.ok && strings.HasSuffix(resolved, "+incompatible") {
+				isRetracted := func(v string) bool {
+					if !r.latestModFile.ok {
+						return false
+					}
+					_, retracted := retraction(r.latestModFile.body, v)
+					return retracted
+				}
+				if corrected, ok := e.resolveIncompatibleLatest(mod, module, r.listedVersions(), isRetracted); ok {
+					resolved = corrected
+				}
+			}
+			checkVersion = resolved
+			r.resolvedVersion = resolved
 		}
 	} else if op, operand, ok := comparisonQuery(version); ok && r.list.ok {
 		// A comparison query ("<v1.2.3", "<=v1.2.3", ">v1.2.3", ">=v1.2.3",
@@ -614,4 +635,108 @@ func resolveComparisonQuery(op, operand string, listed []string, retracted func(
 	}
 	r := pick(prereleases)
 	return r, r != ""
+}
+
+// resolveIncompatibleLatest re-derives the correct "latest" version for a
+// module whose raw @latest answer is a "+incompatible" version (a
+// pre-modules legacy major-version tag — go.dev/ref/mod#incompatible-versions
+// — major version 2 or higher, published without a /vN module-path suffix or
+// a real go.mod declaring one), per
+// https://golang.org/issue/34165 and cmd/go's own modload/query.go
+// (queryMatcher.filterVersions + versionHasGoMod, read directly from
+// /usr/share/go-1.24/src/cmd/go/internal/modload/query.go): walking the
+// module's tagged versions in ascending semver order, once the highest
+// COMPATIBLE (non-"+incompatible") version has a real go.mod file — not just
+// the single-line "module <path>\n" stub the proxy/go synthesizes when a tag
+// was never actually tagged as a Go module at all (modfetch.LegacyGoMod) —
+// `go get`/`go list -m module@latest` never selects any version past that
+// point: every higher "+incompatible" tag is unconditionally excluded from
+// "latest" resolution, no matter how it compares by raw semver. If that
+// highest compatible version has no real go.mod (or there is no compatible
+// version at all), incompatible versions stay eligible, and go picks the
+// highest tagged release — preferring any release over any prerelease,
+// exactly like resolveComparisonQuery above — from the complete list
+// instead, not necessarily the version proxy.golang.org's own @latest
+// endpoint happens to report.
+//
+// retracted (nil-safe, same contract as resolveComparisonQuery's parameter)
+// skips a candidate the module's own go.mod retracts, so this doesn't
+// resurrect a version the maintainer explicitly withdrew.
+//
+// Confirmed live (2026-10-01) against github.com/minio/minio-go, a real,
+// currently published module: @v/list tops out at v6.0.14+incompatible, and
+// every version from v1.0.0 through v6.0.14+incompatible carries only the
+// one-line fake go.mod stub (confirmed via @v/v1.0.0.mod and
+// @v/v6.0.14+incompatible.mod both returning exactly "module
+// github.com/minio/minio-go\n") — yet proxy.golang.org's own @latest
+// endpoint returns v3.0.2+incompatible, stale by three major versions, every
+// time it's queried. `go list -m github.com/minio/minio-go@latest` (go
+// 1.24.4) resolves to v6.0.14+incompatible instead, matching this function's
+// rule, not the raw @latest response. Before this fix, goproxycheck trusted
+// @latest's v3.0.2+incompatible verbatim: every diagnosis (ready/retracted/
+// deprecated/sumdb-lag) and the --json resolved-version field would have
+// been checked against and reported the wrong version entirely — three
+// major versions behind what a real `go get .../minio-go@latest` actually
+// fetches right now.
+//
+// By contrast, github.com/mattn/go-sqlite3's own @latest, v1.14.52, is not
+// "+incompatible" at all, so probe() never even calls this function for it:
+// its v2.0.0+incompatible through v2.0.3+incompatible tags are correctly
+// excluded from "latest" because v1.14.52's go.mod is real (it carries a
+// `go` directive and a `retract` block, confirmed live) — the opposite
+// branch this function's loop takes, verified directly against the same
+// real module TestProbe_LatestModFileScopedToMajorLine already uses.
+func (e endpoints) resolveIncompatibleLatest(escapedModule, module string, listed []string, retracted func(string) bool) (resolved string, ok bool) {
+	sorted := make([]string, 0, len(listed))
+	for _, v := range listed {
+		if semver.IsValid(v) {
+			sorted = append(sorted, v)
+		}
+	}
+	semver.Sort(sorted)
+
+	legacyGoMod := fmt.Sprintf("module %s\n", module)
+	needIncompatible := false
+	var lastCompatible string
+	var releases, prereleases []string
+	for _, v := range sorted {
+		if retracted != nil && retracted(v) {
+			continue
+		}
+		if !needIncompatible {
+			if !strings.HasSuffix(v, "+incompatible") {
+				lastCompatible = v
+			} else if lastCompatible != "" {
+				modFile := e.get(fmt.Sprintf("%s/%s/@v/%s.mod", e.proxyBase, escapedModule, urlPathEscape(escapePath(lastCompatible))))
+				if modFile.ok && modFile.body != legacyGoMod {
+					// lastCompatible has a real go.mod: stop here, exactly
+					// like filterVersions' `break` above.
+					break
+				}
+				needIncompatible = true
+			}
+		}
+		if semver.Prerelease(v) != "" {
+			prereleases = append(prereleases, v)
+		} else {
+			releases = append(releases, v)
+		}
+	}
+
+	highest := func(candidates []string) string {
+		best := ""
+		for _, v := range candidates {
+			if best == "" || semver.Compare(v, best) > 0 {
+				best = v
+			}
+		}
+		return best
+	}
+	if best := highest(releases); best != "" {
+		return best, true
+	}
+	if best := highest(prereleases); best != "" {
+		return best, true
+	}
+	return "", false
 }
