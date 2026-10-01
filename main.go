@@ -182,7 +182,7 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 		for {
 			r = ep.probe(module, version)
 			d = diagnose(r)
-			if d.status == statusSumdbLag {
+			if d.status == statusSumdbLag || d.status == statusReady || d.status == statusRetracted || d.status == statusDeprecated {
 				// Checked before localSumdbSkipped: a custom (non-"off",
 				// non-public) $GOSUMDB only genuinely means "verification
 				// goes elsewhere, the public sumdb's lag is irrelevant" when
@@ -190,22 +190,54 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 				// — see localGosumdbConfigError's doc comment for why a
 				// malformed one is a real, unconditional failure instead, not
 				// a safe skip.
+				//
+				// Gated on all four of these statuses, not just
+				// statusSumdbLag: every one of them already claims (either
+				// unconditionally for statusReady, or conditionally on
+				// r.sum.ok for statusRetracted/statusDeprecated — see their
+				// "resolves fine... will succeed" wording in diagnose.go)
+				// that "a plain `go install` will work/succeed" based purely
+				// on proxy.golang.org and the PUBLIC sum.golang.org this tool
+				// actually probes — with no awareness that dbDial()
+				// (modfetch/sumdb.go) parses and validates the *local*
+				// $GOSUMDB unconditionally, before any specific module's
+				// verification is even attempted, regardless of whether the
+				// module is otherwise fully live, retracted, or deprecated.
+				// Confirmed live (2026-10-01) two ways against a fresh
+				// GOMODCACHE with GOSUMDB=sum.example.com (a bare hostname —
+				// passes sumdbName's extraction fine, but fails
+				// note.NewVerifier, exactly the "malformed verifier id"
+				// shape localGosumdbConfigError already detects): `go mod
+				// download golang.org/x/mod@v0.41.0` (fully live on both
+				// proxy.golang.org and sum.golang.org right now) fails
+				// outright with `invalid GOSUMDB: malformed verifier id`,
+				// and the identical env against the real, currently-
+				// retracted `github.com/mattn/go-sqlite3@v2.0.3+incompatible`
+				// fails the exact same way — never even reaching the point
+				// of reporting retraction. Before this fix, goproxycheck
+				// reported plain statusReady ("a plain `go install` will
+				// work") for the first case, and statusRetracted with
+				// "resolves fine... will succeed" for the second — both the
+				// opposite of what the real command does in this exact
+				// environment.
 				if err := localGosumdbConfigError(module); err != nil {
 					d = diagnosis{statusGosumdbMalformedLocally, fmt.Sprintf(
-						"%s is live on proxy.golang.org, but before that would even matter, your local `GOSUMDB` config is itself malformed (%v) — real `go install`/`go get` fails outright with `invalid GOSUMDB: %v` the moment it actually needs to verify this (or any) module against the checksum database, regardless of what sum.golang.org has. "+
+						"%s is live on proxy.golang.org, but before that would even matter, your local `GOSUMDB` config is itself malformed (%v) — real `go install`/`go get` fails outright with `invalid GOSUMDB: %v` the moment it actually needs to verify this (or any) module against the checksum database, regardless of what sum.golang.org has, or whether this version is otherwise ready, retracted, or deprecated. "+
 							"That's your machine's own config, not a proxy-availability problem. Fix `GOSUMDB` (see `go help goproxy`), or set `GOSUMDB=off` if you intend to skip verification entirely.",
 						displayTarget(r), err, err)}
-				} else if skipped, reason := localSumdbSkipped(module); skipped {
-					// See localSumdbSkipped's doc comment: a local GOSUMDB=off
-					// or a matching GONOSUMDB pattern means `go install` never
-					// consults sum.golang.org for this module at all, so a
-					// sumdb-lag verdict from the public sumdb doesn't reflect
-					// what will actually happen here — the proxy already has
-					// it, so it's ready right now.
-					d = diagnosis{statusReady, fmt.Sprintf(
-						"%s is live on proxy.golang.org. sum.golang.org doesn't have it yet, but your local %s means "+
-							"`go install`/`go get` won't consult the checksum database for this module here at all, so that lag doesn't block you — a plain `go install` will work right now.",
-						displayTarget(r), reason)}
+				} else if d.status == statusSumdbLag {
+					if skipped, reason := localSumdbSkipped(module); skipped {
+						// See localSumdbSkipped's doc comment: a local GOSUMDB=off
+						// or a matching GONOSUMDB pattern means `go install` never
+						// consults sum.golang.org for this module at all, so a
+						// sumdb-lag verdict from the public sumdb doesn't reflect
+						// what will actually happen here — the proxy already has
+						// it, so it's ready right now.
+						d = diagnosis{statusReady, fmt.Sprintf(
+							"%s is live on proxy.golang.org. sum.golang.org doesn't have it yet, but your local %s means "+
+								"`go install`/`go get` won't consult the checksum database for this module here at all, so that lag doesn't block you — a plain `go install` will work right now.",
+							displayTarget(r), reason)}
+					}
 				}
 			}
 			// statusZipBuildError belongs in this early-break list for the same

@@ -1322,6 +1322,109 @@ func TestRun_SumdbLagWithGonosumdbPattern(t *testing.T) {
 	}
 }
 
+// retractedEndpoints simulates a module whose checked version (also
+// @latest's own version) is covered by a `retract` directive, with
+// proxy.golang.org and sum.golang.org both otherwise fully healthy — the
+// same shape TestDiagnose_Retracted uses at the diagnose() level, reused
+// here for full run()-level end-to-end tests.
+func retractedEndpoints(t *testing.T) endpoints {
+	t.Helper()
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v0.1.0"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("v0.1.0\n"))
+		case strings.HasSuffix(r.URL.Path, ".info"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v0.1.0"}`))
+		case strings.HasSuffix(r.URL.Path, ".mod"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("module example.com/mod\n\nretract v0.1.0 // bad release\n"))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	t.Cleanup(proxy.Close)
+	sum := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(sum.Close)
+	return endpoints{proxyBase: proxy.URL, sumBase: sum.URL, client: proxy.Client()}
+}
+
+// TestRun_ReadyWithMalformedGosumdb, TestRun_RetractedWithMalformedGosumdb,
+// and TestRun_DeprecatedWithMalformedGosumdb are regression tests for a real
+// bug: the malformed-$GOSUMDB check (TestRun_SumdbLagWithMalformedGosumdb
+// above) was only ever consulted when the probe itself produced
+// statusSumdbLag — but statusReady, statusRetracted, and statusDeprecated
+// all make the identical "a plain `go install` will work/succeed" claim
+// based purely on proxy.golang.org and the PUBLIC sum.golang.org, with no
+// awareness that a malformed local $GOSUMDB breaks verification
+// unconditionally, before any of those three states even come into play.
+//
+// Confirmed live (2026-10-01) against a fresh GOMODCACHE with
+// GOSUMDB=sum.example.com (the identical malformed-verifier-id shape
+// TestRun_SumdbLagWithMalformedGosumdb already uses): `go mod download
+// golang.org/x/mod@v0.41.0` (fully live on both proxy.golang.org and
+// sum.golang.org right now) fails outright with `invalid GOSUMDB: malformed
+// verifier id`, and the identical env against the real, currently-retracted
+// `github.com/mattn/go-sqlite3@v2.0.3+incompatible` fails the exact same
+// way — never even reaching the point of reporting retraction. Before the
+// fix, goproxycheck reported plain statusReady for the first case and
+// statusRetracted/statusDeprecated with "resolves fine... will succeed" for
+// the other two — the opposite of what the real command does.
+func TestRun_ReadyWithMalformedGosumdb(t *testing.T) {
+	t.Setenv("GOSUMDB", "mycompany.example+abc123 https://sumdb.mycompany.example")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, readyEndpoints(t))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s", code, stdout.String())
+	}
+	out := stdout.String()
+	if strings.Contains(out, "\nready\n") || strings.Contains(out, ": ready\n") {
+		t.Errorf("stdout = %q, must not report ready: a real `go install` under this exact GOSUMDB fails outright", out)
+	}
+	if !strings.Contains(out, "gosumdb-malformed-locally") {
+		t.Errorf("stdout = %q, want it to mention gosumdb-malformed-locally", out)
+	}
+}
+
+func TestRun_RetractedWithMalformedGosumdb(t *testing.T) {
+	t.Setenv("GOSUMDB", "mycompany.example+abc123 https://sumdb.mycompany.example")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, retractedEndpoints(t))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s", code, stdout.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "gosumdb-malformed-locally") {
+		t.Errorf("stdout = %q, want it to mention gosumdb-malformed-locally, not a retracted-but-will-succeed verdict", out)
+	}
+	if strings.Contains(out, "will succeed") {
+		t.Errorf("stdout = %q, must not claim `go install` will succeed: a real one fails outright on this GOSUMDB", out)
+	}
+}
+
+func TestRun_DeprecatedWithMalformedGosumdb(t *testing.T) {
+	t.Setenv("GOSUMDB", "mycompany.example+abc123 https://sumdb.mycompany.example")
+	var hits int
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, deprecatedEndpoints(t, &hits))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s", code, stdout.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "gosumdb-malformed-locally") {
+		t.Errorf("stdout = %q, want it to mention gosumdb-malformed-locally, not a deprecated-but-will-succeed verdict", out)
+	}
+	if strings.Contains(out, "will succeed") {
+		t.Errorf("stdout = %q, must not claim `go install` will succeed: a real one fails outright on this GOSUMDB", out)
+	}
+}
+
 // TestRun_NegativeCache_DirectFallbackNote is the fix for a real gap in this
 // tool's core negative-cache diagnosis: it told the user flatly that
 // nothing but waiting (or, for the per-version case, cutting a new tag)
