@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -584,6 +585,85 @@ func TestRun_LatestQueryResolves(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "resolved to v0.5.0") {
 		t.Errorf("stdout = %q, want it to mention the resolved version", stdout.String())
+	}
+}
+
+// TestRun_LatestQueryJSONIncludesResolvedVersion is the fix for a real bug
+// found by testing --json (this tool's documented machine-readable output
+// mode) against a "latest"-style query: the text-mode diagnosis already
+// names the concrete resolved version via displayTarget ("resolved to
+// v0.5.0"), but --json's top-level "version" field echoed back the raw,
+// unresolved query string ("latest") with no structured field carrying the
+// concrete version at all — a script parsing the JSON (the entire point of
+// --json) has no way to learn which version was actually checked without
+// regexing it back out of the free-text "message" field, defeating the
+// purpose of structured output. Confirmed live against the real
+// proxy.golang.org: `goproxycheck --json golang.org/x/mod@latest` prints
+// "version": "latest" even though the message says "(resolved to v0.41.0)".
+// This server only serves @v/v0.5.0.info and sum for v0.5.0, same shape as
+// TestRun_LatestQueryResolves.
+func TestRun_LatestQueryJSONIncludesResolvedVersion(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v0.5.0"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("v0.5.0\n"))
+		case strings.HasSuffix(r.URL.Path, "/@v/v0.5.0.info"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v0.5.0"}`))
+		case strings.Contains(r.URL.Path, "/lookup/") && strings.HasSuffix(r.URL.Path, "@v0.5.0"):
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	ep := endpoints{proxyBase: srv.URL, sumBase: srv.URL, client: srv.Client()}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--json", "example.com/mod@latest"}, &stdout, &stderr, ep)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	var out struct {
+		Module          string `json:"module"`
+		Version         string `json:"version"`
+		Status          string `json:"status"`
+		ResolvedVersion string `json:"resolved_version"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("json.Unmarshal(%q): %v", stdout.String(), err)
+	}
+	if out.Version != "latest" {
+		t.Errorf("version = %q, want the literal query %q preserved", out.Version, "latest")
+	}
+	if out.ResolvedVersion != "v0.5.0" {
+		t.Errorf("resolved_version = %q, want %q", out.ResolvedVersion, "v0.5.0")
+	}
+}
+
+// TestRun_JSONOmitsResolvedVersionForLiteralVersion confirms the sibling,
+// already-correct case is unaffected by the fix above: an explicit, already-
+// concrete module@version argument never sets report.resolvedVersion (see
+// probe()), so --json's output shouldn't grow a "resolved_version" key that
+// would just duplicate "version" for the overwhelming majority of
+// invocations (an explicit version is the common case; only latest/upgrade/
+// partial/comparison/revision queries resolve to something different).
+func TestRun_JSONOmitsResolvedVersionForLiteralVersion(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--json", "example.com/mod@v0.1.0"}, &stdout, &stderr, readyEndpoints(t))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	var out map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("json.Unmarshal(%q): %v", stdout.String(), err)
+	}
+	if _, ok := out["resolved_version"]; ok {
+		t.Errorf("stdout = %q, want no resolved_version key for an already-literal version", stdout.String())
 	}
 }
 

@@ -56,6 +56,13 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 	}
 
 	var d diagnosis
+	// resolvedVersion carries the concrete version a query (e.g. "latest",
+	// a partial version like "v0.19", or a revision identifier) actually
+	// resolved to, for the --json output below — see its use there for why.
+	// Stays "" for every branch that short-circuits before probing at all
+	// (GOPROXY=off, a private module, etc.), since none of those resolve
+	// anything.
+	var resolvedVersion string
 	if priv, pattern := localModulePrivate(module); priv {
 		// Verified live: with GOPRIVATE (or GONOPROXY directly) set to a
 		// pattern matching this module, `go install`/`go get`/`go mod
@@ -171,8 +178,9 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 			custom, module, version)}
 	} else {
 		deadline := time.Now().Add(*timeout)
+		var r report
 		for {
-			r := ep.probe(module, version)
+			r = ep.probe(module, version)
 			d = diagnose(r)
 			if d.status == statusSumdbLag {
 				// Checked before localSumdbSkipped: a custom (non-"off",
@@ -283,6 +291,7 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 			}
 			time.Sleep(*interval)
 		}
+		resolvedVersion = r.resolvedVersion
 		if kind == "custom" && fallbackOK {
 			// See publicProxyFallback's doc comment: the chain reaches the
 			// public proxy after one or more custom entries, so the probe
@@ -336,14 +345,34 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 	}
 
 	if *jsonOut {
-		enc := json.NewEncoder(stdout)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(map[string]string{
+		out := map[string]string{
 			"module":  module,
 			"version": version,
 			"status":  string(d.status),
 			"message": d.message,
-		}); err != nil {
+		}
+		// "version" above is always the literal argument (or the git-tag-
+		// derived version in no-argument mode) — deliberately left as the
+		// caller's own input even when it was a query, so a caller can always
+		// see what it originally asked for. But a query like "latest", a
+		// partial version ("v0.19"), or a revision identifier (a branch name
+		// or commit hash) resolves to a different, concrete version before
+		// this tool checks anything — the text-mode output already surfaces
+		// that via displayTarget's "(resolved to vX.Y.Z)", but --json had no
+		// field for it at all, so a script consuming --json (the entire
+		// point of the flag) had no way to learn the concrete version that
+		// was actually confirmed ready short of regexing it back out of the
+		// free-text "message" field. Confirmed live: `goproxycheck --json
+		// golang.org/x/mod@latest` printed "version": "latest" even though
+		// the message said "(resolved to v0.41.0)". Only set when resolution
+		// actually happened (resolvedVersion != ""), so an already-literal
+		// version argument's JSON is unchanged.
+		if resolvedVersion != "" {
+			out["resolved_version"] = resolvedVersion
+		}
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(out); err != nil {
 			_, _ = fmt.Fprintln(stderr, "goproxycheck:", err)
 			return 2
 		}
