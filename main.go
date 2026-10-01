@@ -63,7 +63,18 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 	// (GOPROXY=off, a private module, etc.), since none of those resolve
 	// anything.
 	var resolvedVersion string
-	if priv, pattern := localModulePrivate(module); priv {
+	if raw, goproxyErr := localGoproxyEmptyListError(); goproxyErr != nil {
+		// Checked before every other local-config branch below, including
+		// localModulePrivate: confirmed live this failure preempts even the
+		// GOPRIVATE/GONOPROXY direct-fetch path (see
+		// localGoproxyEmptyListError's doc comment) — a real `go install`
+		// never even gets far enough to consult GOPRIVATE, GOVCS, or any
+		// proxy/VCS host at all when GOPROXY itself parses to zero entries.
+		d = diagnosis{statusGoproxyEmptyLocally, fmt.Sprintf(
+			"your local `GOPROXY` is set to %q (via env var or `go env -w`), which parses to zero actual proxy entries once blank entries are dropped — `go install`/`go get` fails outright with `GOPROXY list is not the empty string, but contains no entries` the moment it needs to resolve %s@%s, entirely offline, before consulting any proxy, VCS host, or your GOPRIVATE/GONOPROXY/GOVCS config at all. "+
+				"That's your machine's own config, not a proxy-availability problem. Fix `GOPROXY` (see `go help goproxy`) — e.g. `GOPROXY=https://proxy.golang.org,direct` for the default public config, or unset it entirely.",
+			raw, module, version)}
+	} else if priv, pattern := localModulePrivate(module); priv {
 		// Verified live: with GOPRIVATE (or GONOPROXY directly) set to a
 		// pattern matching this module, `go install`/`go get`/`go mod
 		// download` never contact proxy.golang.org at all for it — they
@@ -1064,6 +1075,65 @@ func firstGoproxyEntry() string {
 // GOPROXY disables module downloads outright (its first entry is "off").
 func localGoproxyOff() bool {
 	return firstGoproxyEntry() == "off"
+}
+
+// goproxyEmptyListError reports the error real cmd/go's own GOPROXY-list
+// parsing (proxyList, cmd/go/internal/modfetch/proxy.go, verified directly
+// against that source) raises for raw when every entry parses away to
+// nothing: once blank entries (from a leading/trailing/doubled separator, or
+// a whitespace-only entry) are dropped, and anything after an "off"/"direct"
+// terminator is discarded, zero entries are left at all. nil when at least
+// one real entry survives — including just "off" or "direct" alone, both of
+// which are themselves valid single entries, not an empty list.
+//
+// Confirmed live (2026-10-01): `GOPROXY=, go install golang.org/x/mod@v0.19.0`
+// and `GOPROXY=" " go install golang.org/x/mod@v0.19.0` both fail immediately
+// and unconditionally with `go: golang.org/x/mod@v0.19.0: GOPROXY list is not
+// the empty string, but contains no entries` — entirely offline, before ever
+// contacting proxy.golang.org or any VCS host. This holds regardless of
+// GOPRIVATE/GONOPROXY: `GOPROXY=, GOPRIVATE=golang.org/x/mod go install
+// golang.org/x/mod@v0.19.0` fails the exact same way, even though the module
+// matches GOPRIVATE and would otherwise be fetched directly, never touching
+// any proxy at all — reading cmd/go's own proxyList source directly explains
+// why: it adds an implicit "noproxy" pseudo-entry when GONOPROXY is set, but
+// still treats a list containing only that one pseudo-entry as empty for
+// this exact error, so a private-module match never rescues an otherwise-
+// empty GOPROXY from this failure.
+//
+// Before this check existed, goproxycheck had no detection for this case at
+// all: a bare `GOPROXY=,` run against a fully healthy, live module reported
+// plain statusReady ("a plain `go install` will work"), and the identical
+// config with GOPRIVATE additionally matching the module reported
+// statusPrivateModuleLocally ("will fetch it directly from its VCS host
+// here... this tool's proxy/sumdb checks don't apply to it") — both the
+// opposite of reality: the real command never reaches the proxy, sumdb, or
+// VCS host at all, failing outright on the GOPROXY config itself first, the
+// same "local config error, not a proxy-availability problem" shape already
+// handled for a malformed GOVCS (govcsConfigError) and GOSUMDB
+// (gosumdbConfigError).
+func goproxyEmptyListError(raw string) error {
+	if entries, _ := parseGoproxyChain(raw); len(entries) == 0 {
+		return fmt.Errorf("GOPROXY list is not the empty string, but contains no entries")
+	}
+	return nil
+}
+
+// localGoproxyEmptyListError is the go-env-reading wrapper around
+// goproxyEmptyListError, the same shape as localGovcsConfigError/
+// localGosumdbConfigError: it reads the local `go` command's actual
+// effective GOPROXY (via `go env GOPROXY`, so a value persisted with `go env
+// -w` is picked up too, not just an explicit env var) rather than assuming
+// os.Getenv("GOPROXY") directly reflects it. raw is returned alongside err
+// so callers can quote the exact configured value in their message. Best-
+// effort like its siblings: a failed `go env` call doesn't block the real
+// check (returns "", nil).
+func localGoproxyEmptyListError() (raw string, err error) {
+	out, cmdErr := exec.Command("go", "env", "GOPROXY").Output()
+	if cmdErr != nil {
+		return "", nil
+	}
+	raw = strings.TrimSpace(string(out))
+	return raw, goproxyEmptyListError(raw)
 }
 
 // localGoproxyNonPublic reports whether the local `go` command's effective

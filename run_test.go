@@ -208,6 +208,56 @@ func TestRun_LocalGoproxyOff(t *testing.T) {
 	}
 }
 
+// TestRun_LocalGoproxyEmptyList verifies run() short-circuits on a local
+// GOPROXY that parses to zero actual entries (e.g. a bare "," or
+// whitespace-only value) before ever probing the proxy/sumdb — passing
+// endpoints{} (a nil client) means any attempt to actually probe would
+// panic, so a clean, non-crashing statusGoproxyEmptyLocally result proves
+// the probe loop was skipped entirely. This is the fix for a real bug found
+// via live-toolchain differential testing: goproxycheck used to report
+// "ready" for a fully live module@version under GOPROXY=",", when the real
+// `go install` in that exact environment fails outright, entirely offline,
+// with "GOPROXY list is not the empty string, but contains no entries" —
+// confirmed live this preempts even a matching GOPRIVATE, which otherwise
+// makes goproxycheck claim a direct VCS fetch will succeed instead (see
+// TestRun_LocalGoproxyEmptyList_OverridesLocalModulePrivate below).
+func TestRun_LocalGoproxyEmptyList(t *testing.T) {
+	t.Setenv("GOPROXY", ",")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, endpoints{})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "goproxy-empty-locally") {
+		t.Errorf("stdout = %q, want it to mention goproxy-empty-locally", stdout.String())
+	}
+}
+
+// TestRun_LocalGoproxyEmptyList_OverridesLocalModulePrivate verifies the
+// GOPROXY-empty-list check runs before localModulePrivate, not after.
+// Confirmed live (2026-10-01): `GOPROXY=, GOPRIVATE=golang.org/x/mod go
+// install golang.org/x/mod@v0.19.0` still fails with the same "GOPROXY list
+// is not the empty string, but contains no entries" error — a matching
+// GOPRIVATE does NOT rescue an otherwise-empty GOPROXY, because cmd/go's own
+// proxyList treats the GONOPROXY-triggered "noproxy" pseudo-entry as not
+// counting either when it's the only entry in the list. Before this ordering
+// was deliberate, a naive implementation checking localModulePrivate first
+// would have reported statusPrivateModuleLocally here instead — claiming a
+// direct VCS fetch "will" succeed, when the real command never gets far
+// enough to even consult GOPRIVATE at all.
+func TestRun_LocalGoproxyEmptyList_OverridesLocalModulePrivate(t *testing.T) {
+	t.Setenv("GOPROXY", ",")
+	t.Setenv("GOPRIVATE", "example.com/*")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, endpoints{})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "goproxy-empty-locally") {
+		t.Errorf("stdout = %q, want it to mention goproxy-empty-locally, not private-module-locally", stdout.String())
+	}
+}
+
 // TestRun_LocalModulePrivate verifies run() short-circuits on a local
 // GOPRIVATE/GONOPROXY match before ever probing the proxy/sumdb — passing
 // endpoints{} means any attempt to actually probe would panic, so a clean,

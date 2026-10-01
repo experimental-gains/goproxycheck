@@ -919,6 +919,55 @@ func TestLocalGoproxyOff(t *testing.T) {
 	}
 }
 
+// TestGoproxyEmptyListError covers goproxyEmptyListError against the shapes
+// confirmed live (2026-10-01) to make real cmd/go's own GOPROXY-list parsing
+// (proxyList, cmd/go/internal/modfetch/proxy.go) fail outright with "GOPROXY
+// list is not the empty string, but contains no entries": `GOPROXY=,` and
+// `GOPROXY=" "` both fail `go install golang.org/x/mod@v0.19.0` this exact
+// way, entirely offline, where the default config and a bare "off"/"direct"
+// (each a single valid entry on its own, not an empty list) succeed past
+// this check fine. A false positive here would make run() claim a fetch
+// fails when it wouldn't, so the well-formed cases must report no error.
+func TestGoproxyEmptyListError(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		wantErr bool
+	}{
+		{"default is well-formed", "https://proxy.golang.org,direct", false},
+		{"off alone is one entry, not empty", "off", false},
+		{"direct alone is one entry, not empty", "direct", false},
+		{"custom proxy is well-formed", "https://goproxy.example.com", false},
+		{"lone comma has zero entries", ",", true},
+		{"lone pipe has zero entries", "|", true},
+		{"whitespace only has zero entries", " ", true},
+		{"doubled comma has zero entries", ",,", true},
+		{"empty string has zero entries", "", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := goproxyEmptyListError(c.raw)
+			if (err != nil) != c.wantErr {
+				t.Errorf("goproxyEmptyListError(%q) = %v, want error: %v", c.raw, err, c.wantErr)
+			}
+		})
+	}
+}
+
+// TestLocalGoproxyEmptyListError covers the go-env-reading wrapper the same
+// way TestLocalGovcsConfigError covers localGovcsConfigError.
+func TestLocalGoproxyEmptyListError(t *testing.T) {
+	t.Setenv("GOPROXY", ",")
+	if _, err := localGoproxyEmptyListError(); err == nil {
+		t.Error("localGoproxyEmptyListError with GOPROXY=\",\" = nil, want an empty-list error")
+	}
+
+	t.Setenv("GOPROXY", "https://proxy.golang.org,direct")
+	if _, err := localGoproxyEmptyListError(); err != nil {
+		t.Errorf("localGoproxyEmptyListError with the default GOPROXY = %v, want nil", err)
+	}
+}
+
 // TestLocalGoproxyNonPublic covers localGoproxyNonPublic's classification
 // of `go env GOPROXY` output — the fix for a real bug found via
 // live-toolchain differential testing: goproxycheck unconditionally probed

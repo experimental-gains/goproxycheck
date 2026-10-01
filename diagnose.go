@@ -19,6 +19,7 @@ const (
 	statusZipBuildError           status = "zip-build-error"
 	statusModuleNegativeCache     status = "module-negative-cache-suspected"
 	statusGoproxyOffLocally       status = "goproxy-off-locally"
+	statusGoproxyEmptyLocally     status = "goproxy-empty-locally"
 	statusGoproxyDirectLocally    status = "goproxy-direct-locally"
 	statusGoproxyCustomLocally    status = "goproxy-custom-locally"
 	statusPrivateModuleLocally    status = "private-module-locally"
