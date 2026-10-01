@@ -529,6 +529,107 @@ func TestProbe_ComparisonQuerySkipsRetractedVersion(t *testing.T) {
 	}
 }
 
+// TestResolveComparisonQuery_ExcludesPseudoVersions is the fix for a real
+// bug found by testing goproxycheck's comparison-query resolution against a
+// from-scratch fake GOPROXY server and a real `go` toolchain: a listed
+// pseudo-version satisfying the bound used to be picked as the resolved
+// version — real cmd/go never offers one as a candidate at all (see
+// resolveComparisonQuery's doc comment for the live verification, including
+// the cmd/go/internal/modfetch source citation for why: @v/list is already
+// filtered of pseudo-versions before query resolution ever runs).
+func TestResolveComparisonQuery_ExcludesPseudoVersions(t *testing.T) {
+	const pseudo = "v0.0.0-20200101000000-abcdef123456"
+	listed := []string{pseudo}
+	cases := []struct {
+		op, operand string
+		want        string
+		wantOK      bool
+	}{
+		// The pseudo-version satisfies both bounds by raw semver (v0.0.0 is
+		// below v1.0.0 regardless of its prerelease-shaped suffix), but real
+		// `go get`/`go list -m` never considers it: with no other candidate
+		// listed, both fail with "no matching versions", never resolving to
+		// the pseudo.
+		{"<", "v1.0.0", "", false},
+		{"<=", "v1.0.0", "", false},
+	}
+	for _, c := range cases {
+		got, ok := resolveComparisonQuery(c.op, c.operand, listed, nil)
+		if got != c.want || ok != c.wantOK {
+			t.Errorf("resolveComparisonQuery(%q, %q, listed) = (%q, %v), want (%q, %v)", c.op, c.operand, got, ok, c.want, c.wantOK)
+		}
+	}
+
+	// A real prerelease must win over a higher-raw-semver pseudo-version,
+	// the same "release beats higher prerelease" shape
+	// TestResolveComparisonQuery_PrefersReleaseOverHigherPrerelease already
+	// covers one level up: here there's no release at all, so the choice is
+	// between a genuine prerelease tag (v1.2.3-rc.1) and a pseudo-version
+	// based on a higher underlying version (v1.5.0-...) that out-ranks it by
+	// raw semver.Compare. Pre-fix, both landed in the same "prereleases"
+	// bucket and the pseudo won the tie-break purely on its higher base
+	// version; post-fix the pseudo is never a candidate, so the real
+	// prerelease wins by default.
+	mixed := []string{"v1.2.3-rc.1", "v1.5.0-0.20200101000000-abcdef123456"}
+	if got, ok := resolveComparisonQuery("<", "v2.0.0", mixed, nil); got != "v1.2.3-rc.1" || !ok {
+		t.Errorf("resolveComparisonQuery(\"<\", \"v2.0.0\", mixed, nil) = (%q, %v), want (%q, %v)", got, ok, "v1.2.3-rc.1", true)
+	}
+}
+
+// TestProbe_ComparisonQueryExcludesPseudoVersion is the end-to-end version
+// of TestResolveComparisonQuery_ExcludesPseudoVersions: reproduces the
+// fake-GOPROXY repro from resolveComparisonQuery's doc comment through the
+// full probe()/diagnose() path. Confirmed live (2026-10-01) against a real
+// `go` toolchain pointed at a from-scratch fake GOPROXY server whose @v/list
+// contains nothing but a single pseudo-version satisfying the bound: both
+// `go list -m` and `go get -x` fail outright with `no matching versions for
+// query "<v1.0.0"`, issuing only the @v/list request and never one for the
+// pseudo-version's own .info — proving it's never a candidate, not even a
+// last-resort "prerelease" one. This fake server fails the test if the
+// pseudo-version's .info is ever requested as the *comparison query's*
+// resolved checkVersion, mirroring TestProbe_ComparisonQueryNoMatchSkipsLiteralProbe's
+// "doomed request should never happen" shape. It does serve the
+// pseudo-version's own .mod, unrelated to the bug this test covers: @latest
+// itself answers with the pseudo (a module with no real tags at all is
+// exactly the one legitimate case where cmd/go's own mayUseLatest fallback
+// keeps a pseudo-version as "latest" — go.dev/ref/mod#version-queries, "If
+// there are no tagged versions in the repo, latest returns the most recent
+// commit"), so probe()'s unconditional latestModFile fetch (used for
+// retraction/deprecation checking, independent of whatever version was
+// actually requested) legitimately targets it here.
+func TestProbe_ComparisonQueryExcludesPseudoVersion(t *testing.T) {
+	const pseudo = "v0.0.0-20200101000000-abcdef123456"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"` + pseudo + `"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(pseudo + "\n"))
+		case strings.HasSuffix(r.URL.Path, "/@v/"+pseudo+".mod"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("module example.com/pseudotest\n"))
+		default:
+			t.Errorf("unexpected request for %s — real cmd/go never requests the pseudo-version's own .info for a comparison query it was never a candidate for", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	ep := endpoints{proxyBase: srv.URL, sumBase: srv.URL, client: srv.Client()}
+
+	r := ep.probe("example.com/pseudotest", "<v1.0.0")
+	if !r.comparisonQueryNoMatch {
+		t.Errorf("comparisonQueryNoMatch = false, want true (the only listed version is a pseudo-version, never a real candidate)")
+	}
+	if r.versionInfo.ok || r.versionInfo.statusCode != 0 {
+		t.Errorf("versionInfo = %+v, want a zero value — no per-version probe should have been made", r.versionInfo)
+	}
+	if d := diagnose(r); d.status != statusNoMatchingVersion {
+		t.Errorf("diagnose(r).status = %q, want %q (message: %s)", d.status, statusNoMatchingVersion, d.message)
+	}
+}
+
 // TestProbe_ComparisonQueryAllCandidatesRetracted covers the other real
 // `go get` outcome confirmed live for github.com/jayconrod/retract: a bound
 // where every listed version satisfying it is retracted (only v1.0.0 and

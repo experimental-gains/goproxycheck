@@ -10,6 +10,11 @@ import (
 	"time"
 
 	"golang.org/x/mod/semver"
+
+	// Aliased, like main.go's identical import: resolveIncompatibleLatest's
+	// own parameter is itself named "module" (a string, the module path),
+	// which would otherwise shadow this package for that function's body.
+	modulepkg "golang.org/x/mod/module"
 )
 
 const (
@@ -220,6 +225,15 @@ func (e endpoints) probe(module, version string) report {
 					// an invalid v into the v0/v1 line, so this check must
 					// come first.
 					if !semver.IsValid(v) || normalizedMajor(v) != wantMajor {
+						continue
+					}
+					// Same pseudo-version exclusion as resolveComparisonQuery
+					// (see its doc comment for the live-confirmed cmd/go
+					// source citation): a pseudo-version is never itself a
+					// real tag this walk should land on, even when it's the
+					// only (or highest-ranked) entry in @v/list for this
+					// major line.
+					if modulepkg.IsPseudoVersion(v) {
 						continue
 					}
 					if semver.Prerelease(v) != "" {
@@ -584,6 +598,33 @@ func comparisonQuery(v string) (op, operand string, ok bool) {
 // google.golang.org/grpc@<v2.0.0 as "resolved to v1.86.0-dev" — a
 // different version than the one a real `go get`/`go install` actually
 // resolves and fetches for the identical query.
+//
+// A pseudo-version (vX.Y.Z-yyyymmddhhmmss-abcdef123456,
+// go.dev/ref/mod#pseudo-versions) in listed is excluded from every
+// candidate set entirely, before the release/prerelease split — it's never
+// offered as a "prerelease" fallback even though semver.Prerelease reports
+// one non-empty for it (its encoded timestamp/hash segment always reads as
+// a prerelease identifier). This mirrors real cmd/go exactly: the GOPROXY
+// protocol (go.dev/ref/mod#goproxy-protocol) says @v/list "should not"
+// include pseudo-versions, and cmd/go's own client doesn't merely trust
+// that — modfetch/proxy.go's proxyRepo.Versions (read directly from
+// cmd/go/internal/modfetch, the function that actually serves @v/list's
+// contents to every query resolution, including this one) filters every
+// line through `!module.IsPseudoVersion(f[0])` before modload/query.go's
+// queryMatcher.filterVersions (the function this one otherwise mirrors)
+// ever sees the list. Confirmed live (2026-10-01) with a from-scratch fake
+// GOPROXY server whose @v/list contains nothing but a single pseudo-version
+// (v0.0.0-20200101000000-abcdef123456, which does satisfy "<v1.0.0" by raw
+// semver): `go list -m`/`go get -x` against it both fail outright with `no
+// matching versions for query "<v1.0.0"`, issuing only the @v/list request
+// and never one for the pseudo-version's own .info — proving cmd/go never
+// considers it a candidate at all, not even as a last-resort prerelease.
+// Before this fix, resolveComparisonQuery had no such exclusion: a
+// pseudo-version in listed landed in the prereleases bucket like any other
+// prerelease-shaped string and could be picked outright whenever it was the
+// only (or best) candidate satisfying the bound, resolving — and then
+// reporting ready — a query a real `go get`/`go install` can never
+// satisfy.
 func resolveComparisonQuery(op, operand string, listed []string, retracted func(string) bool) (resolved string, ok bool) {
 	if !semver.IsValid(operand) {
 		return "", false
@@ -618,6 +659,12 @@ func resolveComparisonQuery(op, operand string, listed []string, retracted func(
 	var releases, prereleases []string
 	for _, v := range listed {
 		if !semver.IsValid(v) {
+			continue
+		}
+		if modulepkg.IsPseudoVersion(v) {
+			// Real cmd/go never offers a pseudo-version as a query candidate
+			// here, no matter how it compares against the bound — see this
+			// function's doc comment for the live-confirmed divergence.
 			continue
 		}
 		if retracted != nil && retracted(v) {
@@ -689,7 +736,12 @@ func resolveComparisonQuery(op, operand string, listed []string, retracted func(
 func (e endpoints) resolveIncompatibleLatest(escapedModule, module string, listed []string, retracted func(string) bool) (resolved string, ok bool) {
 	sorted := make([]string, 0, len(listed))
 	for _, v := range listed {
-		if semver.IsValid(v) {
+		// Same pseudo-version exclusion as resolveComparisonQuery and
+		// probe()'s own latestModFile walk (see resolveComparisonQuery's doc
+		// comment for the live-confirmed cmd/go source citation): never a
+		// real candidate for "latest" resolution, no matter how it compares
+		// or sorts.
+		if semver.IsValid(v) && !modulepkg.IsPseudoVersion(v) {
 			sorted = append(sorted, v)
 		}
 	}
