@@ -811,6 +811,9 @@ func moduleDirective(data string) (string, error) {
 				}
 				return blockMod, nil
 			}
+			if content := stripLineComment(line); moduleLineHasExtraArgs(content) {
+				return "", fmt.Errorf("has a 'module' block entry with more than one argument: %q — real `go list -m`/`go build` Fatals immediately with `usage: module module/path`, entirely offline, before ever contacting the proxy", line)
+			}
 			if mod := parseModulePath(line); mod != "" {
 				// A second non-empty line here is malformed (real go
 				// errors with "repeated module statement"), so this can't
@@ -837,6 +840,17 @@ func moduleDirective(data string) (string, error) {
 				inBlock = true
 				continue
 			}
+			if content := stripLineComment(rest); moduleLineHasExtraArgs(content) {
+				// See moduleLineHasExtraArgs's doc comment: this is a
+				// directive-argument-count failure ("usage: module
+				// module/path"), a different real error than the
+				// CheckPath-style "malformed module path" error returned
+				// below for a single argument whose own content is
+				// invalid — conflating the two used to blame a stray
+				// trailing token on the path's characters instead of on
+				// there being a second argument at all.
+				return "", fmt.Errorf("has a 'module' directive with more than one argument: %q — real `go list -m`/`go build` Fatals immediately with `usage: module module/path`, entirely offline, before ever contacting the proxy", line)
+			}
 			mod := parseModulePath(rest)
 			if mod == "" {
 				// e.g. a "module" line whose entire value is a "//"
@@ -854,6 +868,57 @@ func moduleDirective(data string) (string, error) {
 		return "", fmt.Errorf("has an unterminated 'module' block")
 	}
 	return "", fmt.Errorf("has no 'module' directive")
+}
+
+// moduleLineHasExtraArgs reports whether content — a go.mod module-directive
+// line (or a line inside its parenthesized block form) with any trailing
+// "//" comment already stripped — carries more than the single argument
+// real go's own lexer allows. Confirmed directly against
+// golang.org/x/mod/modfile's rule.go: the "module" verb's case in its
+// top-level directive switch Fatals with "usage: module module/path"
+// whenever it's handed anything other than exactly one token.
+//
+// A quoted Go string literal (double-quoted or a raw backtick string) is
+// lexed as exactly one token regardless of any whitespace it contains, so a
+// quoted path with an embedded space isn't mistaken for two arguments here
+// — only content after the closing quote, or more than one unquoted
+// whitespace-separated field, counts as a second argument. That embedded-
+// space case is still correctly caught, just by the existing
+// modulepkg.CheckPath validation once parseModulePath unquotes it down to
+// a single (invalid) path string — a genuinely different real error from
+// this one, confirmed live below.
+//
+// Confirmed live (2026-09-30) against a real go1.26.8 toolchain, three
+// ways: `module example.com/foo extra` (single-line) and
+// `example.com/foo extra` inside a `module (...)` block both Fatal with
+// `usage: module module/path` (an argument-count error) — while `module
+// "example.com/foo bar"` (one quoted argument, containing a literal space)
+// Fatals instead with `malformed module path "example.com/foo bar":
+// invalid char ' '`, proving the two failures are genuinely distinct, not
+// the same thing phrased two ways. Before this check, moduleDirective
+// passed a two-token line's entire raw text straight through to
+// modulepkg.CheckPath as if it were one literal path — for `module
+// example.com/foo extra`, CheckPath naturally rejects the embedded space
+// and this tool reported `malformed module path "example.com/foo extra":
+// invalid char ' '`, actively misdirecting a user toward stripping
+// characters from the module path instead of removing the stray trailing
+// token that was never part of it.
+func moduleLineHasExtraArgs(content string) bool {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return false
+	}
+	if content[0] == '"' || content[0] == '`' {
+		prefix, err := strconv.QuotedPrefix(content)
+		if err != nil {
+			// Not a well-formed quoted string after all; let the existing
+			// unquote-or-literal fallback in parseModulePath handle it as
+			// a single (malformed) argument instead of a count problem.
+			return false
+		}
+		return strings.TrimSpace(content[len(prefix):]) != ""
+	}
+	return len(strings.Fields(content)) > 1
 }
 
 // stripLineComment strips a trailing "// ..." comment from a go.mod line

@@ -268,6 +268,86 @@ func TestModuleFromGoMod_InvalidPath(t *testing.T) {
 	}
 }
 
+// TestModuleFromGoMod_TooManyArgs is a regression test for a real bug:
+// moduleDirective passed a module-directive line's entire raw text straight
+// to modulepkg.CheckPath even when the line carried a second,
+// whitespace-separated argument after the path — real go's own lexer
+// (golang.org/x/mod/modfile's rule.go) Fatals a "module" directive with
+// anything other than exactly one argument with `usage: module module/path`,
+// an argument-count error, never reaching CheckPath's module-path validation
+// at all. Confirmed live (2026-09-30) against a real go1.26.8 toolchain:
+// `module example.com/foo extra-token` (single-line form) and
+// `example.com/foo extra` inside a `module (...)` block both Fatal with
+// `usage: module module/path`. Before this fix, moduleFromGoMod instead
+// reported `malformed module path "example.com/foo extra-token": invalid
+// char ' '` — CheckPath's genuine reaction to being handed the whole
+// two-token line as if it were one literal path — actively misdirecting a
+// user toward stripping a character from the module path instead of
+// removing the stray trailing token that was never part of it. A quoted
+// path with an embedded space (`module "example.com/foo bar"`) is
+// deliberately NOT part of this bug: that's one lexical argument whose own
+// content is invalid, and real go Fatals with the CheckPath-style
+// `malformed module path ...: invalid char ' '` instead — confirmed live
+// the two cases produce genuinely different real errors, not the same
+// failure phrased two ways (see TestModuleFromGoMod_QuotedPathWithSpace).
+func TestModuleFromGoMod_TooManyArgs(t *testing.T) {
+	for name, content := range map[string]string{
+		"single-line, unquoted extra token": "module example.com/foo extra-token\n\ngo 1.24\n",
+		"single-line, quoted path plus extra token": `module "example.com/foo" extra
+
+go 1.24
+`,
+		"block form, extra token on the path line": "module (\n\texample.com/foo extra\n)\n\ngo 1.24\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "go.mod")
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			_, err := moduleFromGoMod(path)
+			if err == nil {
+				t.Fatal("expected an error for a 'module' directive with more than one argument, got none")
+			}
+			if strings.Contains(err.Error(), "malformed module path") {
+				t.Errorf("error %q wrongly blames the module path's own characters (CheckPath's error) for an argument-COUNT problem — real go Fatals with `usage: module module/path`, never reaching path validation at all", err)
+			}
+			if !strings.Contains(err.Error(), "more than one argument") {
+				t.Errorf("error %q doesn't describe this as an extra-argument problem", err)
+			}
+		})
+	}
+}
+
+// TestModuleFromGoMod_QuotedPathWithSpace confirms the fix for
+// TestModuleFromGoMod_TooManyArgs stays narrowly scoped to a genuine second
+// argument, not any whitespace appearing anywhere on the line: a single
+// quoted argument containing an embedded space is one lexical token to real
+// go's parser (confirmed live: `module "example.com/foo bar"` Fatals with
+// `malformed module path "example.com/foo bar": invalid char ' '`, the
+// CheckPath-style error, not `usage: module module/path`), so this must
+// still be reported as an invalid path, not an extra-argument error.
+func TestModuleFromGoMod_QuotedPathWithSpace(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "go.mod")
+	content := "module \"example.com/foo bar\"\n\ngo 1.24\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := moduleFromGoMod(path)
+	if err == nil {
+		t.Fatal("expected an error for a module path containing a space, got none")
+	}
+	if strings.Contains(err.Error(), "more than one argument") {
+		t.Errorf("error %q wrongly treats a single quoted argument with an embedded space as two arguments", err)
+	}
+	if !strings.Contains(err.Error(), "invalid path") {
+		t.Errorf("error %q doesn't mention the invalid path", err)
+	}
+}
+
 func TestModuleFromGoMod_Missing(t *testing.T) {
 	if _, err := moduleFromGoMod(filepath.Join(t.TempDir(), "go.mod")); err == nil {
 		t.Fatal("expected an error for a missing go.mod")
