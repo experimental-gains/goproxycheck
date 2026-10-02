@@ -22,6 +22,7 @@ const (
 	statusModuleNegativeCache     status = "module-negative-cache-suspected"
 	statusGoproxyOffLocally       status = "goproxy-off-locally"
 	statusGoproxyEmptyLocally     status = "goproxy-empty-locally"
+	statusGoproxyMalformedLocally status = "goproxy-malformed-locally"
 	statusGoproxyDirectLocally    status = "goproxy-direct-locally"
 	statusGoproxyCustomLocally    status = "goproxy-custom-locally"
 	statusPrivateModuleLocally    status = "private-module-locally"

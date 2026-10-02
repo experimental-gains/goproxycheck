@@ -74,6 +74,22 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 			"your local `GOPROXY` is set to %q (via env var or `go env -w`), which parses to zero actual proxy entries once blank entries are dropped — `go install`/`go get` fails outright with `GOPROXY list is not the empty string, but contains no entries` the moment it needs to resolve %s@%s, entirely offline, before consulting any proxy, VCS host, or your GOPRIVATE/GONOPROXY/GOVCS config at all. "+
 				"That's your machine's own config, not a proxy-availability problem. Fix `GOPROXY` (see `go help goproxy`) — e.g. `GOPROXY=https://proxy.golang.org,direct` for the default public config, or unset it entirely.",
 			raw, module, version)}
+	} else if raw, badEntry, entryErr := localGoproxyMalformedEntryError(); entryErr != nil {
+		// Checked at the same priority as localGoproxyEmptyListError just
+		// above, and for the identical reason: see goproxyMalformedEntryError's
+		// doc comment for why this preempts even a matching GOPRIVATE or a
+		// GOPROXY resolving to "direct" — real cmd/go's own proxyList parses
+		// and validates every entry in the whole GOPROXY string eagerly, in one
+		// process-wide pass, before TryProxies ever attempts the first entry
+		// (public, custom, or the "noproxy"/"direct" pseudo-entries a private-
+		// module match or GOPROXY=direct resolve through) — so one malformed
+		// entry anywhere in the list, even one that's only ever meant to be an
+		// unreachable fallback after a perfectly healthy first entry, Fatals
+		// every module operation in the process outright.
+		d = diagnosis{statusGoproxyMalformedLocally, fmt.Sprintf(
+			"your local `GOPROXY` is set to %q (via env var or `go env -w`), which contains a malformed entry (%q) — `go install`/`go get` fails outright with `%v` the moment it needs to resolve %s@%s, entirely offline, before consulting any proxy (even a perfectly healthy one listed earlier in the same chain), VCS host, or your GOPRIVATE/GONOPROXY/GOVCS config at all. "+
+				"That's your machine's own config, not a proxy-availability problem. Fix `GOPROXY` (see `go help goproxy`) — every entry needs an explicit `https://`/`http://`/`file://` scheme, or at least a dot, colon, or slash so `go` can infer `https://` for you.",
+			raw, badEntry, entryErr, module, version)}
 	} else if priv, pattern := localModulePrivate(module); priv {
 		// Verified live: with GOPRIVATE (or GONOPROXY directly) set to a
 		// pattern matching this module, `go install`/`go get`/`go mod
@@ -1336,6 +1352,122 @@ func localGoproxyEmptyListError() (raw string, err error) {
 	}
 	raw = strings.TrimSpace(string(out))
 	return raw, goproxyEmptyListError(raw)
+}
+
+// goproxyEntrySchemeError mirrors the URL-shape validation real cmd/go's own
+// newProxyRepo (modfetch/proxy.go, verified directly against that source)
+// performs on *every* GOPROXY entry it actually tries to use — not just the
+// first, and not gated on whether that entry is ever reached by a
+// particular module's fetch — before ever issuing a request to it: after
+// the same implicit-"https://"-prefix normalization normalizeGoproxyURL
+// already applies, the (possibly normalized) entry must parse as a URL
+// whose scheme is "http", "https", or a "file" URL with no extra non-path
+// components (no host, userinfo, query, or fragment). Any other outcome —
+// no scheme at all, a scheme that isn't one of those three, or a file://
+// URL carrying something beyond a bare path — fails this exact way,
+// entirely offline, regardless of network reachability or which module is
+// being fetched.
+//
+// Confirmed live (2026-10-02), all three shapes, both go1.24.4 and
+// go1.27.1: `GOPROXY=localhost go mod download golang.org/x/text@v0.14.0`
+// (a single bare word — no dot, colon, or slash, so normalizeGoproxyURL's
+// own implicit-https rule doesn't apply, the same "natural misconfiguration
+// by analogy to GOPRIVATE's bare-host patterns" shape documented on
+// normalizeGoproxyURL, but this time for a host with no TLD at all, e.g. a
+// local dev proxy a user forgets to give a port/scheme) fails outright with
+// `invalid proxy URL missing scheme: localhost`; `GOPROXY=ftp://example.com`
+// fails with `invalid proxy URL scheme (must be https, http, file):
+// ftp://example.com`; `GOPROXY=file:///tmp/x?y=1` fails with `invalid
+// file:// proxy URL with non-path elements: file:///tmp/x?y=1`.
+func goproxyEntrySchemeError(entry string) error {
+	base, err := url.Parse(normalizeGoproxyURL(entry))
+	if err != nil {
+		return err
+	}
+	switch base.Scheme {
+	case "http", "https":
+		return nil
+	case "file":
+		if *base != (url.URL{Scheme: base.Scheme, Path: base.Path, RawPath: base.RawPath}) {
+			return fmt.Errorf("invalid file:// proxy URL with non-path elements: %s", base.Redacted())
+		}
+		return nil
+	case "":
+		return fmt.Errorf("invalid proxy URL missing scheme: %s", base.Redacted())
+	default:
+		return fmt.Errorf("invalid proxy URL scheme (must be https, http, file): %s", base.Redacted())
+	}
+}
+
+// goproxyMalformedEntryError reports the first entry in raw's GOPROXY chain
+// (left to right, stopping at — and never validating past — a terminating
+// "off"/"direct", exactly like parseGoproxyChain already models: see its own
+// doc comment) that fails goproxyEntrySchemeError, along with the error it
+// fails with. Returns ("", nil) when every entry actually reached parses
+// cleanly.
+//
+// This matters for an entry anywhere in the chain, not just the first: real
+// cmd/go's own proxyList (modfetch/proxy.go) builds and validates its
+// *entire* entry list eagerly, inside one process-wide sync.Once, before
+// TryProxies ever attempts the first one — so one malformed entry breaks
+// every subsequent `go` module operation in the process outright, for every
+// module, regardless of whether an earlier entry in the same list is a
+// perfectly healthy proxy.golang.org that would otherwise have answered
+// first. Confirmed live (2026-10-02): `GOPROXY="https://proxy.golang.org,localhost"
+// go mod download golang.org/x/text@v0.14.0` — a fully healthy public-proxy
+// entry *first*, with a malformed trailing entry only ever meant as a
+// fallback — fails outright with `invalid proxy URL missing scheme:
+// localhost`, never even attempting the public proxy; the identical failure
+// also preempts a GOPRIVATE match that would otherwise fetch directly from
+// VCS (`GOPROXY="https://proxy.golang.org,localhost" GOPRIVATE=<module> go
+// mod download <module>@latest` fails the exact same way, never reaching
+// the VCS fetch), since TryProxies calls proxyList() — and so hits this same
+// eager, whole-string parse — before ever trying the "noproxy"/"direct"
+// pseudo-entries a private-module match resolves through. A GOPROXY entry
+// placed *after* a terminating "off"/"direct" is never actually reached by
+// that parse (confirmed live: `GOPROXY=off,localhost` fails with the
+// ordinary `module lookup disabled by GOPROXY=off`, not a scheme error;
+// `GOPROXY=direct,localhost` succeeds fetching an ordinary public module via
+// direct VCS, `localhost` never consulted at all) — mirrored here by
+// stopping at the same point parseGoproxyChain already stops.
+//
+// Before this check existed, goproxycheck had no detection for this shape
+// at all: a GOPROXY chain like "https://proxy.golang.org,localhost" against
+// a fully live, healthy module reported plain statusReady ("a plain `go
+// install` will work"), the opposite of reality — the real command never
+// even attempts the public proxy, let alone succeeds against it. The same
+// "local config error, not a proxy-availability problem" shape already
+// handled for a malformed GOVCS/GOSUMDB/GOAUTH (govcsConfigError,
+// gosumdbConfigError, goAuthConfigError) and for a GOPROXY that parses to
+// zero entries (goproxyEmptyListError, right above).
+func goproxyMalformedEntryError(raw string) (entry string, err error) {
+	entries, _ := parseGoproxyChain(raw)
+	for _, e := range entries {
+		if e == "off" || e == "direct" {
+			return "", nil
+		}
+		if schemeErr := goproxyEntrySchemeError(e); schemeErr != nil {
+			return e, schemeErr
+		}
+	}
+	return "", nil
+}
+
+// localGoproxyMalformedEntryError is the go-env-reading wrapper around
+// goproxyMalformedEntryError, the same shape as localGoproxyEmptyListError
+// right above: it reads the local `go` command's actual effective GOPROXY
+// (via `go env GOPROXY`, so a value persisted with `go env -w` is picked up
+// too) rather than assuming os.Getenv("GOPROXY") directly reflects it.
+// Best-effort like its siblings: a failed `go env` call doesn't block the
+// real check (returns "", "", nil).
+func localGoproxyMalformedEntryError() (raw, entry string, err error) {
+	out, cmdErr := exec.Command("go", "env", "GOPROXY").Output()
+	if cmdErr != nil {
+		return "", "", nil
+	}
+	raw = strings.TrimSpace(string(out))
+	entry, err = goproxyMalformedEntryError(raw)
+	return raw, entry, err
 }
 
 // goAuthConfigError reports the error real cmd/go's own GOAUTH parsing

@@ -66,6 +66,23 @@ actually seeing:
   "ready" — confirmed live that without this check it would otherwise say
   a module@version is ready to install while the real `go install` in
   that same environment fails outright.
+- `invalid proxy URL missing scheme: X` / `invalid proxy URL scheme (must
+  be https, http, file): X` / `invalid file:// proxy URL with non-path
+  elements: X` — one entry in your `GOPROXY` list (comma/pipe-separated)
+  is itself malformed: a bare word with no dot/colon/slash (e.g. a local
+  dev proxy like `localhost`, missing its port), a non-`http(s)`/`file`
+  scheme, or a `file://` URL carrying a query string or other non-path
+  component. Confirmed live (both go1.24.4 and go1.27.1) that real `go`
+  validates *every* entry in the whole `GOPROXY` string eagerly, before
+  ever trying the first one — so this Fatals outright even when a
+  perfectly healthy `proxy.golang.org` entry comes *before* the malformed
+  one, and even when the module would otherwise be fetched directly via a
+  matching `GOPRIVATE`. `goproxycheck` checks every entry in the chain
+  *before* probing and reports it as a `goproxy-malformed-locally`
+  diagnosis instead of a false "ready" — confirmed live that without this
+  check it would otherwise say a fully live module@version is ready to
+  install while the real `go install` in that same environment fails
+  outright, never even attempting the healthy entry.
 - You're checking a module that's covered by your own `GOPRIVATE` (or
   `GONOPROXY`) config — confirmed live with `go mod download -x` that a
   matching module is fetched directly from its VCS host and never touches
@@ -322,7 +339,7 @@ argument errors.
 ## Use as a GitHub Action
 
 ```yaml
-- uses: experimental-gains/goproxycheck@v0.1.84
+- uses: experimental-gains/goproxycheck@v0.1.85
   with:
     args: --wait --timeout 10m github.com/you/yourmodule@v1.2.3
 ```

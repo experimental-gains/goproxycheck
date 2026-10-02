@@ -274,6 +274,81 @@ func TestRun_LocalGoproxyEmptyList_OverridesLocalModulePrivate(t *testing.T) {
 	}
 }
 
+// TestRun_LocalGoproxyMalformedEntry verifies run() short-circuits on a
+// local GOPROXY chain containing a malformed entry — even one that's only
+// ever meant to be a fallback *after* a perfectly healthy public-proxy
+// entry — before ever probing the proxy/sumdb. Passing endpoints{} means
+// any attempt to actually probe would panic, so a clean, non-crashing
+// statusGoproxyMalformedLocally result proves the probe loop was skipped
+// entirely. This is the fix for a real bug found via live-toolchain
+// differential testing: `GOPROXY="https://proxy.golang.org,localhost" go mod
+// download golang.org/x/text@v0.14.0` (golang.org/x/text@v0.14.0 is fully
+// live right now) fails outright, entirely offline, with "invalid proxy URL
+// missing scheme: localhost" — confirmed live on both go1.24.4 and
+// go1.27.1 — because real cmd/go's own proxyList parses and validates the
+// *entire* GOPROXY string eagerly before ever trying the first entry, so
+// one malformed entry anywhere in the chain breaks every module operation
+// regardless of position. Before this check existed, goproxycheck reported
+// plain statusReady for this exact config and module, the opposite of
+// reality.
+func TestRun_LocalGoproxyMalformedEntry(t *testing.T) {
+	t.Setenv("GOPROXY", "https://proxy.golang.org,localhost")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, endpoints{})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "goproxy-malformed-locally") {
+		t.Errorf("stdout = %q, want it to mention goproxy-malformed-locally", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "localhost") {
+		t.Errorf("stdout = %q, want it to name the specific malformed entry (localhost)", stdout.String())
+	}
+}
+
+// TestRun_LocalGoproxyMalformedEntry_OverridesLocalModulePrivate verifies
+// the GOPROXY-malformed-entry check runs before localModulePrivate, not
+// after — the same ordering TestRun_LocalGoproxyEmptyList_
+// OverridesLocalModulePrivate already covers for the empty-list case, and
+// for the identical underlying reason: confirmed live (2026-10-02) that
+// `GOPROXY="https://proxy.golang.org,localhost" GOPRIVATE=<module> go mod
+// download <module>@latest` still fails with the same "invalid proxy URL
+// missing scheme: localhost" error, never reaching the direct-VCS fetch a
+// matching GOPRIVATE would otherwise use — because TryProxies calls
+// proxyList() (and so hits this same eager, whole-string parse) before ever
+// trying the "noproxy" pseudo-entry a private-module match resolves
+// through.
+func TestRun_LocalGoproxyMalformedEntry_OverridesLocalModulePrivate(t *testing.T) {
+	t.Setenv("GOPROXY", "https://proxy.golang.org,localhost")
+	t.Setenv("GOPRIVATE", "example.com/*")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, endpoints{})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "goproxy-malformed-locally") {
+		t.Errorf("stdout = %q, want it to mention goproxy-malformed-locally, not private-module-locally", stdout.String())
+	}
+}
+
+// TestRun_LocalGoproxyMalformedEntry_OffTruncatesBeforeIt verifies an entry
+// after a terminating "off" is never flagged — real cmd/go's own proxyList
+// breaks its parse loop immediately after appending "off", never reaching
+// (let alone validating) anything after it. Confirmed live:
+// GOPROXY=off,localhost fails with the ordinary "module lookup disabled by
+// GOPROXY=off" error, not a scheme error.
+func TestRun_LocalGoproxyMalformedEntry_OffTruncatesBeforeIt(t *testing.T) {
+	t.Setenv("GOPROXY", "off,localhost")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, endpoints{})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "goproxy-off-locally") {
+		t.Errorf("stdout = %q, want it to mention goproxy-off-locally, not goproxy-malformed-locally", stdout.String())
+	}
+}
+
 // TestRun_LocalModulePrivate verifies run() short-circuits on a local
 // GOPRIVATE/GONOPROXY match before ever probing the proxy/sumdb — passing
 // endpoints{} means any attempt to actually probe would panic, so a clean,

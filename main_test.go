@@ -1155,6 +1155,103 @@ func TestLocalGoproxyEmptyListError(t *testing.T) {
 	}
 }
 
+// TestGoproxyEntrySchemeError covers goproxyEntrySchemeError against the
+// three shapes confirmed live (2026-10-02, both go1.24.4 and go1.27.1) to
+// make real cmd/go's own newProxyRepo (modfetch/proxy.go) fail outright
+// before ever issuing a request: a single bare word with no dot/colon/slash
+// (so normalizeGoproxyURL's implicit-https rule doesn't apply) fails with
+// "invalid proxy URL missing scheme"; a non-http(s)/file scheme fails with
+// "invalid proxy URL scheme (must be https, http, file)"; a file:// URL
+// carrying a query string (or other non-path component) fails with "invalid
+// file:// proxy URL with non-path elements". A well-formed entry — the
+// default public proxy, a bare host with a dot (normalized to https://), a
+// custom https:// URL, or a bare file:// path — must report no error, or
+// run() would wrongly Fatal a perfectly fetchable config.
+func TestGoproxyEntrySchemeError(t *testing.T) {
+	cases := []struct {
+		name    string
+		entry   string
+		wantErr bool
+	}{
+		{"default public proxy", "https://proxy.golang.org", false},
+		{"bare host with dot", "proxy.golang.org", false},
+		{"custom https", "https://goproxy.example.com", false},
+		{"custom http", "http://goproxy.example.com", false},
+		{"file URL", "file:///tmp/fileproxy", false},
+		{"bare word no dot", "localhost", true},
+		{"bare word no dot, another", "myproxy", true},
+		{"bare absolute path, no file scheme", "/tmp/fileproxy", true},
+		{"non-http(s)/file scheme", "ftp://example.com", true},
+		{"file URL with query string", "file:///tmp/fileproxy?x=1", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := goproxyEntrySchemeError(c.entry)
+			if (err != nil) != c.wantErr {
+				t.Errorf("goproxyEntrySchemeError(%q) = %v, want error: %v", c.entry, err, c.wantErr)
+			}
+		})
+	}
+}
+
+// TestGoproxyMalformedEntryError covers goproxyMalformedEntryError's walk
+// over the whole GOPROXY chain, not just the first entry: a real bug fix.
+// Confirmed live (2026-10-02) that `GOPROXY="https://proxy.golang.org,localhost"
+// go mod download golang.org/x/text@v0.14.0` — a fully healthy public-proxy
+// entry first, a malformed one only ever meant as a fallback — fails
+// outright with "invalid proxy URL missing scheme: localhost", never even
+// attempting the healthy first entry; the same failure happens regardless of
+// separator ("," or "|") or whether the malformed entry comes first or
+// second. An entry placed after a terminating "off"/"direct" is never
+// actually reached by real cmd/go's own parse (confirmed live:
+// GOPROXY=off,localhost fails with the ordinary GOPROXY=off error, not a
+// scheme error; GOPROXY=direct,localhost succeeds fetching an ordinary
+// public module via direct VCS) and must not be flagged here either.
+func TestGoproxyMalformedEntryError(t *testing.T) {
+	cases := []struct {
+		name      string
+		raw       string
+		wantEntry string
+	}{
+		{"default is well-formed", "https://proxy.golang.org,direct", ""},
+		{"off alone", "off", ""},
+		{"direct alone", "direct", ""},
+		{"malformed only entry", "localhost", "localhost"},
+		{"healthy first, malformed fallback, comma", "https://proxy.golang.org,localhost", "localhost"},
+		{"healthy first, malformed fallback, pipe", "https://proxy.golang.org|localhost", "localhost"},
+		{"malformed first, healthy fallback", "localhost,https://proxy.golang.org", "localhost"},
+		{"malformed then off, off never changes the outcome", "localhost,off", "localhost"},
+		{"off then malformed: off truncates first, never reached", "off,localhost", ""},
+		{"direct then malformed: direct truncates first, never reached", "direct,localhost", ""},
+		{"wrong scheme", "ftp://example.com,direct", "ftp://example.com"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			entry, err := goproxyMalformedEntryError(c.raw)
+			if entry != c.wantEntry {
+				t.Errorf("goproxyMalformedEntryError(%q) entry = %q, want %q", c.raw, entry, c.wantEntry)
+			}
+			if (err != nil) != (c.wantEntry != "") {
+				t.Errorf("goproxyMalformedEntryError(%q) err = %v, want error: %v", c.raw, err, c.wantEntry != "")
+			}
+		})
+	}
+}
+
+// TestLocalGoproxyMalformedEntryError covers the go-env-reading wrapper the
+// same way TestLocalGoproxyEmptyListError covers localGoproxyEmptyListError.
+func TestLocalGoproxyMalformedEntryError(t *testing.T) {
+	t.Setenv("GOPROXY", "https://proxy.golang.org,localhost")
+	if _, entry, err := localGoproxyMalformedEntryError(); err == nil || entry != "localhost" {
+		t.Errorf("localGoproxyMalformedEntryError with a trailing malformed entry = (entry %q, err %v), want entry \"localhost\" and a non-nil error", entry, err)
+	}
+
+	t.Setenv("GOPROXY", "https://proxy.golang.org,direct")
+	if _, entry, err := localGoproxyMalformedEntryError(); err != nil || entry != "" {
+		t.Errorf("localGoproxyMalformedEntryError with the default GOPROXY = (entry %q, err %v), want (\"\", nil)", entry, err)
+	}
+}
+
 // TestLocalGoproxyNonPublic covers localGoproxyNonPublic's classification
 // of `go env GOPROXY` output — the fix for a real bug found via
 // live-toolchain differential testing: goproxycheck unconditionally probed
