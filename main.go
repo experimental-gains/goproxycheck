@@ -329,7 +329,16 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 			// fix to its whole-module sibling; check each status's own
 			// diagnosis text for what it actually claims about waiting
 			// before assuming they share the same answer.
-			if !*wait || d.status == statusReady || d.status == statusModuleUnknown || d.status == statusBlocklistedMalicious || d.status == statusWrongImportPath || d.status == statusRetracted || d.status == statusDeprecated || d.status == statusZipBuildError || d.status == statusMajorVersionMismatch || d.status == statusUnknownRevision || d.status == statusInvalidPseudoVersion || d.status == statusGosumdbMalformedLocally || d.status == statusNegativeCache || d.status == statusNoMatchingVersion || time.Now().After(deadline) {
+			// statusGoModUnparseable joins this list for the same reason as
+			// statusZipBuildError/statusMajorVersionMismatch above: a go.mod
+			// that golang.org/x/mod/modfile.Parse itself rejects (e.g. a "/*
+			// */" block comment) is a permanent property of the file
+			// committed at this tag — proxy.golang.org and sum.golang.org
+			// don't validate go.mod syntax before indexing a version (see
+			// this status's own diagnosis text), so no amount of polling
+			// either service ever fixes it; only a new tag with a corrected
+			// go.mod would.
+			if !*wait || d.status == statusReady || d.status == statusModuleUnknown || d.status == statusBlocklistedMalicious || d.status == statusWrongImportPath || d.status == statusRetracted || d.status == statusDeprecated || d.status == statusZipBuildError || d.status == statusMajorVersionMismatch || d.status == statusUnknownRevision || d.status == statusInvalidPseudoVersion || d.status == statusGosumdbMalformedLocally || d.status == statusNegativeCache || d.status == statusNoMatchingVersion || d.status == statusGoModUnparseable || time.Now().After(deadline) {
 				break
 			}
 			time.Sleep(*interval)

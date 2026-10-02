@@ -14,6 +14,15 @@ func readyEndpoints(t *testing.T) endpoints {
 	t.Helper()
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
+		if strings.HasSuffix(r.URL.Path, ".mod") {
+			// A real, parseable go.mod body — not the placeholder JSON
+			// below, which golang.org/x/mod/modfile.Parse (see
+			// TestDiagnose_GoModUnparseable) correctly rejects, and every
+			// caller of readyEndpoints wants a clean statusReady, not a
+			// spurious statusGoModUnparseable from this fixture's own body.
+			_, _ = w.Write([]byte("module example.com/mod\n\ngo 1.21\n"))
+			return
+		}
 		_, _ = w.Write([]byte(`{"Version":"v0.1.0"}`))
 	}))
 	t.Cleanup(proxy.Close)
@@ -160,6 +169,13 @@ func TestRun_WaitPollsUntilReady(t *testing.T) {
 				_, _ = w.Write([]byte("v0.1.0\n"))
 			} else {
 				_, _ = w.Write([]byte("v0.0.9\n"))
+			}
+		case strings.HasSuffix(r.URL.Path, ".mod"):
+			if ready {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("module example.com/mod\n\ngo 1.21\n"))
+			} else {
+				w.WriteHeader(http.StatusNotFound)
 			}
 		default: // .info, sum lookup
 			if ready {

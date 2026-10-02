@@ -19,9 +19,27 @@ func fakeProxy(t *testing.T, routes map[string]int) *httptest.Server {
 			t.Fatalf("unexpected request to %s", r.URL.Path)
 		}
 		w.WriteHeader(code)
-		if code == http.StatusOK {
-			_, _ = fmt.Fprint(w, `{"Version":"v0.1.0","Time":"2026-09-19T00:00:00Z"}`)
+		if code != http.StatusOK {
+			return
 		}
+		// A ".mod" request gets a real, minimal, parseable go.mod body
+		// instead of the ".info"/"@latest" placeholder JSON below — tests
+		// using this generic helper don't care about go.mod content, but
+		// since TestDiagnose_GoModUnparseable added a check that actually
+		// parses r.modFile.body with golang.org/x/mod/modfile.Parse, every
+		// other test whose probe() also fetches a .mod file (any test that
+		// exercises r.versionInfo.ok) needs that body to be valid, or it
+		// spuriously trips the new check instead of reaching whatever this
+		// test actually means to exercise.
+		if strings.HasSuffix(r.URL.Path, ".mod") {
+			modulePath := strings.TrimPrefix(r.URL.Path, "/")
+			if i := strings.Index(modulePath, "/@v/"); i >= 0 {
+				modulePath = modulePath[:i]
+			}
+			_, _ = fmt.Fprintf(w, "module %s\n\ngo 1.21\n", modulePath)
+			return
+		}
+		_, _ = fmt.Fprint(w, `{"Version":"v0.1.0","Time":"2026-09-19T00:00:00Z"}`)
 	}))
 	return srv
 }
@@ -810,6 +828,67 @@ func TestDiagnose_Retracted(t *testing.T) {
 	}
 	if !strings.Contains(got.message, "go install") {
 		t.Fatalf("expected the message to note `go install` still succeeds despite the retraction, got: %s", got.message)
+	}
+}
+
+// TestDiagnose_GoModUnparseable is the fix for a real bug found by publishing
+// a real, public GitHub module whose go.mod opens with a "/* ... */" block
+// comment (a realistic mistake: a license header copy-pasted from a .go
+// file) and querying the real proxy.golang.org/sum.golang.org about it
+// (2026-10-02, github.com/experimental-gains/blockcomment-probe@v0.1.0):
+// @v/list, @v/v0.1.0.info, @v/v0.1.0.mod, and sum.golang.org/lookup all
+// answered 200 — proxy.golang.org serves a version's raw go.mod bytes
+// verbatim with no syntax validation at all — while a real `go get` against
+// the identical tag (GOPROXY=direct, bypassing any proxy-side caching)
+// failed immediately and permanently with "parsing go.mod: go.mod:1: mod
+// files must use // comments (not /* */ comments)". Before this fix,
+// goproxycheck's own canonicalModulePath/retraction/deprecation checks
+// already parsed this exact go.mod body for their own narrower purposes and
+// silently swallowed the parse error as "nothing to report," so this
+// permanent failure fell through to a false statusReady.
+func TestDiagnose_GoModUnparseable(t *testing.T) {
+	const module = "github.com/experimental-gains/blockcomment-probe"
+	const version = "v0.1.0"
+	const brokenGoMod = "/* Copyright 2026 Example Corp.\n" +
+		" * Licensed under MIT.\n" +
+		" */\n" +
+		"module github.com/experimental-gains/blockcomment-probe\n\n" +
+		"go 1.24\n"
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/" + module + "/@latest":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2026-10-02T00:15:29Z"}`, version)
+		case "/" + module + "/@v/list":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, "%s\n", version)
+		case "/" + module + "/@v/" + version + ".info":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2026-10-02T00:15:29Z"}`, version)
+		case "/" + module + "/@v/" + version + ".mod":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, brokenGoMod)
+		default:
+			t.Fatalf("unexpected request to %s", r.URL.Path)
+		}
+	}))
+	defer proxy.Close()
+	sum := fakeProxy(t, map[string]int{
+		"/lookup/" + module + "@" + version: http.StatusOK,
+	})
+	defer sum.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, client: proxy.Client()}
+	r := ep.probe(module, version)
+	got := diagnose(r)
+	if got.status != statusGoModUnparseable {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusGoModUnparseable, got.message)
+	}
+	if !strings.Contains(got.message, "mod files must use // comments") {
+		t.Fatalf("expected the message to quote modfile.Parse's real error, got: %s", got.message)
+	}
+	if !strings.Contains(got.message, "permanent") {
+		t.Fatalf("expected the message to say this is permanent, not a timing issue, got: %s", got.message)
 	}
 }
 

@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+
+	"golang.org/x/mod/modfile"
 )
 
 type status string
@@ -36,6 +38,7 @@ const (
 	statusUnknownRevision         status = "unknown-revision"
 	statusInvalidPseudoVersion    status = "invalid-pseudo-version"
 	statusNoMatchingVersion       status = "no-matching-version"
+	statusGoModUnparseable        status = "go-mod-unparseable"
 )
 
 // isRepoCheckInconclusive reports whether a repo-reachability probe status
@@ -516,6 +519,43 @@ func diagnose(r report) diagnosis {
 	// just `go get module@latest`.
 	if (r.version == "latest" || r.version == "upgrade") && isProxyErrorStatus(r.latest.statusCode) {
 		return proxyErrorDiagnosis("proxy.golang.org", "@latest", r.latest.statusCode)
+	}
+
+	// Checked ahead of canonicalModulePath/ready/sumdb-lag below (all three
+	// require r.versionInfo.ok, same as this): proxy.golang.org and
+	// sum.golang.org serve a version's @v/<version>.info, @v/<version>.mod,
+	// and sumdb lookup from the raw bytes committed at that tag, with no
+	// go.mod syntax validation at all — confirmed live (2026-10-02) by
+	// publishing a real, public GitHub module whose go.mod opens with a "/*
+	// ... */" block comment (a realistic mistake: a license header
+	// copy-pasted from a .go file, where that comment style is normal, into
+	// go.mod, where it categorically is not — go.mod's lexer only ever
+	// recognizes "//" line comments, confirmed directly against
+	// golang.org/x/mod/modfile/read.go). @v/list, @v/<version>.info,
+	// @v/<version>.mod, and sum.golang.org/lookup all answered 200 for it —
+	// proxy.golang.org happily indexed and served the broken file verbatim
+	// — while a real `go get` against the same tag (GOPROXY=direct, bypassing
+	// any proxy-side caching) failed immediately and permanently with `go:
+	// MODULE@VERSION requires MODULE@VERSION: parsing go.mod: go.mod:1: mod
+	// files must use // comments (not /* */ comments)`, entirely offline
+	// once the bytes were in hand, before ever consulting sum.golang.org.
+	// Before this check, goproxycheck's own canonicalModulePath,
+	// retraction, and deprecation checks already parsed this exact go.mod
+	// body (modFile/latestModFile) for their own narrower purposes and
+	// silently treated a parse failure as "nothing to report" — so this
+	// permanent, unconditional failure fell all the way through to a false
+	// statusReady ("a plain `go install` will work"), the opposite of
+	// reality. golang.org/x/mod/modfile.Parse is the exact parser cmd/go
+	// itself uses, so a failure here reproduces a real `go install`/`go
+	// get`/`go build` Fatal, not just a stylistic lint.
+	if r.versionInfo.ok && r.modFile.ok {
+		if _, err := modfile.Parse("go.mod", []byte(r.modFile.body), nil); err != nil {
+			return diagnosis{statusGoModUnparseable, fmt.Sprintf(
+				"%s: the go.mod committed at this tag doesn't parse: %v. "+
+					"proxy.golang.org and sum.golang.org don't validate go.mod syntax before serving/indexing a version, so this can still report as present on both — but a real `go install`/`go get`/`go build` fails outright with this exact error the moment it tries to use this go.mod, entirely offline, regardless of proxy or sumdb state. "+
+					"This isn't the negative-cache bug or ordinary indexing lag: it's a permanent property of the file committed at this tag, so --wait and a retry can't fix it. Fix the go.mod (a common cause: a \"/* */\" block comment — go.mod only allows \"//\" line comments) and cut a new tag.",
+				displayTarget(r), err)}
+		}
 	}
 
 	// Checked ahead of the ready/sumdb-lag verdicts below (both require

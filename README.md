@@ -246,6 +246,23 @@ actually seeing:
   that was never cut can't start existing by waiting. `goproxycheck`
   reports this as a distinct `invalid-pseudo-version` diagnosis and stops
   immediately under `--wait`.
+- `mod files must use // comments (not /* */ comments)` — the go.mod
+  committed at this tag doesn't parse at all, most often from a license
+  header copy-pasted from a `.go` file: `/* */` block comments are normal
+  Go syntax but go.mod's own lexer only ever accepts `//` line comments.
+  `proxy.golang.org` and `sum.golang.org` don't validate go.mod syntax
+  before serving/indexing a version, so this can still show up as fully
+  live on both — verified live (2026-10-02) by publishing a real, public
+  GitHub module with exactly this defect: `@v/list`, `@v/<version>.info`,
+  `@v/<version>.mod`, and `sum.golang.org/lookup` all answered `200`, while
+  `go get` against the identical tag (bypassing any proxy-side caching
+  with `GOPROXY=direct`) failed immediately and permanently with this exact
+  message, entirely offline, the moment it had the bytes in hand.
+  `goproxycheck` parses the fetched go.mod with the same
+  `golang.org/x/mod/modfile` package `cmd/go` itself uses and reports this
+  as a distinct `go-mod-unparseable` diagnosis (not `ready`) instead of
+  missing the one signal that proves a plain `go install` can never work
+  here no matter how long `--wait` polls.
 
 ## Install
 
