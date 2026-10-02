@@ -391,6 +391,52 @@ func TestModuleFromGoMod_Missing(t *testing.T) {
 	}
 }
 
+// TestModuleFromGoMod_BOM is a regression test for a real bug: a go.mod
+// whose first bytes are the UTF-8 byte order mark (hex EF BB BF, Unicode
+// code point U+FEFF) makes a real `go list -m`/`go build` Fatal
+// immediately and offline with `go.mod:1: unexpected input character`
+// (quoting the BOM rune itself) — confirmed live (go1.24.4) — before the
+// module directive, or anything else in the file, is ever evaluated.
+// Windows tooling commonly writes UTF-8-with-BOM by default (pre-6
+// PowerShell's `Set-Content -Encoding UTF8`, Notepad's "UTF-8" option), so
+// a hand-edited go.mod saved that way is a real, if rare, shape.
+//
+// diagnose.go's statusGoModUnparseable check (added for a different go.mod
+// defect, a "/* */" block comment — see that status's doc comment) already
+// catches this same class of problem for the *proxy-served* go.mod of the
+// version being checked, by running the real golang.org/x/mod/modfile.Parse
+// ahead of canonicalModulePath/retraction/deprecation. But moduleFromGoMod
+// is a separate, earlier code path: the no-argument CLI mode that reads the
+// *local* ./go.mod to discover which module to probe in the first place,
+// and it never goes through that check at all — it calls moduleDirective's
+// hand-rolled line scanner directly.
+//
+// Before this fix, moduleDirective's `strings.CutPrefix(line, "module")`
+// check on the first line silently failed (the line reads the BOM code
+// point glued onto the front of "module", and strings.TrimSpace does not
+// strip that code point), so the directive was never recognized at all and
+// moduleFromGoMod reported the generic "go.mod has no 'module' directive"
+// — actively misdirecting a user into thinking they need to add a module
+// directive from scratch, instead of the accurate, `go`-shaped answer that
+// the file has an encoding problem a real toolchain Fatals on before even
+// looking for one.
+func TestModuleFromGoMod_BOM(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "go.mod")
+	_ = os.WriteFile(path, []byte("\xEF\xBB\xBFmodule github.com/foo/bar\n\ngo 1.24\n"), 0o644)
+
+	_, err := moduleFromGoMod(path)
+	if err == nil {
+		t.Fatal("expected an error for a go.mod beginning with a UTF-8 byte order mark, got none")
+	}
+	if strings.Contains(err.Error(), "has no 'module' directive") {
+		t.Errorf("error %q wrongly claims there's no module directive at all — real go Fatals with a BOM-specific parse error (`unexpected input character '\\ufeff'`) before it ever looks for one", err)
+	}
+	if !strings.Contains(err.Error(), "byte order mark") || !strings.Contains(err.Error(), "unexpected input character") {
+		t.Errorf("error %q doesn't mention the byte order mark and real go's own Fatal message", err)
+	}
+}
+
 func TestResolveTarget_ExplicitArg(t *testing.T) {
 	module, version, err := resolveTarget([]string{"example.com/mod@v1.2.3"})
 	if err != nil {

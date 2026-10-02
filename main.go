@@ -790,6 +790,39 @@ func moduleFromGoMod(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// A leading UTF-8 byte order mark (hex EF BB BF, U+FEFF) makes the
+	// *entire* file unparseable to the real go toolchain — confirmed live
+	// (go1.24.4): `go list -m`/`go build` against a go.mod opening with
+	// this byte sequence Fatals immediately and offline with
+	// `go.mod:1: unexpected input character`, quoting the BOM rune itself,
+	// before the module directive, or anything else in the file, is ever
+	// evaluated. Windows tooling
+	// commonly writes UTF-8-with-BOM by default (pre-6 PowerShell's
+	// `Set-Content -Encoding UTF8`, Notepad's "UTF-8" option), so a
+	// hand-edited go.mod saved that way is a real, if rare, shape.
+	//
+	// diagnose.go's statusGoModUnparseable check already catches this same
+	// class of problem for the *proxy-served* go.mod of the version being
+	// checked (it runs golang.org/x/mod/modfile.Parse, which rejects a BOM
+	// exactly like it rejects a "/* */" block comment, ahead of
+	// canonicalModulePath/retraction/deprecation). But this function is a
+	// separate, earlier code path — the no-argument CLI mode that reads the
+	// *local* ./go.mod to discover which module to probe in the first
+	// place — and it never goes through that check: it hands the raw bytes
+	// straight to moduleDirective's hand-rolled line scanner, whose
+	// `strings.CutPrefix(line, "module")` check on the first line silently
+	// fails once the BOM is glued onto the front of "module" (strings.
+	// TrimSpace does not strip U+FEFF), so the directive is never
+	// recognized at all. Without this check, that fell through to the
+	// generic "has no 'module' directive" error below — actively
+	// misdirecting a user into thinking they need to add a module
+	// directive from scratch, instead of the accurate, `go`-shaped answer
+	// that the file has an encoding problem a real toolchain Fatals on
+	// before even looking for one.
+	const utf8BOM = "\xEF\xBB\xBF" // the three raw bytes of a UTF-8 byte order mark (U+FEFF)
+	if strings.HasPrefix(string(data), utf8BOM) {
+		return "", fmt.Errorf("%s begins with a UTF-8 byte order mark — a real `go list -m`/`go build` Fatals immediately with `go.mod:1: unexpected input character`, entirely offline, before ever contacting the proxy, so this could never resolve regardless of the repo or proxy config. Re-save the file as plain UTF-8 without a byte-order mark and try again", path)
+	}
 	mod, err := moduleDirective(string(data))
 	if err != nil {
 		return "", fmt.Errorf("%s %w", path, err)
