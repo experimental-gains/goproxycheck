@@ -63,7 +63,18 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 	// (GOPROXY=off, a private module, etc.), since none of those resolve
 	// anything.
 	var resolvedVersion string
-	if raw, goproxyErr := localGoproxyEmptyListError(); goproxyErr != nil {
+	if localGo111ModuleOff() {
+		// Checked before every other local-config branch below, including
+		// localGoproxyEmptyListError/localGoproxyMalformedEntryError: see
+		// localGo111ModuleOff's doc comment for the live confirmation that
+		// GO111MODULE=off preempts all of them — a real `go install`/`go get`
+		// never gets far enough to parse GOPROXY, GOVCS, GOAUTH, or GOSUMDB,
+		// or to consult GOPRIVATE/GONOPROXY, when module mode itself is off.
+		d = diagnosis{statusGo111moduleOffLocally, fmt.Sprintf(
+			"your local `GO111MODULE` is set to `off` (via env var or `go env -w`), which disables module mode outright — `go install`/`go get` fails immediately and unconditionally with `go: modules disabled by GO111MODULE=off; see 'go help modules'` the moment it's invoked, entirely offline, before %s@%s (or anything else, including a malformed module path) is ever checked against proxy.golang.org, sum.golang.org, or any VCS host. "+
+				"That's your machine's own config, not a proxy-availability problem. Module mode has been the default since Go 1.16 for any directory with a go.mod — unset `GO111MODULE` (or set it to `on`) to use it.",
+			module, version)}
+	} else if raw, goproxyErr := localGoproxyEmptyListError(); goproxyErr != nil {
 		// Checked before every other local-config branch below, including
 		// localModulePrivate: confirmed live this failure preempts even the
 		// GOPRIVATE/GONOPROXY direct-fetch path (see
@@ -1293,6 +1304,54 @@ func firstGoproxyEntry() string {
 // GOPROXY disables module downloads outright (its first entry is "off").
 func localGoproxyOff() bool {
 	return firstGoproxyEntry() == "off"
+}
+
+// localGo111ModuleOff reports whether the local `go` command's effective
+// GO111MODULE disables module mode outright. Reads it via `go env
+// GO111MODULE` rather than os.Getenv("GO111MODULE") directly, the same
+// go-env-reading shape as firstGoproxyEntry and every other local*
+// check in this file, so a value persisted with `go env -w` is picked up
+// too.
+//
+// Confirmed live (2026-10-02, go1.24.4): `GO111MODULE=off go install
+// golang.org/x/example/hello@latest` fails immediately and unconditionally
+// with `go: modules disabled by GO111MODULE=off; see 'go help modules'`,
+// entirely offline, before proxy.golang.org, sum.golang.org, or any VCS
+// host is ever contacted — reproduced identically for `go get`, and for a
+// module path that's already known to be syntactically invalid (a stray
+// '!' character) or already blocklisted, proving this Fatal preempts even
+// the module-path-validation check resolveTarget already performs, not
+// just the proxy probe. This isn't module-specific or even GOPROXY-shaped
+// local config: it precedes every other local-config gate this tool already
+// models — confirmed live that combining it with a malformed GOPROXY
+// (`GOPROXY=,`), a malformed GOVCS (`GOVCS=badrule`), or a malformed GOAUTH
+// (`GOAUTH="off;netrc"`) always surfaces the identical GO111MODULE error,
+// never any of those others, since go never gets as far as parsing any of
+// them when module mode itself is off.
+//
+// GO111MODULE is legacy (module mode has been the unconditional default
+// since Go 1.16 for any directory with a go.mod — `go help modules`), but
+// "off" is not a no-op relic the way GONOSUMCHECK is: it's still read and
+// still Fatal on every module-aware command in every currently supported Go
+// release, including the one this tool's own go.mod requires. A stray
+// GO111MODULE=off is realistic, not just theoretical: it's exactly the kind
+// of var a legacy GOPATH-era shell profile, Makefile, or CI job still
+// exports out of habit long after the project itself moved to modules.
+//
+// Before this check existed, goproxycheck had no detection for this at
+// all: with GO111MODULE=off set and an otherwise fully live, healthy
+// module@version, it probed proxy.golang.org/sum.golang.org directly and
+// reported plain statusReady ("a plain `go install` will work") — the
+// opposite of reality, the same "local config error, not a proxy-
+// availability problem" shape already handled for GOPROXY=off
+// (localGoproxyOff) and every other local*ConfigError in this file, just
+// for the one gate that, uniquely, precedes all of them.
+func localGo111ModuleOff() bool {
+	out, err := exec.Command("go", "env", "GO111MODULE").Output()
+	if err != nil {
+		return false // best-effort: don't block the real check on this
+	}
+	return strings.TrimSpace(string(out)) == "off"
 }
 
 // goproxyEmptyListError reports the error real cmd/go's own GOPROXY-list

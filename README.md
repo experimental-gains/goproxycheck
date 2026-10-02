@@ -58,6 +58,23 @@ actually seeing:
   tagged isn't showing up yet. Could be ordinary indexing lag (wait a
   minute), could be the negative-cache poisoning described above (wait
   won't fix it — you need a new tag). `goproxycheck` tells you which.
+- `modules disabled by GO111MODULE=off; see 'go help modules'` — not a
+  proxy-availability problem at all, your own `GO111MODULE` (checked via
+  `go env GO111MODULE`) disables module mode outright. Confirmed live
+  (2026-10-02) that this Fatals `go install`/`go get` immediately and
+  unconditionally, entirely offline, before anything else — even a
+  malformed module path, or a malformed `GOPROXY`/`GOVCS`/`GOAUTH` that
+  would otherwise Fatal first — is ever considered: module mode itself
+  never turns on, so none of those are ever parsed. `goproxycheck` checks
+  this *first*, ahead of every other local-config check in this list, and
+  reports it as a `go111module-off-locally` diagnosis instead of a false
+  "ready" — confirmed live that without this check it would otherwise say
+  a fully live module@version is ready to install while the real `go
+  install` in that same environment fails outright. `GO111MODULE` is a
+  Go 1.11-era legacy var — module mode has been the unconditional default
+  since Go 1.16 — but `off` is not a no-op relic: it's still read and
+  still Fatal on every currently supported Go release, including the one
+  this tool's own go.mod requires.
 - `module lookup disabled by GOPROXY=off` — not a proxy-availability
   problem at all, your own `GOPROXY` is set to `off` (checked via `go env
   GOPROXY`, so this also catches a value persisted with `go env -w`, not
@@ -339,7 +356,7 @@ argument errors.
 ## Use as a GitHub Action
 
 ```yaml
-- uses: experimental-gains/goproxycheck@v0.1.85
+- uses: experimental-gains/goproxycheck@v0.1.86
   with:
     args: --wait --timeout 10m github.com/you/yourmodule@v1.2.3
 ```

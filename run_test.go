@@ -224,6 +224,52 @@ func TestRun_LocalGoproxyOff(t *testing.T) {
 	}
 }
 
+// TestRun_LocalGo111ModuleOff verifies run() short-circuits on a local
+// GO111MODULE=off before ever probing the proxy/sumdb — passing endpoints{}
+// (a nil client) means any attempt to actually probe would panic, so a
+// clean, non-crashing statusGo111moduleOffLocally result proves the probe
+// loop was skipped entirely. This is the fix for a real bug found via
+// live-toolchain differential testing: goproxycheck used to report "ready"
+// for a module@version while GO111MODULE=off was set, when the real `go
+// install` in that exact environment fails outright, entirely offline, with
+// "modules disabled by GO111MODULE=off; see 'go help modules'" — see
+// localGo111ModuleOff's doc comment for the live confirmation.
+func TestRun_LocalGo111ModuleOff(t *testing.T) {
+	t.Setenv("GO111MODULE", "off")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, endpoints{})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "go111module-off-locally") {
+		t.Errorf("stdout = %q, want it to mention go111module-off-locally", stdout.String())
+	}
+}
+
+// TestRun_LocalGo111ModuleOff_OverridesLocalGoproxyEmptyList verifies the
+// GO111MODULE=off check runs before localGoproxyEmptyListError, not after —
+// confirmed live (2026-10-02): `GO111MODULE=off GOPROXY=, go get
+// golang.org/x/example/hello@latest` still fails with the GO111MODULE error,
+// not the "GOPROXY list is not the empty string, but contains no entries"
+// one, because real `go` never gets far enough to parse GOPROXY at all when
+// module mode itself is off. Before this ordering was deliberate, a naive
+// implementation checking localGoproxyEmptyListError first would have
+// reported statusGoproxyEmptyLocally here instead — a different, incorrect
+// local-config diagnosis for the exact same (non-probing) reason, but citing
+// the wrong config var and the wrong real-`go` error message.
+func TestRun_LocalGo111ModuleOff_OverridesLocalGoproxyEmptyList(t *testing.T) {
+	t.Setenv("GO111MODULE", "off")
+	t.Setenv("GOPROXY", ",")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, endpoints{})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "go111module-off-locally") {
+		t.Errorf("stdout = %q, want it to mention go111module-off-locally, not some other local-config diagnosis", stdout.String())
+	}
+}
+
 // TestRun_LocalGoproxyEmptyList verifies run() short-circuits on a local
 // GOPROXY that parses to zero actual entries (e.g. a bare "," or
 // whitespace-only value) before ever probing the proxy/sumdb — passing
