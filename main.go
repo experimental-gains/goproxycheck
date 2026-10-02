@@ -552,6 +552,54 @@ func resolveTarget(args []string) (module, version string, err error) {
 		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 			return "", "", fmt.Errorf("argument must be in module@version form, got %q", args[0])
 		}
+		if parts[0] == "go" || parts[0] == "toolchain" {
+			// "go" and "toolchain" are not ordinary module paths at all — real
+			// cmd/go reserves both literal strings as pseudo-module names it
+			// special-cases ahead of any path validation (modfetch/repo.go's
+			// lookup: `switch path { case "go", "toolchain": return
+			// &toolchainRepo{path, Lookup(ctx, proxy, "golang.org/toolchain")},
+			// nil }`), redirecting every query to the real golang.org/toolchain
+			// module under the hood. `go help get` documents this directly:
+			// "To upgrade the minimum required Go version to the latest
+			// released Go version: go get go@latest" / "To upgrade the Go
+			// toolchain to the latest patch release of the current Go
+			// toolchain: go get toolchain@patch". Confirmed live (2026-10-02,
+			// go1.24.4): `go install go@latest` and `go get toolchain@patch`
+			// both resolve the module successfully (`go install go@latest`
+			// only fails afterward, on "does not contain package go" — the
+			// module lookup itself already succeeded by then).
+			//
+			// modulepkg.CheckPath rejects both strings outright ("missing dot
+			// in first path element", since neither looks like a
+			// domain-rooted import path) — but a real `go get`/`go install`
+			// never reaches that check for these two literal strings; it
+			// special-cases them first. Before this check, resolveTarget let
+			// CheckPath's ordinary rejection fire here, so goproxycheck told
+			// the caller that `go get`/`go install` "rejects this exact
+			// string immediately with `malformed module path ...: missing dot
+			// in first path element`" — an outright false claim about real
+			// tool behavior (the opposite-direction mistake from this tool's
+			// usual "the real toolchain would Fatal first" family: here it
+			// invented a Fatal that doesn't happen).
+			//
+			// goproxycheck still doesn't check either target, though: unlike
+			// an ordinary module, "go"/"toolchain" versions aren't semver
+			// (no "v" prefix — confirmed live `go get go@v1.27.1` itself fails
+			// with "invalid go version v1.27.1"), "latest"/"patch" resolve
+			// against the *locally running* toolchain's own version as well
+			// as a fetched list (cmd/go's internal/gover package; confirmed
+			// live that proxy.golang.org's own plain golang.org/toolchain
+			// @latest returns a nonsense, years-stale "v0.0.1-go1.9rc2...",
+			// unusable as a stand-in), and even a fully-specified version like
+			// "1.21rc1" that's older than the locally running toolchain is
+			// treated as present without ever consulting the proxy at all
+			// (cmd/go's own toolchainRepo.Stat: "pretend to have all earlier
+			// Go versions available without network access"). None of that
+			// reuses this tool's ordinary module-version machinery safely, so
+			// this reports an honest "not supported" instead of a false
+			// "invalid".
+			return "", "", fmt.Errorf("%q is a reserved Go-toolchain pseudo-module name, not an ordinary module path — `go get %s@%s` (see `go help get`) is real, documented syntax that resolves fine via golang.org/toolchain, not an offline parse rejection. goproxycheck doesn't check Go-toolchain version availability, only ordinary module paths against the public proxy/checksum database", parts[0], parts[0], parts[1])
+		}
 		if err := modulepkg.CheckPath(parts[0]); err != nil {
 			// Confirmed live (2026-09-28) against golang.org/x/mod/module (the
 			// same package cmd/go itself uses for this check) and the real `go`

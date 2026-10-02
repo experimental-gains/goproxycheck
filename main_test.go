@@ -592,6 +592,66 @@ func TestResolveTarget_ValidUppercaseModulePathNotRejected(t *testing.T) {
 	}
 }
 
+// TestResolveTarget_GoToolchainPseudoModuleNotFalselyRejected is a regression
+// test for a real bug: "go" and "toolchain" are reserved pseudo-module names
+// real cmd/go special-cases ahead of any ordinary module-path validation
+// (modfetch/repo.go's lookup: `switch path { case "go", "toolchain": ...
+// }`), redirecting to the real golang.org/toolchain module under the hood —
+// `go help get` documents `go get go@latest` and `go get toolchain@patch`
+// directly as the way to bump a go.mod's minimum Go version or toolchain.
+// Confirmed live (2026-10-02, go1.24.4): `go install go@latest` and `go get
+// toolchain@patch` both resolve the module successfully (`go install
+// go@latest` only fails afterward, on "does not contain package go" — the
+// module lookup itself already succeeded).
+//
+// Before this check, resolveTarget ran modulepkg.CheckPath("go") /
+// ("toolchain") like any ordinary module path, which fails with "missing dot
+// in first path element" (neither looks like a domain-rooted import path) —
+// so goproxycheck told the caller that a real `go get`/`go install` "rejects
+// this exact string immediately with `malformed module path ...: missing dot
+// in first path element`", an outright false claim: real go never runs that
+// check for these two literal strings at all, since it recognizes them
+// first. This test only guards against the false "malformed module path"
+// claim and confirms the error is distinct for the two cases, not that
+// goproxycheck actually resolves a go/toolchain target — it still doesn't
+// (see the fix's own doc comment in resolveTarget for why: Go-toolchain
+// versions aren't semver, and "latest"/"patch" resolution depends on the
+// locally running toolchain's own version, neither of which this tool's
+// ordinary module-version machinery can safely reuse).
+func TestResolveTarget_GoToolchainPseudoModuleNotFalselyRejected(t *testing.T) {
+	for _, module := range []string{"go", "toolchain"} {
+		t.Run(module, func(t *testing.T) {
+			_, _, err := resolveTarget([]string{module + "@1.27.1"})
+			if err == nil {
+				t.Fatalf("expected resolveTarget to decline %q@version (goproxycheck doesn't check it), got no error", module)
+			}
+			if strings.Contains(err.Error(), "malformed module path") || strings.Contains(err.Error(), "missing dot in first path element") {
+				t.Errorf("error falsely claims real `go` rejects %q as a malformed module path, but `go get %s@1.27.1` is real, documented syntax (go help get) that resolves fine: %v", module, module, err)
+			}
+			if !strings.Contains(err.Error(), "go get "+module+"@1.27.1") {
+				t.Errorf("error should name the real, working `go get %s@1.27.1` equivalent so the caller knows this isn't a syntax error: %v", module, err)
+			}
+		})
+	}
+}
+
+// TestResolveTarget_UppercaseGoNotTreatedAsToolchainPseudoModule guards
+// against an over-broad fix to the check above: cmd/go's special-casing of
+// "go"/"toolchain" is an exact, case-sensitive string match (confirmed live:
+// `go install Go@latest` fails with the ordinary `malformed module path
+// "Go": missing dot in first path element`, since real go does NOT
+// special-case "Go"), so resolveTarget must not treat "Go" or "Toolchain" as
+// the reserved pseudo-module names either.
+func TestResolveTarget_UppercaseGoNotTreatedAsToolchainPseudoModule(t *testing.T) {
+	_, _, err := resolveTarget([]string{"Go@1.27.1"})
+	if err == nil {
+		t.Fatal(`expected an error for "Go@1.27.1" (not a valid module path either way)`)
+	}
+	if !strings.Contains(err.Error(), "malformed module path") {
+		t.Errorf("error should still cite the ordinary malformed-module-path rejection for \"Go\" (not special-cased like \"go\"): %v", err)
+	}
+}
+
 // TestResolveTarget_WhitespaceInVersion is a regression test for a real bug:
 // a version query with a leading, trailing, or embedded space (e.g. picked
 // up from copy-paste, a CI variable, or a file read with the newline only
