@@ -236,6 +236,25 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 						"%s is live on proxy.golang.org, but before that would even matter, your local `GOSUMDB` config is itself malformed (%v) — real `go install`/`go get` fails outright with `invalid GOSUMDB: %v` the moment it actually needs to verify this (or any) module against the checksum database, regardless of what sum.golang.org has, or whether this version is otherwise ready, retracted, or deprecated. "+
 							"That's your machine's own config, not a proxy-availability problem. Fix `GOSUMDB` (see `go help goproxy`), or set `GOSUMDB=off` if you intend to skip verification entirely.",
 						displayTarget(r), err, err)}
+				} else if localGosumdbOffBlocksToolchain(module) {
+					// See sumdbAlwaysRequired's doc comment: unlike every other
+					// module, GOSUMDB=off doesn't mean "skip verification" for
+					// golang.org/toolchain — modfetch/sumdb.go's useSumDB hardcodes
+					// this one module path as always requiring the checksum
+					// database, so dbDial's own "off" check is reached
+					// unconditionally and Fatals outright, regardless of proxy or
+					// sumdb state. Checked ahead of statusSumdbLag below for the
+					// same reason localGosumdbConfigError is: this is a local-config
+					// failure that preempts the sumdb-lag question entirely, and it
+					// applies just as much when d.status is already statusReady
+					// (sum.golang.org has fully caught up) as when it's
+					// statusSumdbLag — a real install Fatals on GOSUMDB=off before
+					// ever checking either.
+					d = diagnosis{statusGosumdbRequiredLocally, fmt.Sprintf(
+						"%s is Go's own toolchain-distribution module — real `go install`/`go get`/`go mod download` always consult the checksum database for it, even when your local `GOSUMDB` is `off` or a `GONOSUMDB` pattern matches it (every other module path is exempted by either of those; this one, uniquely, is not — see modfetch/sumdb.go's useSumDB, \"downloaded toolchains cannot be listed in go.sum\"). "+
+							"Your local `GOSUMDB` is `off`, so the real command fails outright with `checksum database disabled by GOSUMDB=off` the moment it tries to verify this module, regardless of what proxy.golang.org or sum.golang.org have, or whether this version is otherwise ready. "+
+							"That's your machine's own config, not a proxy-availability problem — but unlike every other module, `GOSUMDB=off` is not the fix here: point `GOSUMDB` at a real, reachable checksum database (the default `sum.golang.org` works) to fetch Go toolchains.",
+						displayTarget(r))}
 				} else if d.status == statusSumdbLag {
 					if skipped, reason := localSumdbSkipped(module); skipped {
 						// See localSumdbSkipped's doc comment: a local GOSUMDB=off
@@ -295,6 +314,12 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 			// a malformed local $GOSUMDB is this machine's own config, and
 			// no amount of proxy.golang.org/sum.golang.org catching up
 			// changes it — it needs a config fix, not a wait.
+			// statusGosumdbRequiredLocally joins it for the identical
+			// reason: GOSUMDB=off blocking golang.org/toolchain (see
+			// sumdbAlwaysRequired's doc comment) is just as much a local
+			// config problem as a malformed GOSUMDB, and just as
+			// unfixable by waiting on either proxy.golang.org or
+			// sum.golang.org to catch up.
 			// statusNoMatchingVersion joins this list for the same reason as
 			// statusUnknownRevision/statusInvalidPseudoVersion right above:
 			// a comparison version query (e.g. "<v0.0.1") for which zero
@@ -338,7 +363,7 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 			// this status's own diagnosis text), so no amount of polling
 			// either service ever fixes it; only a new tag with a corrected
 			// go.mod would.
-			if !*wait || d.status == statusReady || d.status == statusModuleUnknown || d.status == statusBlocklistedMalicious || d.status == statusWrongImportPath || d.status == statusRetracted || d.status == statusDeprecated || d.status == statusZipBuildError || d.status == statusMajorVersionMismatch || d.status == statusUnknownRevision || d.status == statusInvalidPseudoVersion || d.status == statusGosumdbMalformedLocally || d.status == statusNegativeCache || d.status == statusNoMatchingVersion || d.status == statusGoModUnparseable || time.Now().After(deadline) {
+			if !*wait || d.status == statusReady || d.status == statusModuleUnknown || d.status == statusBlocklistedMalicious || d.status == statusWrongImportPath || d.status == statusRetracted || d.status == statusDeprecated || d.status == statusZipBuildError || d.status == statusMajorVersionMismatch || d.status == statusUnknownRevision || d.status == statusInvalidPseudoVersion || d.status == statusGosumdbMalformedLocally || d.status == statusGosumdbRequiredLocally || d.status == statusNegativeCache || d.status == statusNoMatchingVersion || d.status == statusGoModUnparseable || time.Now().After(deadline) {
 				break
 			}
 			time.Sleep(*interval)
@@ -1649,6 +1674,39 @@ func validSumdbName(name string) error {
 	return nil
 }
 
+// sumdbAlwaysRequired reports whether module is cmd/go's one hardcoded
+// exception to every GOSUMDB/GONOSUMDB skip rule the rest of this file
+// models — confirmed directly against modfetch/sumdb.go's own useSumDB:
+// for module path "golang.org/toolchain" specifically, it sets `must :=
+// true` and returns true unconditionally, ahead of (and regardless of) the
+// ordinary `cfg.GOSUMDB != "off" && !module.MatchPrefixPatterns(cfg.GONOSUMDB,
+// mod.Path)` check every other module path goes through — "Downloaded
+// toolchains cannot be listed in go.sum, so we require checksum database
+// lookups even if GOSUMDB=off or GONOSUMDB matches the pattern," per that
+// function's own comment. (Its own two further exceptions — a
+// `file://`-only GOPROXY used for distpack testing, or GIT_HTTP_USER_AGENT
+// naming proxy.golang.org — are internal Go-infrastructure signals this
+// tool has no way to read and no realistic end-user/CI config would set,
+// so they're deliberately not modeled here.)
+//
+// Confirmed live (2026-10-02), both directions, against a fresh, isolated
+// GOMODCACHE: `GOSUMDB=off go mod download
+// golang.org/toolchain@v0.0.1-go1.23.0.linux-amd64` fails outright with
+// `checksum database disabled by GOSUMDB=off` — the literal dbDial() error
+// for GOSUMDB=off — while the identical GOSUMDB=off against an ordinary
+// module (golang.org/x/text@v0.14.0) succeeds, with zero sum.golang.org
+// requests in its -x trace. And with GONOSUMDB="golang.org/toolchain" (an
+// exact match) plus a deliberately malformed custom GOSUMDB,
+// golang.org/toolchain still fails with "invalid GOSUMDB: malformed
+// verifier id", while golang.org/x/text under that identical GONOSUMDB
+// (matching it instead) succeeds untouched — proving the GONOSUMDB match
+// that exempts every ordinary module from verification does nothing at all
+// for this one path. See localGosumdbConfigError and localSumdbSkipped,
+// both of which used to treat this module exactly like any other.
+func sumdbAlwaysRequired(module string) bool {
+	return module == "golang.org/toolchain"
+}
+
 // localGosumdbConfigError reports the error a real `go install`/`go get`
 // would raise from a malformed local $GOSUMDB the moment it actually needs
 // to verify module against the checksum database — nil when verification
@@ -1659,6 +1717,16 @@ func validSumdbName(name string) error {
 // parses fine, whether or not it names the public sum.golang.org. Best-
 // effort like its sibling localGovcsConfigError: a failed `go env` call
 // doesn't block the real check.
+//
+// The GONOSUMDB-match exemption is skipped entirely when
+// sumdbAlwaysRequired(module) — see its doc comment: a GONOSUMDB pattern
+// matching "golang.org/toolchain" doesn't exempt it from verification the
+// way it would any other module, so a malformed custom $GOSUMDB still
+// Fatals for it even then. The separate GOSUMDB=off case for this same
+// module is deliberately NOT handled here (see localGosumdbOffBlocksToolchain
+// instead): off parses fine and isn't "malformed" — it just doesn't mean
+// what it means for every other module — so it needs its own honestly
+// worded diagnosis rather than this function's "invalid GOSUMDB" framing.
 func localGosumdbConfigError(module string) error {
 	out, err := exec.Command("go", "env", "GOSUMDB").Output()
 	if err != nil {
@@ -1668,12 +1736,32 @@ func localGosumdbConfigError(module string) error {
 	if gosumdb == "off" {
 		return nil
 	}
-	if nonsumOut, err := exec.Command("go", "env", "GONOSUMDB").Output(); err == nil {
-		if matchesAnyPattern(module, splitPatterns(strings.TrimSpace(string(nonsumOut)))) {
-			return nil
+	if !sumdbAlwaysRequired(module) {
+		if nonsumOut, err := exec.Command("go", "env", "GONOSUMDB").Output(); err == nil {
+			if matchesAnyPattern(module, splitPatterns(strings.TrimSpace(string(nonsumOut)))) {
+				return nil
+			}
 		}
 	}
 	return gosumdbConfigError(gosumdb)
+}
+
+// localGosumdbOffBlocksToolchain reports whether the local `go` command's
+// effective GOSUMDB is "off" while module is sumdbAlwaysRequired — the one
+// case where that ordinarily-harmless, common setting instead makes every
+// real `go install`/`go get`/`go mod download` of module Fatal outright,
+// regardless of proxy or sumdb state. See sumdbAlwaysRequired's doc
+// comment for the live confirmation. Best-effort like its siblings: a
+// failed `go env` call doesn't block the real check.
+func localGosumdbOffBlocksToolchain(module string) bool {
+	if !sumdbAlwaysRequired(module) {
+		return false
+	}
+	out, err := exec.Command("go", "env", "GOSUMDB").Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) == "off"
 }
 
 // localSumdbSkipped reports whether the local `go` command's effective
@@ -1709,15 +1797,30 @@ func localGosumdbConfigError(module string) error {
 // decided not to consult it. Without this, goproxycheck told a
 // GOSUMDB=off (or custom-GOSUMDB) user to "retry shortly" for a module
 // that was already installable right now.
+//
+// None of this applies when sumdbAlwaysRequired(module) — see its doc
+// comment: for "golang.org/toolchain" specifically, GOSUMDB=off blocks the
+// install outright instead of skipping verification (handled as its own
+// diagnosis by localGosumdbOffBlocksToolchain, not a "skip" here) and a
+// matching GONOSUMDB pattern does nothing at all, so neither reason this
+// function would otherwise return true for actually holds for it. A
+// well-formed custom (non-public, non-"off") GOSUMDB is unaffected by this
+// exception and still counts as skipped below: real go redirects
+// verification to that database instead of the public sum.golang.org this
+// tool probes either way, for every module including this one.
 func localSumdbSkipped(module string) (skipped bool, reason string) {
 	if out, err := exec.Command("go", "env", "GOSUMDB").Output(); err == nil {
 		gosumdb := strings.TrimSpace(string(out))
 		if gosumdb == "off" {
-			return true, "GOSUMDB=off"
-		}
-		if name := sumdbName(gosumdb); name != "sum.golang.org" {
+			if !sumdbAlwaysRequired(module) {
+				return true, "GOSUMDB=off"
+			}
+		} else if name := sumdbName(gosumdb); name != "sum.golang.org" {
 			return true, fmt.Sprintf("custom GOSUMDB %q", name)
 		}
+	}
+	if sumdbAlwaysRequired(module) {
+		return false, ""
 	}
 	out, err := exec.Command("go", "env", "GONOSUMDB").Output()
 	if err != nil {

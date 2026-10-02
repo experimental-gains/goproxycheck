@@ -35,6 +35,7 @@ const (
 	statusGovcsDisallowedLocally  status = "govcs-disallowed-locally"
 	statusGovcsMalformedLocally   status = "govcs-malformed-locally"
 	statusGosumdbMalformedLocally status = "gosumdb-malformed-locally"
+	statusGosumdbRequiredLocally  status = "gosumdb-required-locally"
 	statusUnknownRevision         status = "unknown-revision"
 	statusInvalidPseudoVersion    status = "invalid-pseudo-version"
 	statusNoMatchingVersion       status = "no-matching-version"

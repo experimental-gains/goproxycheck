@@ -1388,6 +1388,116 @@ func TestRun_SumdbLagWithGonosumdbPattern(t *testing.T) {
 	}
 }
 
+// TestRun_ToolchainGosumdbOffBlocksInstall is a regression test for a real
+// bug: GOSUMDB=off makes every ordinary module's sumdb-lag verdict
+// irrelevant (see TestRun_SumdbLagWithGosumdbOff right above) — but
+// "golang.org/toolchain" is cmd/go's own one hardcoded exception
+// (modfetch/sumdb.go's useSumDB: "downloaded toolchains cannot be listed in
+// go.sum, so we require checksum database lookups even if GOSUMDB=off").
+// Confirmed live (2026-10-02) against a fresh, isolated GOMODCACHE:
+// `GOSUMDB=off go mod download golang.org/toolchain@v0.0.1-go1.23.0.linux-amd64`
+// fails outright with "checksum database disabled by GOSUMDB=off", while
+// the identical GOSUMDB=off against an ordinary module
+// (golang.org/x/text@v0.14.0) succeeds. Before this fix, goproxycheck
+// treated this module exactly like any other and reported statusReady
+// ("GOSUMDB=off means ... a plain go install will work right now") for a
+// module whose install actually fails in this exact environment.
+func TestRun_ToolchainGosumdbOffBlocksInstall(t *testing.T) {
+	t.Setenv("GOSUMDB", "off")
+	t.Setenv("GONOSUMDB", "")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"golang.org/toolchain@v0.1.0"}, &stdout, &stderr, sumdbLagEndpoints(t))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s", code, stdout.String())
+	}
+	out := stdout.String()
+	if strings.Contains(out, "\nready\n") || strings.Contains(out, ": ready\n") {
+		t.Errorf("stdout = %q, must not report ready: a real `go install` under GOSUMDB=off fails outright for this module", out)
+	}
+	if !strings.Contains(out, "gosumdb-required-locally") {
+		t.Errorf("stdout = %q, want it to mention gosumdb-required-locally", out)
+	}
+	if !strings.Contains(out, "checksum database disabled by GOSUMDB=off") {
+		t.Errorf("stdout = %q, want it to quote the real `go` error", out)
+	}
+}
+
+// TestRun_ToolchainGosumdbOffBlocksInstallEvenWhenSumdbCaughtUp confirms the
+// same GOSUMDB=off-blocks-toolchain diagnosis fires even when the probe
+// result would otherwise be a plain statusReady (sum.golang.org already has
+// it, no lag at all) — see localGosumdbOffBlocksToolchain's call site in
+// run(), gated on four statuses including statusReady, not just
+// statusSumdbLag: a real `go mod download golang.org/toolchain@...` under
+// GOSUMDB=off Fatals on the local config before it would even matter
+// whether the public sumdb has caught up.
+func TestRun_ToolchainGosumdbOffBlocksInstallEvenWhenSumdbCaughtUp(t *testing.T) {
+	t.Setenv("GOSUMDB", "off")
+	t.Setenv("GONOSUMDB", "")
+	// A dedicated fixture, not the shared readyEndpoints helper: that one
+	// hardcodes a "module example.com/mod" go.mod body regardless of the
+	// module path requested, which would misfire canonicalModulePath's
+	// wrong-import-path check for golang.org/toolchain and short-circuit
+	// before ever reaching the check this test exists to exercise.
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if strings.HasSuffix(r.URL.Path, ".mod") {
+			_, _ = w.Write([]byte("module golang.org/toolchain\n\ngo 1.21\n"))
+			return
+		}
+		_, _ = w.Write([]byte(`{"Version":"v0.1.0"}`))
+	}))
+	t.Cleanup(proxy.Close)
+	sum := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(sum.Close)
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, client: proxy.Client()}
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"golang.org/toolchain@v0.1.0"}, &stdout, &stderr, ep)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s", code, stdout.String())
+	}
+	out := stdout.String()
+	if strings.Contains(out, "\nready\n") || strings.Contains(out, ": ready\n") {
+		t.Errorf("stdout = %q, must not report ready: a real `go install` under GOSUMDB=off fails outright for this module even when the public sumdb is fully caught up", out)
+	}
+	if !strings.Contains(out, "gosumdb-required-locally") {
+		t.Errorf("stdout = %q, want it to mention gosumdb-required-locally", out)
+	}
+}
+
+// TestRun_ToolchainGonosumdbMatchDoesNotHelp is a regression test for the
+// other half of the same real bug: an exactly-matching GONOSUMDB pattern
+// exempts every ordinary module from sumdb verification (see
+// TestRun_SumdbLagWithGonosumdbPattern above), but not golang.org/toolchain
+// — confirmed live (2026-10-02) that `GONOSUMDB=golang.org/toolchain go mod
+// download golang.org/toolchain@v0.0.1-go1.23.0.linux-amd64`, with a
+// deliberately malformed custom GOSUMDB, still fails with "invalid GOSUMDB:
+// malformed verifier id" (the ordinary gosumdbConfigError path), while the
+// identical GONOSUMDB match against golang.org/x/text succeeds untouched.
+// Before this fix, localGosumdbConfigError's GONOSUMDB-match check applied
+// unconditionally, so this exact config reported statusReady instead of
+// surfacing the real, unconditional GOSUMDB parse failure.
+func TestRun_ToolchainGonosumdbMatchDoesNotHelp(t *testing.T) {
+	t.Setenv("GOSUMDB", "mycompany.example+abc123 https://sumdb.mycompany.example")
+	t.Setenv("GONOSUMDB", "golang.org/toolchain")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"golang.org/toolchain@v0.1.0"}, &stdout, &stderr, sumdbLagEndpoints(t))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s", code, stdout.String())
+	}
+	out := stdout.String()
+	if strings.Contains(out, "\nready\n") || strings.Contains(out, ": ready\n") {
+		t.Errorf("stdout = %q, must not report ready: a real `go install` fails outright on the malformed GOSUMDB despite the matching GONOSUMDB pattern", out)
+	}
+	if !strings.Contains(out, "gosumdb-malformed-locally") {
+		t.Errorf("stdout = %q, want it to mention gosumdb-malformed-locally", out)
+	}
+	if !strings.Contains(out, "invalid GOSUMDB: malformed verifier id") {
+		t.Errorf("stdout = %q, want it to quote the real `go` error", out)
+	}
+}
+
 // retractedEndpoints simulates a module whose checked version (also
 // @latest's own version) is covered by a `retract` directive, with
 // proxy.golang.org and sum.golang.org both otherwise fully healthy — the
