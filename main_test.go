@@ -437,6 +437,87 @@ func TestModuleFromGoMod_BOM(t *testing.T) {
 	}
 }
 
+// TestModuleFromGoMod_BacktickQuoted is a regression test for a real bug:
+// parseModulePath ran a module-directive's raw text straight through
+// strconv.Unquote regardless of which quote character (if any) opened it.
+// strconv.Unquote treats a backtick-delimited string as an ordinary Go raw
+// string literal and happily unquotes it — Go SOURCE CODE does support
+// backtick raw strings — but go.mod's own grammar does not extend that same
+// allowance: confirmed by reading golang.org/x/mod/modfile/rule.go's
+// parseString directly, a token is only ever unquoted when it starts with a
+// literal '"'; any other token containing a '"', '\”, or '`' anywhere
+// (including one fully wrapped in matching backticks) is an unconditional
+// parse Fatal, with real go's own comment explaining why: "Other quotes are
+// reserved both for possible future expansion and to avoid confusion."
+// Confirmed live (2026-10-02, go1.24.4): a go.mod whose module directive
+// reads `module `+"`"+`example.com/foo`+"`"+` makes `go list -m`/`go build`
+// Fatal immediately and offline with `go.mod:1: invalid quoted string:
+// unquoted string cannot contain quote`.
+//
+// Before this fix, moduleFromGoMod's no-argument-mode callers instead
+// silently stripped the backticks, accepted "example.com/foo" as the module
+// path, and probed it against the real proxy.golang.org — reporting the
+// actively misleading statusModuleUnknown verdict ("check: is the repo
+// public? does the module path... typo? GOPRIVATE?") for a go.mod that
+// never had a shot at resolving at all, since it doesn't even parse.
+func TestModuleFromGoMod_BacktickQuoted(t *testing.T) {
+	for name, content := range map[string]string{
+		"single-line, whole path backtick-quoted":  "module `example.com/foo`\n\ngo 1.24\n",
+		"block form, path line backtick-quoted":    "module (\n\t`example.com/foo`\n)\n\ngo 1.24\n",
+		"empty backtick string":                    "module ``\n\ngo 1.24\n",
+		"stray backtick in an otherwise bare path": "module exa`mple.com/foo\n\ngo 1.24\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "go.mod")
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := moduleFromGoMod(path)
+			if err == nil {
+				t.Fatalf("expected an error for a module directive involving a backtick, got module %q", got)
+			}
+			if !strings.Contains(err.Error(), "invalid quoted string") || !strings.Contains(err.Error(), "cannot contain quote") {
+				t.Errorf("error %q doesn't cite real go's own `invalid quoted string: unquoted string cannot contain quote` Fatal", err)
+			}
+		})
+	}
+}
+
+// TestModuleFromGoMod_MalformedEscape confirms parseModulePath's rewrite
+// (TestModuleFromGoMod_BacktickQuoted above) also fixes a narrower,
+// same-root-cause case one call site already caught but misreported: a
+// double-quoted path with a malformed Go-string escape (e.g. an invalid
+// two-digit hex escape) was already rejected pre-fix too — strconv.Unquote
+// fails on it either way — but the old "return s unchanged on Unquote
+// failure" fallback handed modulepkg.CheckPath the raw, still-quoted
+// literal, which blamed the embedded '"' characters ("malformed module path
+// ...: invalid char '\"'") instead of citing the real, earlier go.mod-parse
+// Fatal real go actually raises: confirmed live (2026-10-02, go1.24.4) the
+// identical file fails with `invalid quoted string: invalid syntax`
+// (strconv.Unquote's own error), never reaching CheckPath's validation at
+// all.
+func TestModuleFromGoMod_MalformedEscape(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "go.mod")
+	content := "module \"example.com\\xZZ\"\n\ngo 1.24\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := moduleFromGoMod(path)
+	if err == nil {
+		t.Fatal("expected an error for a module path with a malformed Go-string escape, got none")
+	}
+	if strings.Contains(err.Error(), "malformed module path") {
+		t.Errorf("error %q wrongly blames CheckPath's module-path validation for a go.mod-parse-time Fatal that happens first in real go", err)
+	}
+	if !strings.Contains(err.Error(), "invalid quoted string") {
+		t.Errorf("error %q doesn't cite real go's own `invalid quoted string: ...` Fatal", err)
+	}
+}
+
 func TestResolveTarget_ExplicitArg(t *testing.T) {
 	module, version, err := resolveTarget([]string{"example.com/mod@v1.2.3"})
 	if err != nil {

@@ -959,6 +959,14 @@ func moduleFromGoMod(path string) (string, error) {
 // real toolchain would Fatal immediately and offline, before ever
 // resolving anything or contacting a proxy, no matter which of the two (or
 // more) module paths a user might expect to be "the real one."
+//
+// Also rejects a module path wrapped in backticks (or carrying a stray
+// unquoted `"`/`'`/backtick anywhere) instead of silently accepting it as a
+// Go raw string literal — see parseModulePath's doc comment for the
+// live-confirmed real-go Fatal this mirrors and the real bug this closes
+// (moduleFromGoMod used to strip the backticks and probe the unwrapped path
+// against the live proxy, reporting a misleading module-unknown verdict for
+// a go.mod that never had a shot at parsing in the first place).
 func moduleDirective(data string) (string, error) {
 	inBlock := false
 	blockMod := ""
@@ -981,7 +989,11 @@ func moduleDirective(data string) (string, error) {
 			if content := stripLineComment(line); moduleLineHasExtraArgs(content) {
 				return "", fmt.Errorf("has a 'module' block entry with more than one argument: %q — real `go list -m`/`go build` Fatals immediately with `usage: module module/path`, entirely offline, before ever contacting the proxy", line)
 			}
-			if m := parseModulePath(line); m != "" {
+			m, perr := parseModulePath(line)
+			if perr != nil {
+				return "", fmt.Errorf("has a 'module' block entry with an invalid path: %q — real `go list -m`/`go build` Fatals immediately with `%v`, entirely offline, before ever contacting the proxy", line, perr)
+			}
+			if m != "" {
 				// A second non-empty path line inside the same block is
 				// just as much a repeated module statement to real go as
 				// two separate top-level directives (confirmed live, see
@@ -1025,7 +1037,10 @@ func moduleDirective(data string) (string, error) {
 				// there being a second argument at all.
 				return "", fmt.Errorf("has a 'module' directive with more than one argument: %q — real `go list -m`/`go build` Fatals immediately with `usage: module module/path`, entirely offline, before ever contacting the proxy", line)
 			}
-			m := parseModulePath(rest)
+			m, perr := parseModulePath(rest)
+			if perr != nil {
+				return "", fmt.Errorf("has a 'module' directive with an invalid path: %q — real `go list -m`/`go build` Fatals immediately with `%v`, entirely offline, before ever contacting the proxy", line, perr)
+			}
 			if m == "" {
 				// e.g. a "module" line whose entire value is a "//"
 				// comment (found via mutation testing, run #125: the
@@ -1117,13 +1132,60 @@ func stripLineComment(s string) string {
 // "//" line comment (valid go.mod syntax — `go list -m` ignores it, but a
 // naive TrimSpace would fold it straight into the module path and send
 // goproxycheck probing a bogus URL) and unquotes the path if it's written
-// as a quoted Go string literal (also valid go.mod syntax, just rarer).
-func parseModulePath(s string) string {
+// as a double-quoted Go string literal (also valid go.mod syntax, just
+// rarer).
+//
+// Mirrors golang.org/x/mod/modfile's own parseString (rule.go) exactly,
+// confirmed by reading that function directly: a token is only ever
+// unquoted via strconv.Unquote when it starts with a literal '"' — any
+// other token (quoted or not) that contains a '"', '\”, or '`' ANYWHERE is
+// an unconditional parse Fatal, with real go's own comment explaining why:
+// "Other quotes are reserved both for possible future expansion and to
+// avoid confusion." Before this fix, this function instead ran s straight
+// through strconv.Unquote regardless of which quote character (if any)
+// opened it — strconv.Unquote treats a backtick-delimited string as an
+// ordinary Go raw string literal and happily unquotes it, since Go SOURCE
+// CODE does support backtick raw strings; go.mod's own grammar does not
+// extend that same allowance, confirmed live (2026-10-02) against a real
+// go1.24.4 toolchain: a go.mod whose module directive reads
+//
+//	module `example.com/foo`
+//
+// makes `go list -m`/`go build` Fatal immediately and offline with
+// `go.mod:1: invalid quoted string: unquoted string cannot contain quote`
+// — never resolving anything, let alone contacting a proxy. Before this
+// fix, moduleFromGoMod's no-argument-mode callers instead silently stripped
+// the backticks, accepted "example.com/foo" as the module path, and probed
+// it against the real proxy.golang.org, reporting the actively misleading
+// statusModuleUnknown verdict ("check: is the repo public? does the module
+// path in go.mod exactly match the repo? is it covered by a
+// GOPRIVATE/GONOSUMDB pattern? ...") for a go.mod that never had a shot at
+// resolving at all, since it doesn't even parse.
+//
+// Also fixes a narrower, same-root-cause case one call site already caught
+// but misreported: a double-quoted path with a malformed Go-string escape
+// (e.g. `module "example.com\xZZ"`, an invalid two-digit hex escape) was
+// already rejected — strconv.Unquote fails on it too — but the old
+// "return s unchanged" fallback handed modulepkg.CheckPath the raw,
+// still-quoted literal, which blamed the embedded `"` characters
+// ("malformed module path ...: invalid char '\"'") instead of citing the
+// real, earlier go.mod-parse Fatal real go actually raises here too:
+// confirmed live the identical file fails with `invalid quoted string:
+// invalid syntax` (strconv.Unquote's own error), never reaching CheckPath's
+// validation at all.
+func parseModulePath(s string) (string, error) {
 	s = stripLineComment(s)
-	if unquoted, err := strconv.Unquote(s); err == nil {
-		return unquoted
+	if strings.HasPrefix(s, `"`) {
+		unquoted, err := strconv.Unquote(s)
+		if err != nil {
+			return "", fmt.Errorf("invalid quoted string: %v", err)
+		}
+		return unquoted, nil
 	}
-	return s
+	if strings.ContainsAny(s, "\"'`") {
+		return "", fmt.Errorf("invalid quoted string: unquoted string cannot contain quote")
+	}
+	return s, nil
 }
 
 // firstGoproxyEntry returns the first comma/pipe-separated entry of the
