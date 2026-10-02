@@ -43,6 +43,7 @@ const (
 	statusNoMatchingVersion       status = "no-matching-version"
 	statusGoModUnparseable        status = "go-mod-unparseable"
 	statusGoauthMalformedLocally  status = "goauth-malformed-locally"
+	statusGoflagsModVendorLocally status = "goflags-mod-vendor-locally"
 )
 
 // isRepoCheckInconclusive reports whether a repo-reachability probe status

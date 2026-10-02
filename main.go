@@ -101,6 +101,21 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 			"your local `GOPROXY` is set to %q (via env var or `go env -w`), which contains a malformed entry (%q) — `go install`/`go get` fails outright with `%v` the moment it needs to resolve %s@%s, entirely offline, before consulting any proxy (even a perfectly healthy one listed earlier in the same chain), VCS host, or your GOPRIVATE/GONOPROXY/GOVCS config at all. "+
 				"That's your machine's own config, not a proxy-availability problem. Fix `GOPROXY` (see `go help goproxy`) — every entry needs an explicit `https://`/`http://`/`file://` scheme, or at least a dot, colon, or slash so `go` can infer `https://` for you.",
 			raw, badEntry, entryErr, module, version)}
+	} else if localGoflagsModVendor() {
+		// Checked ahead of localModulePrivate/localGoproxyOff/the direct-fetch
+		// and public-proxy-probe branches below: see localGoflagsModVendor's
+		// doc comment for the live confirmation that `-mod=vendor` (via
+		// GOFLAGS, env var or `go env -w`) Fatals real `go install`/`go get`
+		// with `cannot query module due to -mod=vendor` regardless of a
+		// matching GOPRIVATE/GONOPROXY or GOPROXY=off — the query mechanism
+		// itself is disabled process-wide, before any of those are even
+		// consulted. Checked after localGoproxyEmptyListError/
+		// localGoproxyMalformedEntryError, which still Fatal with their own,
+		// different error ahead of this one.
+		d = diagnosis{statusGoflagsModVendorLocally, fmt.Sprintf(
+			"your local `GOFLAGS` includes `-mod=vendor` (via env var or `go env -w`), which disables the module-query mechanism outright — `go install`/`go get` fails outright with `cannot query module due to -mod=vendor` the moment it needs to resolve %s@%s, entirely offline, before consulting proxy.golang.org, sum.golang.org, any VCS host, or your GOPRIVATE/GONOPROXY/GOPROXY config at all. "+
+				"That's your machine's own config, not a proxy-availability problem. Fix `GOFLAGS` (see `go help environment`) — drop the `-mod=vendor` entry, or use `-mod=mod`/`-mod=readonly` if you still want the main module's own build mode controlled explicitly.",
+			module, version)}
 	} else if priv, pattern := localModulePrivate(module); priv {
 		// Verified live: with GOPRIVATE (or GONOPROXY directly) set to a
 		// pattern matching this module, `go install`/`go get`/`go mod
@@ -1352,6 +1367,62 @@ func localGo111ModuleOff() bool {
 		return false // best-effort: don't block the real check on this
 	}
 	return strings.TrimSpace(string(out)) == "off"
+}
+
+// localGoflagsModVendor reports whether the local `go` command's effective
+// GOFLAGS (env var or persisted via `go env -w`) carries a `-mod=vendor` (or
+// `--mod=vendor`) entry. GOFLAGS is documented ("go help environment") as "a
+// space-separated list of -flag=value settings to apply to go commands by
+// default, when the given flag is known by the current command" — cmd/go
+// itself splits it on whitespace (strings.Fields) before matching each token
+// against the flags the invoked subcommand actually registers, so this
+// mirrors that: any whitespace-separated token, dash-trimmed, equal to
+// exactly "mod=vendor" counts, regardless of how many other flags share the
+// string or how much extra whitespace surrounds it.
+//
+// Confirmed live (2026-10-02, go1.26.8) that this Fatals `go install`/`go
+// get module@version` immediately and unconditionally with `cannot query
+// module due to -mod=vendor` — entirely offline, zero network trace under
+// `go install -x` — the moment it would otherwise need to resolve the
+// module, even in a directory with no go.mod and no vendor/ directory at
+// all (this isn't a vendor-consistency check against a real vendor tree;
+// `-mod=vendor` disables the module-query mechanism itself, unconditionally,
+// for any target). This holds via a bare env var and via `go env -w
+// GOFLAGS=-mod=vendor`, with `--mod=vendor` (double-dash) and extra
+// leading/trailing/interior whitespace (`"  -mod=vendor  "`, `"-x
+// -mod=vendor"`) all equally effective — but `-mod=mod`/`-mod=readonly`
+// (every other `-mod` value) are not, so this must match the literal
+// "vendor" value, not just the flag's presence.
+//
+// Verified the ordering empirically against real go, each case in its own
+// fresh GOMODCACHE to rule out module-cache contamination: `GO111MODULE=off`
+// and a malformed/empty-list `GOPROXY` both still Fatal with their own error
+// ahead of this one (so those checks, positioned earlier in run()'s dispatch
+// chain, correctly stay there) — but a matching `GOPRIVATE`/`GONOPROXY` (the
+// localModulePrivate branch below, which would otherwise claim "fetches
+// directly from VCS, never touches the proxy") and `GOPROXY=off` are both
+// still preempted by `-mod=vendor`: real `go install` Fatals on the
+// `-mod=vendor` query error regardless of either, so this check is placed
+// ahead of both in run()'s chain.
+//
+// Before this check existed, goproxycheck had no detection for this at all:
+// with GOFLAGS=-mod=vendor set and an otherwise fully live, healthy
+// module@version, it probed proxy.golang.org/sum.golang.org directly and
+// reported plain statusReady ("a plain `go install` will work") — the
+// opposite of reality, the same "local config error, not a proxy-
+// availability problem" shape already handled for GO111MODULE=off
+// (localGo111ModuleOff) and every other local*ConfigError in this file.
+func localGoflagsModVendor() bool {
+	out, err := exec.Command("go", "env", "GOFLAGS").Output()
+	if err != nil {
+		return false // best-effort: don't block the real check on this
+	}
+	for _, tok := range strings.Fields(string(out)) {
+		if strings.TrimLeft(tok, "-") == "mod=vendor" {
+			return true
+		}
+	}
+	return false
 }
 
 // goproxyEmptyListError reports the error real cmd/go's own GOPROXY-list

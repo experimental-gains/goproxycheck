@@ -320,6 +320,136 @@ func TestRun_LocalGoproxyEmptyList_OverridesLocalModulePrivate(t *testing.T) {
 	}
 }
 
+// TestRun_LocalGoflagsModVendor verifies run() short-circuits on a local
+// GOFLAGS carrying a `-mod=vendor` entry before ever probing the
+// proxy/sumdb — passing endpoints{} (a nil client) means any attempt to
+// actually probe would panic, so a clean, non-crashing
+// statusGoflagsModVendorLocally result proves the probe loop was skipped
+// entirely. This is the fix for a real bug found via live-toolchain
+// differential testing: `GOFLAGS=-mod=vendor go install
+// golang.org/x/text@v0.3.0`, run in a fresh, empty directory with no go.mod
+// and no vendor/ directory at all, fails immediately and unconditionally
+// with `cannot query module due to -mod=vendor` — confirmed live (go1.26.8)
+// with zero network trace under `go install -x` — where the identical
+// command with GOFLAGS unset reaches the proxy fine (a "downloading"
+// message, then an unrelated "not a main package" error). Before this check
+// existed, goproxycheck had no detection for GOFLAGS at all: it probed
+// proxy.golang.org/sum.golang.org directly and reported plain statusReady
+// for this exact config and an otherwise fully live module, the opposite of
+// reality. See localGoflagsModVendor's doc comment for the full live
+// verification, including the ordering tests below.
+func TestRun_LocalGoflagsModVendor(t *testing.T) {
+	t.Setenv("GOFLAGS", "-mod=vendor")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, endpoints{})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "goflags-mod-vendor-locally") {
+		t.Errorf("stdout = %q, want it to mention goflags-mod-vendor-locally", stdout.String())
+	}
+}
+
+// TestRun_LocalGoflagsModVendor_IgnoresOtherModValues is the negative
+// control for TestRun_LocalGoflagsModVendor: confirmed live that
+// `GOFLAGS=-mod=mod` (and `-mod=readonly`) do NOT make real `go install`
+// Fatal on "cannot query module due to -mod=vendor" — only the literal
+// "vendor" value does. A module@version that's actually unknown to the
+// fake proxy here proves the probe loop still ran (unknownEndpoints, not
+// endpoints{}), ruling out the check firing on any `-mod=` value rather
+// than specifically "vendor".
+func TestRun_LocalGoflagsModVendor_IgnoresOtherModValues(t *testing.T) {
+	t.Setenv("GOFLAGS", "-mod=mod")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/nope@v0.1.0"}, &stdout, &stderr, unknownEndpoints(t))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "module-unknown") {
+		t.Errorf("stdout = %q, want it to mention module-unknown (probe ran normally), not goflags-mod-vendor-locally", stdout.String())
+	}
+}
+
+// TestRun_LocalGoflagsModVendor_DoubleDashAndWhitespace confirms the token
+// match tolerates the double-dash spelling and extra surrounding
+// whitespace cmd/go itself tolerates — confirmed live that
+// `GOFLAGS="  -x  --mod=vendor  "` Fatals real `go install` identically to
+// the plain single-dash, no-extra-whitespace case.
+func TestRun_LocalGoflagsModVendor_DoubleDashAndWhitespace(t *testing.T) {
+	t.Setenv("GOFLAGS", "  -x  --mod=vendor  ")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, endpoints{})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "goflags-mod-vendor-locally") {
+		t.Errorf("stdout = %q, want it to mention goflags-mod-vendor-locally", stdout.String())
+	}
+}
+
+// TestRun_LocalGoflagsModVendor_OverridesLocalModulePrivate verifies the
+// GOFLAGS=-mod=vendor check runs before localModulePrivate, not after.
+// Confirmed live (2026-10-02), each in its own fresh GOMODCACHE:
+// `GOFLAGS=-mod=vendor GOPRIVATE=golang.org/x/text GOPROXY=direct go install
+// golang.org/x/text@v0.3.0` still fails with "cannot query module due to
+// -mod=vendor" — a matching GOPRIVATE does NOT rescue it, because
+// `-mod=vendor` disables the query mechanism itself before GOPRIVATE's
+// direct-VCS fetch path is ever consulted. Before this ordering was
+// deliberate, checking localModulePrivate first would have reported
+// statusPrivateModuleLocally here instead — claiming a direct VCS fetch
+// "will" succeed, when the real command never gets that far.
+func TestRun_LocalGoflagsModVendor_OverridesLocalModulePrivate(t *testing.T) {
+	t.Setenv("GOFLAGS", "-mod=vendor")
+	t.Setenv("GOPRIVATE", "example.com/*")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, endpoints{})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "goflags-mod-vendor-locally") {
+		t.Errorf("stdout = %q, want it to mention goflags-mod-vendor-locally, not private-module-locally", stdout.String())
+	}
+}
+
+// TestRun_LocalGoflagsModVendor_OverridesLocalGoproxyOff verifies the
+// GOFLAGS=-mod=vendor check runs before localGoproxyOff too. Confirmed live
+// (2026-10-02), fresh GOMODCACHE: `GOFLAGS=-mod=vendor GOPROXY=off go
+// install golang.org/x/text@v0.3.0` fails with "cannot query module due to
+// -mod=vendor", not "module lookup disabled by GOPROXY=off" — the
+// -mod=vendor query-rejection happens first regardless of GOPROXY's own
+// value.
+func TestRun_LocalGoflagsModVendor_OverridesLocalGoproxyOff(t *testing.T) {
+	t.Setenv("GOFLAGS", "-mod=vendor")
+	t.Setenv("GOPROXY", "off")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, endpoints{})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "goflags-mod-vendor-locally") {
+		t.Errorf("stdout = %q, want it to mention goflags-mod-vendor-locally, not goproxy-off-locally", stdout.String())
+	}
+}
+
+// TestRun_LocalGoflagsModVendor_YieldsToLocalGo111ModuleOff verifies
+// GO111MODULE=off still wins ahead of GOFLAGS=-mod=vendor, matching every
+// other local-config check in this file: confirmed live that
+// `GO111MODULE=off GOFLAGS=-mod=vendor go install golang.org/x/text@v0.3.0`
+// fails with the GO111MODULE error, not the -mod=vendor one, because module
+// mode itself never turns on.
+func TestRun_LocalGoflagsModVendor_YieldsToLocalGo111ModuleOff(t *testing.T) {
+	t.Setenv("GO111MODULE", "off")
+	t.Setenv("GOFLAGS", "-mod=vendor")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, endpoints{})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "go111module-off-locally") {
+		t.Errorf("stdout = %q, want it to mention go111module-off-locally, not goflags-mod-vendor-locally", stdout.String())
+	}
+}
+
 // TestRun_LocalGoproxyMalformedEntry verifies run() short-circuits on a
 // local GOPROXY chain containing a malformed entry — even one that's only
 // ever meant to be a fallback *after* a perfectly healthy public-proxy
