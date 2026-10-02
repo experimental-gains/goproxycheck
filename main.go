@@ -187,6 +187,31 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 				"This tool only knows how to probe the public proxy.golang.org/sum.golang.org anonymously over plain HTTP; it has no way to know your custom proxy's auth or protocol quirks, so it can't tell you whether %[2]s@%[3]s is actually ready there. "+
 				"If you're chasing a real failure, check your proxy's own logs/status instead of trusting this tool's result — or temporarily set GOPROXY=https://proxy.golang.org,direct to check against the public proxy specifically.",
 			custom, module, version)}
+	} else if goauthErr := localGoAuthConfigError(); goauthErr != nil {
+		// Checked here, immediately ahead of the branch that actually probes
+		// the public proxy over HTTPS: see goAuthConfigError's doc comment
+		// for why a malformed GOAUTH Fatals real `go` before its first HTTPS
+		// request of the whole process, regardless of module health — and
+		// why that's scoped to exactly this branch rather than every branch
+		// above it. Confirmed live (2026-10-02) that an identical malformed
+		// GOAUTH has zero effect on the GOPRIVATE/GONOPROXY-direct-fetch and
+		// GOPROXY=direct branches above: a direct git fetch of a github.com
+		// module shells out to the `git` binary via
+		// cmd/go/internal/modfetch/codehost, never touching cmd/go's own
+		// HTTPS client (and so never touching GOAUTH) at all — confirmed by
+		// running `GOAUTH=off;netrc GOPRIVATE=... GOPROXY=direct go install
+		// github.com/golang/example@latest`, which succeeds identically with
+		// or without the malformed GOAUTH. GOPROXY=off similarly never
+		// issues any HTTP request at all (an immediate, different Fatal of
+		// its own), so GOAUTH is moot there too. The "custom, no fallback"
+		// branch just above is deliberately left unchanged: this tool
+		// already declines to probe a non-public custom proxy at all (it has
+		// no way to know that proxy's scheme), so there's no basis here for
+		// claiming GOAUTH would or wouldn't Fatal before reaching it.
+		d = diagnosis{statusGoauthMalformedLocally, fmt.Sprintf(
+			"your local `GOAUTH` config is malformed (%v) — real `go install`/`go get`/`go mod download` Fatals outright with this exact error the moment it makes its first HTTPS request of the run, entirely offline and before %s@%s (or anything else) is ever checked against proxy.golang.org or sum.golang.org. "+
+				"That's your machine's own config, not a proxy-availability problem. Fix `GOAUTH` (see `go help goauth`) — e.g. `GOAUTH=netrc` for the default, or a lone `GOAUTH=off` (not combined with any other semicolon-separated entry) to disable authentication entirely.",
+			goauthErr, module, version)}
 	} else {
 		deadline := time.Now().Add(*timeout)
 		var r report
@@ -1168,6 +1193,102 @@ func localGoproxyEmptyListError() (raw string, err error) {
 	}
 	raw = strings.TrimSpace(string(out))
 	return raw, goproxyEmptyListError(raw)
+}
+
+// goAuthConfigError reports the error real cmd/go's own GOAUTH parsing
+// (runGoAuth, cmd/go/internal/auth/auth.go, verified directly against that
+// source) Fatals with for raw before the very *first* HTTPS request of the
+// entire process — confirmed directly against cmd/go/internal/web/http.go's
+// fetch closure, which calls `auth.AddCredentials(client, req, nil, "")`
+// unconditionally ahead of `client.Do(req)` for every URL with an "https"
+// scheme, and auth.AddCredentials parses the whole GOAUTH value (via a
+// `sync.Once`) the first time it's ever called in the process. Since the
+// default (and overwhelmingly common) GOPROXY is `https://proxy.golang.org`,
+// and sum.golang.org lookups are HTTPS too, this Fatals before proxy.golang.org
+// or sum.golang.org are ever contacted — entirely offline, regardless of
+// whether the target module is otherwise perfectly healthy.
+//
+// nil when raw parses cleanly: "netrc" alone (the default), "off" alone, a
+// custom auth command, a well-formed "git <absolute-dir>", or any
+// semicolon-separated combination of those that isn't one of the specific
+// Fatal shapes below.
+//
+// Confirmed live (2026-10-02), entirely offline (a deliberately
+// unreachable `https://` GOPROXY returns in ~3ms instead of timing out, vs.
+// 5+ seconds for the identical setup with a well-formed GOAUTH): both
+// `GOAUTH="off;netrc"` and `GOAUTH="netrc;;netrc"` (a stray double
+// semicolon — a natural copy-paste/templating typo) Fatal `go
+// install`/`go get`/`go mod download` of a perfectly healthy, live module
+// against the real public proxy.golang.org, before sending a single
+// request — the same "go itself would Fatal first" shape already modeled
+// for a malformed GOVCS/GOPROXY/GOSUMDB (see govcsConfigError,
+// goproxyEmptyListError, gosumdbConfigError). GOAUTH itself was only added
+// in Go 1.24 (`go help goauth`), and goproxycheck had no detection for it
+// at all before this: a malformed GOAUTH with an otherwise fully healthy
+// target module used to report plain statusReady.
+//
+// Deliberately only two of runGoAuth's Fatal conditions are modeled as
+// "empty command"/"off combined with other commands" above the switch, plus
+// the three "git <dir>" argument-shape ones below — every one of them is a
+// property of the GOAUTH string (plus, for "git", the local filesystem)
+// alone, checkable with zero network access, exactly mirroring what
+// govcsConfigError already does for GOVCS. The "netrc"/custom-command cases
+// are deliberately NOT modeled: a bad netrc file or a failing custom auth
+// command is collected and only reported later, non-fatally, if that
+// specific credential set was actually needed and still missing — not an
+// unconditional offline Fatal the way these are.
+func goAuthConfigError(raw string) error {
+	cmds := strings.Split(raw, ";")
+	// Real go processes commands in reverse order (runGoAuth's own comment:
+	// "GOAUTH commands are processed in reverse order to prioritize
+	// credentials in the order they were specified") — mirrored here so
+	// that, when more than one entry is independently malformed, this
+	// reports the same one a real `go` run would Fatal on first.
+	for i := len(cmds) - 1; i >= 0; i-- {
+		command := strings.TrimSpace(cmds[i])
+		words := strings.Fields(command)
+		if len(words) == 0 {
+			return fmt.Errorf("GOAUTH encountered an empty command (GOAUTH=%s)", raw)
+		}
+		switch words[0] {
+		case "off":
+			if len(cmds) != 1 {
+				return fmt.Errorf("GOAUTH=off cannot be combined with other authentication commands (GOAUTH=%s)", raw)
+			}
+			return nil
+		case "git":
+			if len(words) != 2 {
+				return fmt.Errorf("GOAUTH=git dir method requires an absolute path to the git working directory")
+			}
+			dir := words[1]
+			if !filepath.IsAbs(dir) {
+				return fmt.Errorf("GOAUTH=git dir method requires an absolute path to the git working directory, dir is not absolute")
+			}
+			fi, statErr := os.Stat(dir)
+			if statErr != nil {
+				return fmt.Errorf("GOAUTH=git encountered an error; cannot stat %s: %v", dir, statErr)
+			}
+			if !fi.IsDir() {
+				return fmt.Errorf("GOAUTH=git dir method requires an absolute path to the git working directory, dir is not a directory")
+			}
+		}
+	}
+	return nil
+}
+
+// localGoAuthConfigError is the go-env-reading wrapper around
+// goAuthConfigError, the same shape as localGoproxyEmptyListError/
+// localGovcsConfigError: reads the local `go` command's actual effective
+// GOAUTH (via `go env GOAUTH`, so a value persisted with `go env -w` is
+// picked up too) rather than assuming os.Getenv("GOAUTH") reflects it.
+// Best-effort like its siblings: a failed `go env` call doesn't block the
+// real check.
+func localGoAuthConfigError() error {
+	out, err := exec.Command("go", "env", "GOAUTH").Output()
+	if err != nil {
+		return nil
+	}
+	return goAuthConfigError(strings.TrimSpace(string(out)))
 }
 
 // localGoproxyNonPublic reports whether the local `go` command's effective

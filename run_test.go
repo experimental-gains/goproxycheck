@@ -1757,3 +1757,93 @@ func TestRun_NotYetIndexed_DirectFallbackNote(t *testing.T) {
 		t.Errorf("stdout = %q, want it to mention the automatic direct-fallback note", stdout.String())
 	}
 }
+
+// TestRun_LocalGoauthMalformed verifies run() short-circuits on a local
+// GOAUTH that real cmd/go's own GOAUTH parsing (runGoAuth,
+// cmd/go/internal/auth/auth.go) Fatals on — before ever probing the
+// proxy/sumdb — passing endpoints{} (a nil client) means any attempt to
+// actually probe would panic, so a clean, non-crashing
+// statusGoauthMalformedLocally result proves the probe loop was skipped
+// entirely. This is the fix for a real bug found via live-toolchain
+// differential testing: GOAUTH (added Go 1.24) is parsed, and any malformed
+// entry Fatals, before the first HTTPS request of the whole process —
+// proxy.golang.org included — confirmed live that `GOAUTH="off;netrc" go
+// install golang.org/x/text@v0.14.0` against the real, live public proxy
+// Fatals in ~3ms with "GOAUTH=off cannot be combined with other
+// authentication commands", where goproxycheck used to report plain
+// statusReady for an otherwise perfectly healthy module in that exact
+// environment.
+func TestRun_LocalGoauthMalformed(t *testing.T) {
+	t.Setenv("GOAUTH", "off;netrc")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, endpoints{})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "goauth-malformed-locally") {
+		t.Errorf("stdout = %q, want it to mention goauth-malformed-locally", stdout.String())
+	}
+}
+
+// TestRun_LocalGoauthMalformed_ReadyWhenWellFormed is the sibling control
+// for TestRun_LocalGoauthMalformed: a well-formed GOAUTH (the real default,
+// "netrc") must not trip the new check at all, letting a healthy module
+// resolve to statusReady exactly as before GOAUTH was ever modeled.
+func TestRun_LocalGoauthMalformed_ReadyWhenWellFormed(t *testing.T) {
+	t.Setenv("GOAUTH", "netrc")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, readyEndpoints(t))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "ready") {
+		t.Errorf("stdout = %q, want it to mention ready", stdout.String())
+	}
+}
+
+// TestRun_LocalGoauthMalformed_DoesNotOverrideLocalModulePrivate covers the
+// scope boundary documented on goAuthConfigError/its call site in run():
+// confirmed live (2026-10-02) that an identical malformed GOAUTH has ZERO
+// effect on a direct git fetch of a github.com module — `GOAUTH=off;netrc
+// GOPRIVATE=github.com/golang/example GOPROXY=direct go install
+// github.com/golang/example@latest` succeeds identically with or without
+// the malformed GOAUTH, because real go's direct-VCS fetch for a recognized
+// host pattern shells out to the `git` binary directly, never touching
+// cmd/go's own HTTPS client (and so never touching GOAUTH) at all. A naive
+// implementation checking GOAUTH ahead of localModulePrivate would
+// incorrectly report goauth-malformed-locally here instead of the correct
+// private-module-locally.
+func TestRun_LocalGoauthMalformed_DoesNotOverrideLocalModulePrivate(t *testing.T) {
+	t.Setenv("GOAUTH", "off;netrc")
+	t.Setenv("GOPRIVATE", "example.com/*")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, endpoints{})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "private-module-locally") {
+		t.Errorf("stdout = %q, want it to mention private-module-locally, not goauth-malformed-locally", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "goauth-malformed-locally") {
+		t.Errorf("stdout = %q, want it NOT to mention goauth-malformed-locally", stdout.String())
+	}
+}
+
+// TestRun_LocalGoauthMalformed_DoesNotOverrideGoproxyOff covers the same
+// scope boundary for the other branch that never issues an HTTP request at
+// all: GOPROXY=off fails with its own, different, immediate Fatal
+// ("module lookup disabled by GOPROXY=off") before GOAUTH is ever
+// consulted, so goproxycheck must keep reporting goproxy-off-locally here,
+// not goauth-malformed-locally.
+func TestRun_LocalGoauthMalformed_DoesNotOverrideGoproxyOff(t *testing.T) {
+	t.Setenv("GOAUTH", "off;netrc")
+	t.Setenv("GOPROXY", "off")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/mod@v0.1.0"}, &stdout, &stderr, endpoints{})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "goproxy-off-locally") {
+		t.Errorf("stdout = %q, want it to mention goproxy-off-locally, not goauth-malformed-locally", stdout.String())
+	}
+}

@@ -108,6 +108,25 @@ actually seeing:
   is more specific) and reports a distinct `govcs-disallowed-locally`
   diagnosis instead of the misleading `private-module-locally`/
   `goproxy-direct-locally` verdict.
+- `GOAUTH=off cannot be combined with other authentication commands` /
+  `GOAUTH encountered an empty command` — your local `GOAUTH` (added in Go
+  1.24, see `go help goauth`) is malformed. This Fatals `go
+  install`/`go get`/`go mod download` the moment they make their *first*
+  HTTPS request of the whole process — `proxy.golang.org`/`sum.golang.org`
+  included — entirely offline, regardless of whether the module you're
+  checking is otherwise perfectly healthy: confirmed live (2026-10-02) that
+  `GOAUTH="off;netrc"` (or a stray leading/trailing/doubled `;`, a natural
+  copy-paste or templating typo) fails `go install
+  golang.org/x/text@v0.14.0` against the real, live public proxy in ~3ms,
+  versus 1.3s+ for the identical command with a well-formed `GOAUTH`.
+  `goproxycheck` checks this *before* probing (via `go env GOAUTH`) and
+  reports it as a distinct `goauth-malformed-locally` diagnosis instead of
+  a false `ready` — confirmed live this doesn't affect a direct `git`
+  fetch of a `github.com` module (the `private-module-locally`/
+  `goproxy-direct-locally` cases above), since that bypasses `cmd/go`'s own
+  HTTPS client entirely — so the check is scoped to only the branch that
+  actually probes a proxy over HTTPS, the same branch this diagnosis
+  preempts.
 - `git ls-remote -q origin ... exit status 128` / `could not read
   Username for 'https://github.com'` — this one bypasses the module
   proxy protocol entirely (Go fell back to a direct VCS fetch). Usually
