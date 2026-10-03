@@ -518,6 +518,285 @@ func TestModuleFromGoMod_MalformedEscape(t *testing.T) {
 	}
 }
 
+// TestModuleFromGoMod_MalformedIgnoreDirective is a regression test for a
+// real bug: the `ignore` go.mod directive (golang.org/x/mod/modfile v0.41.0
+// parses it; go1.24.4 — the system toolchain on this box — does not even
+// recognize it, confirmed live) Fatals real `go list -m`/`go build`
+// immediately and entirely offline with `ignore directive expects exactly
+// one argument` whenever it's given zero or more than one argument — in
+// either its single-line form or inside its parenthesized block form.
+// Confirmed live (go1.26.8, 2026-10-03) for every shape in this table.
+//
+// Before this fix, moduleFromGoMod had no awareness of `ignore` at all —
+// moduleDirective's scanner only ever recognizes `module` lines — so a
+// go.mod broken this way sailed straight through unflagged: the module
+// path was extracted normally and probed against the live proxy as if the
+// file were perfectly ordinary, when the real toolchain can't even parse
+// it, let alone resolve a single requirement.
+func TestModuleFromGoMod_MalformedIgnoreDirective(t *testing.T) {
+	for name, content := range map[string]string{
+		"bare ignore, no argument": "module example.com/foo\n\ngo 1.26\n\nignore\n",
+		"two unquoted arguments":   "module example.com/foo\n\ngo 1.26\n\nignore ./a ./b\n",
+		"trailing comment doesn't count as an arg, this one's still bare": "module example.com/foo\n\ngo 1.26\n\nignore // nothing here\n",
+		"block form, one entry with two arguments":                        "module example.com/foo\n\ngo 1.26\n\nignore (\n\t./a ./b\n)\n",
+		"block form, one empty-looking entry":                             "module example.com/foo\n\ngo 1.26\n\nignore (\n\t./a\n\t\n\t./b ./c\n)\n",
+		"no-space-before-paren block, bad entry":                          "module example.com/foo\n\ngo 1.26\n\nignore(\n\t./a ./b\n)\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "go.mod")
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := moduleFromGoMod(path)
+			if err == nil {
+				t.Fatalf("expected an error for a malformed 'ignore' directive, got module %q", got)
+			}
+			if !strings.Contains(err.Error(), "ignore directive expects exactly one argument") {
+				t.Errorf("error %q doesn't cite real go's own `ignore directive expects exactly one argument` Fatal", err)
+			}
+		})
+	}
+}
+
+// TestModuleFromGoMod_WellFormedIgnoreDirectiveNotRejected confirms the fix
+// for TestModuleFromGoMod_MalformedIgnoreDirective stays narrowly scoped to
+// a genuine argument-count mismatch: a well-formed single-argument `ignore`
+// line, in every shape real go accepts (single-line, block form, block form
+// with no space before the opening paren, multiple one-argument block
+// entries), must not be rejected.
+func TestModuleFromGoMod_WellFormedIgnoreDirectiveNotRejected(t *testing.T) {
+	for name, content := range map[string]string{
+		"single-line":                 "module example.com/foo\n\ngo 1.26\n\nignore ./vendor\n",
+		"single-line with comment":    "module example.com/foo\n\ngo 1.26\n\nignore ./vendor // generated\n",
+		"block form":                  "module example.com/foo\n\ngo 1.26\n\nignore (\n\t./vendor\n)\n",
+		"block form, two entries":     "module example.com/foo\n\ngo 1.26\n\nignore (\n\t./vendor\n\t./testdata\n)\n",
+		"no-space-before-paren block": "module example.com/foo\n\ngo 1.26\n\nignore(\n\t./vendor\n)\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "go.mod")
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := moduleFromGoMod(path)
+			if err != nil {
+				t.Fatalf("unexpected error for a well-formed 'ignore' directive: %v", err)
+			}
+			if want := "example.com/foo"; got != want {
+				t.Errorf("got %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// TestHasIgnoreDirective pins hasIgnoreDirective's presence-only scan,
+// independent of the argument-shape questions TestModuleFromGoMod_
+// MalformedIgnoreDirective/WellFormedIgnoreDirectiveNotRejected already
+// cover.
+func TestHasIgnoreDirective(t *testing.T) {
+	cases := []struct {
+		name string
+		data string
+		want bool
+	}{
+		{"no ignore directive at all", "module example.com/foo\n\ngo 1.26\n", false},
+		{"single-line", "module example.com/foo\n\ngo 1.26\n\nignore ./vendor\n", true},
+		{"block form", "module example.com/foo\n\ngo 1.26\n\nignore (\n\t./vendor\n)\n", true},
+		{"no-space-before-paren block", "module example.com/foo\n\ngo 1.26\n\nignore(\n\t./vendor\n)\n", true},
+		{"bare, no argument", "module example.com/foo\n\ngo 1.26\n\nignore\n", true},
+		{"a module path that merely starts with the substring 'ignore'", "module example.com/ignoreme\n\ngo 1.26\n", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := hasIgnoreDirective(c.data); got != c.want {
+				t.Errorf("hasIgnoreDirective(%q) = %v, want %v", c.data, got, c.want)
+			}
+		})
+	}
+}
+
+// TestGoDirectiveVersion pins goDirectiveVersion's extraction of a go.mod's
+// own `go` directive version string.
+func TestGoDirectiveVersion(t *testing.T) {
+	cases := []struct {
+		name string
+		data string
+		want string
+	}{
+		{"ordinary", "module example.com/foo\n\ngo 1.26.8\n", "1.26.8"},
+		{"two-component version", "module example.com/foo\n\ngo 1.21\n", "1.21"},
+		{"trailing comment", "module example.com/foo\n\ngo 1.21 // pinned\n", "1.21"},
+		{"tab separator", "module example.com/foo\n\ngo\t1.21\n", "1.21"},
+		{"no go directive at all", "module example.com/foo\n", ""},
+		{"godebug is not mistaken for go", "module example.com/foo\n\ngodebug httpmux=1\n", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := goDirectiveVersion(c.data); got != c.want {
+				t.Errorf("goDirectiveVersion(%q) = %q, want %q", c.data, got, c.want)
+			}
+		})
+	}
+}
+
+// TestGoVersionAtLeast pins goVersionAtLeast's major.minor comparison,
+// including the "go"-prefixed form `go env GOVERSION` actually returns.
+func TestGoVersionAtLeast(t *testing.T) {
+	cases := []struct {
+		version      string
+		major, minor int
+		want         bool
+	}{
+		{"1.25.0", 1, 25, true},
+		{"go1.25.0", 1, 25, true},
+		{"1.26.8", 1, 25, true},
+		{"1.25", 1, 25, true},
+		{"1.24.4", 1, 25, false},
+		{"go1.24.4", 1, 25, false},
+		{"2.0", 1, 25, true},
+		{"0.9", 1, 25, false},
+		{"", 1, 25, false},
+		{"1", 1, 25, false},
+		{"garbage", 1, 25, false},
+	}
+	for _, c := range cases {
+		t.Run(c.version, func(t *testing.T) {
+			if got := goVersionAtLeast(c.version, c.major, c.minor); got != c.want {
+				t.Errorf("goVersionAtLeast(%q, %d, %d) = %v, want %v", c.version, c.major, c.minor, got, c.want)
+			}
+		})
+	}
+}
+
+// TestIgnoreDirectiveTooOldError_NoIgnoreDirective confirms a go.mod with no
+// `ignore` directive at all is never flagged, regardless of its own `go`
+// line or the (deliberately low, to prove it's irrelevant here) local
+// version passed in — this check has nothing to say about a file it
+// doesn't apply to.
+func TestIgnoreDirectiveTooOldError_NoIgnoreDirective(t *testing.T) {
+	if err := ignoreDirectiveTooOldError("module example.com/foo\n\ngo 1.21\n", "go1.20.0"); err != nil {
+		t.Errorf("unexpected error for a go.mod with no 'ignore' directive: %v", err)
+	}
+}
+
+// TestIgnoreDirectiveTooOldError_OwnGoDirectiveSatisfies confirms a go.mod
+// whose own `go` directive already requires go1.25 or newer is never
+// flagged — passing a deliberately low localVersion ("go1.20.0") proves the
+// own-`go`-directive short-circuit fires before localVersion is even
+// consulted.
+func TestIgnoreDirectiveTooOldError_OwnGoDirectiveSatisfies(t *testing.T) {
+	if err := ignoreDirectiveTooOldError("module example.com/foo\n\ngo 1.26\n\nignore ./vendor\n", "go1.20.0"); err != nil {
+		t.Errorf("unexpected error for a go.mod whose own 'go' directive (1.26) already satisfies go1.25+: %v", err)
+	}
+}
+
+// TestIgnoreDirectiveTooOldError_TooOld is a regression test for a real bug
+// shared with sibling tool goprivaudit (fixed there in v0.1.82, this
+// project's testing-practice technique #116): a go.mod whose own `go`
+// directive stays below 1.25 falls back to the toolchain that would
+// actually run it (ordinarily localGoVersion()'s live `go env GOVERSION`
+// result, pinned here to a literal string instead — see
+// ignoreDirectiveTooOldError's doc comment for why this function takes
+// that as a parameter rather than calling localGoVersion() itself) — and
+// when that's also below 1.25, `ignore` isn't recognized as a go.mod
+// directive at all: a real `go list -m`/`go build` Fatals with `unknown
+// directive: ignore`, entirely offline, before resolving anything — even
+// though the directive's own single argument is perfectly well-formed.
+// Live-verified (2026-10-03): a from-scratch go.mod reading only `module
+// example.com/foo`, `go 1.21`, and `ignore ./vendor` makes a real go1.24.4
+// (GOTOOLCHAIN=auto, no override) Fatal instantly this exact way,
+// GOPROXY=off, zero network access. `go mod edit -ignore=path`, run with a
+// newer local toolchain, is a realistic way to produce exactly this
+// shape: it does not bump the file's own `go` line to cover the directive
+// it just added (also live-verified, with a real go1.26.8 toolchain).
+func TestIgnoreDirectiveTooOldError_TooOld(t *testing.T) {
+	err := ignoreDirectiveTooOldError("module example.com/foo\n\ngo 1.21\n\nignore ./vendor\n", "go1.24.4")
+	if err == nil {
+		t.Fatal("expected an error for an 'ignore' directive older than both the file's own `go` line and the local toolchain, got none")
+	}
+	if !strings.Contains(err.Error(), "unknown directive: ignore") {
+		t.Errorf("error %q doesn't cite real go's own `unknown directive: ignore` Fatal", err)
+	}
+}
+
+// TestIgnoreDirectiveTooOldError_LocalVersionSatisfies is the mirror image
+// of TestIgnoreDirectiveTooOldError_TooOld: the file's own `go` directive
+// is too low, but the toolchain actually selected to run it (e.g. because
+// GOTOOLCHAIN=auto picked a newer one, or `-toolchain` pinned one) is
+// go1.25+, so `ignore` resolves fine and there's nothing to flag.
+func TestIgnoreDirectiveTooOldError_LocalVersionSatisfies(t *testing.T) {
+	if err := ignoreDirectiveTooOldError("module example.com/foo\n\ngo 1.21\n\nignore ./vendor\n", "go1.26.8"); err != nil {
+		t.Errorf("unexpected error when the locally selected toolchain (go1.26.8) satisfies go1.25+: %v", err)
+	}
+}
+
+// TestIgnoreDirectiveTooOldError_UnresolvableLocalVersion confirms the
+// fail-open convention every other go-env-derived check in this file
+// already uses: an empty localVersion (meaning the `go env GOVERSION` call
+// itself failed) must not be treated as "too old."
+func TestIgnoreDirectiveTooOldError_UnresolvableLocalVersion(t *testing.T) {
+	if err := ignoreDirectiveTooOldError("module example.com/foo\n\ngo 1.21\n\nignore ./vendor\n", ""); err != nil {
+		t.Errorf("unexpected error for an unresolvable local version: %v", err)
+	}
+}
+
+// TestModuleFromGoMod_IgnoreDirectiveTooOldForToolchain is the
+// moduleFromGoMod-level counterpart of TestIgnoreDirectiveTooOldError_
+// TooOld, confirming the check is actually wired into the no-argument CLI
+// mode's real entry point (via the real localGoVersion(), not a pinned
+// string), not just reachable in isolation.
+//
+// Runs `go env GOVERSION` for real, so — like TestResolveTarget_
+// FallbackToGoModAndGitTag just below — it `t.Chdir`s into a tempdir
+// holding only the fixture go.mod, rather than running from this
+// repository's own directory: goproxycheck's own go.mod pins go1.26.8,
+// and GOTOOLCHAIN=auto's toolchain switch prepends that toolchain's own
+// bin directory to PATH for the rest of the process tree — which would
+// otherwise mask the exact "ambient toolchain is below go1.25" case this
+// test needs, regardless of which directory `go env GOVERSION` itself
+// runs in. PATH is reset to drop that prepended entry so the plain
+// system `go` (confirmed live, 2026-10-03, as go1.24.4 on this box) is
+// the one actually exec'd.
+func TestModuleFromGoMod_IgnoreDirectiveTooOldForToolchain(t *testing.T) {
+	if systemPath := systemGoDir(t); systemPath != "" {
+		t.Setenv("PATH", systemPath+string(os.PathListSeparator)+os.Getenv("PATH"))
+	}
+	dir := t.TempDir()
+	t.Chdir(dir)
+	path := filepath.Join(dir, "go.mod")
+	content := "module example.com/foo\n\ngo 1.21\n\nignore ./vendor\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := moduleFromGoMod(path)
+	if err == nil {
+		t.Fatalf("expected an error for an 'ignore' directive too new for the selected toolchain, got module %q", got)
+	}
+	if !strings.Contains(err.Error(), "unknown directive: ignore") {
+		t.Errorf("error %q doesn't cite real go's own `unknown directive: ignore` Fatal", err)
+	}
+}
+
+// systemGoDir returns the directory containing the plain system `go`
+// binary (resolved via the symlink chain from /usr/bin/go), or "" if that
+// path doesn't exist — used only to put the real system toolchain ahead
+// of any GOTOOLCHAIN-prepended entry already in PATH, see
+// TestModuleFromGoMod_IgnoreDirectiveTooOldForToolchain.
+func systemGoDir(t *testing.T) string {
+	t.Helper()
+	const systemGo = "/usr/bin/go"
+	resolved, err := filepath.EvalSymlinks(systemGo)
+	if err != nil {
+		t.Skipf("no system go at %s to isolate from this repo's own GOTOOLCHAIN-selected one: %v", systemGo, err)
+		return ""
+	}
+	return filepath.Dir(resolved)
+}
+
 func TestResolveTarget_ExplicitArg(t *testing.T) {
 	module, version, err := resolveTarget([]string{"example.com/mod@v1.2.3"})
 	if err != nil {

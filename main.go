@@ -913,6 +913,27 @@ func moduleFromGoMod(path string) (string, error) {
 	if strings.HasPrefix(string(data), utf8BOM) {
 		return "", fmt.Errorf("%s begins with a UTF-8 byte order mark — a real `go list -m`/`go build` Fatals immediately with `go.mod:1: unexpected input character`, entirely offline, before ever contacting the proxy, so this could never resolve regardless of the repo or proxy config. Re-save the file as plain UTF-8 without a byte-order mark and try again", path)
 	}
+	if lineErr := ignoreDirectiveTooOldError(string(data), localGoVersion()); lineErr != nil {
+		// Checked ahead of ignoreDirectiveArgCountError just below: see
+		// ignoreDirectiveTooOldError's doc comment for the live confirmation
+		// that when the toolchain actually selected to run this file
+		// doesn't recognize `ignore` as a verb AT ALL, real go Fatals with
+		// `unknown directive: ignore` regardless of the directive's own
+		// argument count — an unrecognized verb never reaches argument-count
+		// validation in the first place.
+		return "", fmt.Errorf("%s %s, entirely offline, before ever contacting the proxy, so this could never resolve regardless of the repo or proxy config", path, lineErr)
+	}
+	if lineErr := ignoreDirectiveArgCountError(string(data)); lineErr != nil {
+		// See ignoreDirectiveArgCountError's doc comment for the live
+		// confirmation (go1.26.8, 2026-10-03) that a malformed `ignore`
+		// directive anywhere in the file Fatals real `go list -m`/`go build`
+		// immediately and entirely offline — before the module directive
+		// (checked right below) or anything else is ever resolved, let alone
+		// a proxy contacted. moduleDirective's scanner only ever recognizes
+		// `module` lines, so without this check a go.mod this broken sailed
+		// straight through unflagged.
+		return "", fmt.Errorf("%s %s, entirely offline, before ever contacting the proxy, so this could never resolve regardless of the repo or proxy config", path, lineErr)
+	}
 	mod, err := moduleDirective(string(data))
 	if err != nil {
 		return "", fmt.Errorf("%s %w", path, err)
@@ -940,6 +961,253 @@ func moduleFromGoMod(path string) (string, error) {
 		return "", fmt.Errorf("%s has a 'module' directive with an invalid path %q — a real `go list -m`/`go build` rejects this exact string immediately with `%v`, entirely offline, before ever contacting the proxy, so this could never resolve regardless of the repo or proxy config. Check for a stray character, leading/trailing dot, or non-ASCII letter in the module path", path, mod, err)
 	}
 	return mod, nil
+}
+
+// hasIgnoreDirective reports whether data — a go.mod file's raw body —
+// contains a top-level `ignore` directive at all, single-line or inside
+// its parenthesized block form. A pure presence check (unlike
+// ignoreDirectiveArgCountError, which also validates the directive's
+// shape) — used only by ignoreDirectiveTooOldError, which needs to know
+// whether `ignore` appears at all before it's worth asking `go env
+// GOVERSION` which toolchain would actually try to parse it.
+func hasIgnoreDirective(data string) bool {
+	for _, raw := range strings.Split(data, "\n") {
+		line := strings.TrimSpace(raw)
+		rest, ok := strings.CutPrefix(line, "ignore")
+		if ok && (rest == "" || rest[0] == ' ' || rest[0] == '\t' || rest[0] == '(' || strings.HasPrefix(rest, "//")) {
+			return true
+		}
+	}
+	return false
+}
+
+// goDirectiveVersion extracts a go.mod's own `go` directive version string
+// (e.g. "1.26.8" or "1.21") from data, or "" if the file has no `go`
+// directive at all. Unlike `module`, the `go` directive (along with
+// `toolchain`) is never written in parenthesized block form — confirmed
+// against golang.org/x/mod/modfile/rule.go's block-open verb set, which
+// lists `module`/`godebug`/`require`/`exclude`/`replace`/`retract`/`tool`/
+// `ignore` but not `go`/`toolchain` — so unlike moduleDirective this needs
+// no block-tracking at all.
+func goDirectiveVersion(data string) string {
+	for _, raw := range strings.Split(data, "\n") {
+		line := strings.TrimSpace(raw)
+		rest, ok := strings.CutPrefix(line, "go")
+		if ok && (rest == "" || rest[0] == ' ' || rest[0] == '\t') {
+			return strings.TrimSpace(stripLineComment(rest))
+		}
+	}
+	return ""
+}
+
+// goVersionAtLeast reports whether a go version string (e.g. "1.26.8" or
+// "1.21", with or without a leading "go" — any such prefix is stripped
+// first) is at least major.minor. Returns false for an empty or
+// unparsable version.
+func goVersionAtLeast(version string, major, minor int) bool {
+	version = strings.TrimPrefix(strings.TrimSpace(version), "go")
+	parts := strings.SplitN(version, ".", 3)
+	if len(parts) < 2 {
+		return false
+	}
+	vMajor, err1 := strconv.Atoi(parts[0])
+	vMinor, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	if vMajor != major {
+		return vMajor > major
+	}
+	return vMinor >= minor
+}
+
+// localGoVersion returns the version `go env GOVERSION` reports in the
+// current directory (e.g. "go1.24.4"), or "" if the command fails for any
+// reason. Running `go env` (for any variable, not just this one) already
+// performs GOTOOLCHAIN=auto's full toolchain selection — including
+// downloading a newer toolchain if this go.mod's own `go`/`toolchain`
+// directive demands one — before it ever gets to the deeper go.mod
+// semantic parsing where an unrecognized verb like a too-new `ignore`
+// directive would Fatal; confirmed live (2026-10-03) that `go env
+// GOVERSION` succeeds and reports the correctly-selected toolchain version
+// even when the same go.mod's `ignore` directive is itself malformed or
+// unrecognized by that exact version.
+func localGoVersion() string {
+	out, err := exec.Command("go", "env", "GOVERSION").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// ignoreDirectiveTooOldError reports an error if data's go.mod contains a
+// top-level `ignore` directive (see hasIgnoreDirective) that the toolchain
+// actually selected to run this file cannot recognize as a directive at
+// all — making every module-aware `go` subcommand Fatal with `go.mod:N:
+// unknown directive: ignore` before resolving a single module, regardless
+// of whether the directive's own argument count would otherwise be valid
+// (see ignoreDirectiveArgCountError, a separate, later-stage check).
+//
+// `ignore` is a comparatively new go.mod directive: confirmed absent from
+// golang.org/x/mod/modfile as vendored into go1.24.4's own cmd/go (no
+// "ignore" case anywhere in its verb switch) and present starting
+// go1.25.14/go1.26.0 (read directly from each toolchain's own vendored
+// modfile/rule.go — matches goprivaudit's independent finding of the same
+// cutoff, technique #90/#116 in this project's testing-practice catalog).
+// Whether a given go.mod's `ignore` line parses at all depends on which
+// toolchain binary ends up running it, governed by GOTOOLCHAIN (default
+// "auto"): the effective version is max(the locally installed/selected go
+// version, whatever this go.mod's own `go`/`toolchain` directive
+// requires) — go never downgrades, and only attempts to download a newer
+// toolchain when the file's own stated requirement exceeds what's already
+// installed/selected. So this only fires when BOTH halves of that max are
+// below 1.25: the file's own `go` directive requires less than 1.25 (an
+// absent `go` line counts as unsatisfied too), AND localGoVersion() — the
+// toolchain actually installed/selected for this directory, which already
+// reflects any GOTOOLCHAIN upgrade this go.mod's own directives would
+// trigger — is ALSO below 1.25.
+//
+// This is a realistic shape, not a contrived one: `go mod edit
+// -ignore=path`, run with a newer local toolchain, does NOT bump the
+// file's own `go` line to cover the directive it just added — live-
+// verified (2026-10-03) running it with a real go1.26.8 toolchain.
+// Live-verified end-to-end: a from-scratch go.mod reading only `module
+// example.com/foo`, `go 1.21`, and `ignore ./testdata` makes a real
+// go1.24.4 (GOTOOLCHAIN=auto, no override — the toolchain this sandbox's
+// `go env GOVERSION` actually selects for a `go 1.21` file) Fatal
+// instantly with `go.mod:5: unknown directive: ignore`, GOPROXY=off, zero
+// network access — even with the directive's own single argument
+// perfectly well-formed. Before this fix, moduleFromGoMod's no-argument-
+// mode callers had no awareness of this toolchain-gating at all: the
+// module path was extracted normally and probed against the live proxy as
+// if the file were perfectly ordinary.
+//
+// localVersion is the toolchain that would actually run data (ordinarily
+// localGoVersion()'s live result, taken as a parameter — rather than
+// called directly — so tests can pin it instead of depending on this
+// sandbox's own ambient toolchain; mirrors goprivaudit's identical
+// `-goversion`-override split for the exact same reason, see that tool's
+// goModHasIgnoreDirectiveTooOld). An unresolvable value (empty, meaning
+// the `go env` call itself failed) fails open here, same convention as
+// every other go-env-derived check in this file when the environment fact
+// it needs can't be pinned down.
+func ignoreDirectiveTooOldError(data, localVersion string) error {
+	if !hasIgnoreDirective(data) {
+		return nil
+	}
+	if goVersionAtLeast(goDirectiveVersion(data), 1, 25) {
+		return nil
+	}
+	if localVersion == "" || goVersionAtLeast(localVersion, 1, 25) {
+		return nil
+	}
+	return fmt.Errorf("has an 'ignore' directive, but neither its own `go` directive (%q) nor the locally selected toolchain (%s) is go1.25 or newer — `ignore` wasn't recognized as a go.mod directive before go1.25, so `go list -m`/`go build` Fatals immediately with `unknown directive: ignore`", goDirectiveVersion(data), localVersion)
+}
+
+// ignoreDirectiveArgCountError scans data — a go.mod file's raw body — for
+// an `ignore` directive, single-line or inside its parenthesized block
+// form (both forms accept an optional or missing space before the opening
+// paren, exactly like `module`'s own block form — see moduleDirective's
+// doc comment — confirmed live, 2026-10-03, go1.26.8, that `ignore(` alone
+// on its own line opens a block identically to `ignore (`), carrying
+// anything other than exactly one argument.
+//
+// `ignore` is a comparatively new go.mod directive: golang.org/x/mod/
+// modfile v0.41.0 (this repo's own pinned version) parses it, but the
+// go1.24.4 toolchain installed on this box does not recognize it at all —
+// confirmed live it Fatals instead with `go.mod:N: unknown directive:
+// ignore`, a different, unrelated failure this function deliberately
+// leaves alone: that toolchain-gating question (is the `go` directive, or
+// the toolchain actually selected, too old to know `ignore` exists at
+// all) is ignoreDirectiveTooOldError's job, checked ahead of this one in
+// moduleFromGoMod — this function only ever runs once that check has
+// already confirmed `ignore` IS a recognized verb for this file. Despite
+// being new, `ignore`'s own grammar is unremarkable: golang.org/x/mod/
+// modfile/rule.go's
+// parseVerb gives it the exact same "expects exactly one argument" rule
+// as `tool`/`godebug` (case "ignore": `if len(args) != 1 { errorf("ignore
+// directive expects exactly one argument") }`) — confirmed live
+// (go1.26.8, 2026-10-03) that a go.mod carrying a bare `ignore` line (zero
+// arguments), `ignore ./a ./b` (two unquoted tokens on one line), or the
+// equivalent two-argument shape written as one entry inside an `ignore
+// (...)` block all Fatal `go list -m`/`go build`/`go install` immediately
+// and entirely offline with `ignore directive expects exactly one
+// argument`, before ever resolving a single requirement or contacting a
+// proxy — while a well-formed single-argument `ignore` line (or block
+// entry) builds and resolves completely normally.
+//
+// Before this check, moduleFromGoMod's no-argument-mode callers (the
+// shipped GitHub Action's default invocation, reading ./go.mod with no
+// CLI argument) had no awareness of the `ignore` directive at all:
+// moduleDirective's scanner only ever recognizes lines starting with
+// `module`, so a go.mod broken this way sailed straight through
+// unflagged — module path extracted normally, then probed against the
+// live proxy and reported ready (or whatever the proxy/sumdb state
+// happened to say) as if the file were perfectly ordinary, when the real
+// toolchain can't even parse it, let alone get as far as resolving a
+// single requirement.
+//
+// Deliberately narrower than a full golang.org/x/mod/modfile.Parse
+// delegation would be: it only ever flags an argument-COUNT mismatch
+// (matching this function's name), not a malformed quoted-string argument
+// (e.g. `ignore "unterminated`, confirmed live to Fatal with its own,
+// different lexer-level error, `unexpected newline in string`) — a
+// narrower, rarer gap left unfixed here as a deliberate scope boundary,
+// the same way moduleLineHasExtraArgs's sibling check for `module`
+// deliberately leaves quoted-path content validation to parseModulePath's
+// own separate, already-existing check rather than folding every
+// character-level go.mod lexer rule into one function.
+func ignoreDirectiveArgCountError(data string) error {
+	inBlock := false
+	lineNo := 0
+	for _, raw := range strings.Split(data, "\n") {
+		lineNo++
+		line := strings.TrimSpace(raw)
+		if inBlock {
+			content := stripLineComment(line)
+			if content == ")" {
+				inBlock = false
+				continue
+			}
+			if content != "" {
+				if err := ignoreEntryArgCountError(content, lineNo); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		rest, ok := strings.CutPrefix(line, "ignore")
+		if !ok || !(rest == "" || rest[0] == ' ' || rest[0] == '\t' || rest[0] == '(' || strings.HasPrefix(rest, "//")) {
+			continue
+		}
+		rest = strings.TrimSpace(rest)
+		if stripLineComment(rest) == "(" {
+			inBlock = true
+			continue
+		}
+		if err := ignoreEntryArgCountError(stripLineComment(rest), lineNo); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ignoreEntryArgCountError checks a single `ignore` directive's argument
+// text (content after the verb, or a block entry line — either way, with
+// any trailing "//" comment already stripped) for the zero-argument or
+// more-than-one-argument shapes ignoreDirectiveArgCountError's doc comment
+// describes, reusing moduleLineHasExtraArgs's existing quote-aware
+// token-count logic (shared across both directives since go.mod's lexer
+// treats a quoted string as exactly one token for either verb alike).
+func ignoreEntryArgCountError(content string, lineNo int) error {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return fmt.Errorf("has an 'ignore' directive on line %d with no argument — real `go list -m`/`go build` Fatals immediately with `ignore directive expects exactly one argument`", lineNo)
+	}
+	if moduleLineHasExtraArgs(content) {
+		return fmt.Errorf("has an 'ignore' directive on line %d with more than one argument (%q) — real `go list -m`/`go build` Fatals immediately with `ignore directive expects exactly one argument`", lineNo, content)
+	}
+	return nil
 }
 
 // moduleDirective extracts the module path from a go.mod-format body's
