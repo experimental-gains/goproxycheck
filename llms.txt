@@ -17,5 +17,11 @@ set of causes, not a guess.
 - [README](https://github.com/experimental-gains/goproxycheck/blob/main/README.md): full diagnosis list, exit codes, and example output
 - [pkg.go.dev](https://pkg.go.dev/github.com/experimental-gains/goproxycheck): generated Go API docs
 
+## Related
+- [goprivaudit](https://github.com/experimental-gains/goprivaudit): audits GOPRIVATE/GONOSUMDB config for sumdb leaks
+- [modslop](https://github.com/experimental-gains/modslop): flags hallucinated/slopsquatted Go module paths
+- [slopcheck](https://github.com/experimental-gains/slopcheck): same hallucinated-name check for PyPI/npm
+- [hfaudit](https://github.com/experimental-gains/hfaudit): same check for Hugging Face Hub model/dataset IDs
+
 ## Repo
 - [Source](https://github.com/experimental-gains/goproxycheck): MIT-licensed, zero dependencies, currently at v0.1.90

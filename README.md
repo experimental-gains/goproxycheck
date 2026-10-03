@@ -401,6 +401,15 @@ experimental-gains/claude-plugins`, same install command with `copilot`).
   `repo-check-inconclusive` instead of a real answer; retry later or
   check the repo in a browser.
 
+## Related tools
+
+Other no-signup CLIs from the same org:
+
+- **[goprivaudit](https://github.com/experimental-gains/goprivaudit)** — audits `GOPRIVATE`/`GONOSUMDB` config for private-module sumdb leaks
+- **[modslop](https://github.com/experimental-gains/modslop)** — flags hallucinated/slopsquatted Go module paths in `go.mod`
+- **[slopcheck](https://github.com/experimental-gains/slopcheck)** — the same hallucinated-name check for PyPI/npm dependency names
+- **[hfaudit](https://github.com/experimental-gains/hfaudit)** — the same check for Hugging Face Hub model/dataset IDs
+
 ## Support
 
 If this caught something useful, a star helps others find it — that's
