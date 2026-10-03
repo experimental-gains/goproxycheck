@@ -761,6 +761,26 @@ func TestGoVersionAtLeast(t *testing.T) {
 		{"", 1, 25, false},
 		{"1", 1, 25, false},
 		{"garbage", 1, 25, false},
+		// Regression cases for a real bug (run #683): a Go prerelease
+		// version glues its "rc"/"beta" suffix directly onto the minor
+		// number with no separating dot (internal/gover's own doc comment:
+		// "Go toolchain versions like 1.21.0 and 1.21rc1") — confirmed
+		// live (2026-10-03) that `go env GOVERSION` for a real, officially
+		// downloaded go1.25rc1 toolchain prints exactly "go1.25rc1", and
+		// that toolchain's own golang.org/x/mod/modfile already recognizes
+		// the `ignore` go.mod directive (`go list -m all` succeeds against
+		// a go.mod with `go 1.21` and an `ignore` line). Pre-fix, a plain
+		// strconv.Atoi on the glued "25rc1"/"26rc2" segment failed
+		// outright, so every one of these returned false regardless of how
+		// new the prerelease actually was.
+		{"go1.25rc1", 1, 25, true},
+		{"go1.25beta1", 1, 25, true},
+		{"go1.26rc2", 1, 25, true},
+		{"1.25rc1", 1, 25, true},
+		// A prerelease of an OLDER line must still compare as older —
+		// confirming the fix doesn't just treat any "rc"/"beta" suffix as
+		// unconditionally satisfying.
+		{"go1.24rc1", 1, 25, false},
 	}
 	for _, c := range cases {
 		t.Run(c.version, func(t *testing.T) {
@@ -768,6 +788,50 @@ func TestGoVersionAtLeast(t *testing.T) {
 				t.Errorf("goVersionAtLeast(%q, %d, %d) = %v, want %v", c.version, c.major, c.minor, got, c.want)
 			}
 		})
+	}
+}
+
+// TestLeadingInt directly exercises goVersionAtLeast's new helper, covering
+// the glued-prerelease-suffix shape (see goVersionAtLeast's doc comment) in
+// isolation from the version-comparison logic built on top of it.
+func TestLeadingInt(t *testing.T) {
+	cases := []struct {
+		s      string
+		want   int
+		wantOk bool
+	}{
+		{"25", 25, true},
+		{"25rc1", 25, true},
+		{"26beta2", 26, true},
+		{"0", 0, true},
+		{"", 0, false},
+		{"rc1", 0, false},
+		{"abc", 0, false},
+	}
+	for _, c := range cases {
+		t.Run(c.s, func(t *testing.T) {
+			n, ok := leadingInt(c.s)
+			if n != c.want || ok != c.wantOk {
+				t.Errorf("leadingInt(%q) = (%d, %v), want (%d, %v)", c.s, n, ok, c.want, c.wantOk)
+			}
+		})
+	}
+}
+
+// TestIgnoreDirectiveTooOldError_PrereleaseLocalToolchainSatisfies is a
+// regression test for the same real bug as TestGoVersionAtLeast's
+// "go1.25rc1"-shaped cases, exercised through ignoreDirectiveTooOldError
+// itself (the only caller of goVersionAtLeast, and the function a
+// prerelease-toolchain CI run would actually hit): a go.mod whose own `go`
+// line stays below 1.25 must NOT be flagged when the toolchain actually
+// selected to run it is a go1.25+ prerelease — live-verified (2026-10-03)
+// that a real go1.25rc1 toolchain parses this exact file fine (see
+// goVersionAtLeast's doc comment for the full live transcript). Pre-fix,
+// this returned a false "unknown directive: ignore" error for a file the
+// real, currently-selected toolchain handles correctly right now.
+func TestIgnoreDirectiveTooOldError_PrereleaseLocalToolchainSatisfies(t *testing.T) {
+	if err := ignoreDirectiveTooOldError("module example.com/foo\n\ngo 1.21\n\nignore ./testdata\n", "go1.25rc1"); err != nil {
+		t.Errorf("unexpected error when the locally selected toolchain (go1.25rc1, a real go1.25+ prerelease) already recognizes 'ignore': %v", err)
 	}
 }
 

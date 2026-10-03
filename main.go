@@ -1077,25 +1077,72 @@ func goDirectiveVersion(data string) string {
 	return ""
 }
 
-// goVersionAtLeast reports whether a go version string (e.g. "1.26.8" or
-// "1.21", with or without a leading "go" — any such prefix is stripped
-// first) is at least major.minor. Returns false for an empty or
-// unparsable version.
+// goVersionAtLeast reports whether a go version string (e.g. "1.26.8",
+// "1.21", or a prerelease like "1.25rc1"/"1.26beta1" — with or without a
+// leading "go" prefix, stripped first) is at least major.minor. Returns
+// false for an empty or unparsable version.
+//
+// The minor (and, defensively, major) component is parsed via its LEADING
+// digits rather than requiring the whole dot-separated segment to be
+// numeric: a real Go prerelease version glues its "rc"/"beta" suffix
+// directly onto the minor number with no separating dot — confirmed
+// directly against internal/gover's own doc comment ("Package gover
+// implements support for Go toolchain versions like 1.21.0 and 1.21rc1")
+// — so `go env GOVERSION` for a toolchain built from an official release
+// candidate or beta tarball reports a literal string like "go1.25rc1", and
+// a strict strconv.Atoi on the "25rc1" segment used to fail outright,
+// silently making every major.minor comparison against a prerelease
+// toolchain version return false regardless of how new it actually is.
+//
+// Live-verified (2026-10-03) against a real, officially-downloaded
+// go1.25rc1 toolchain, fetched for real via `GOTOOLCHAIN=go1.25rc1 go env
+// GOVERSION` (confirmed to print exactly "go1.25rc1", no "devel" prefix or
+// extra dot): that toolchain's own vendored golang.org/x/mod/modfile
+// already recognizes the `ignore` go.mod directive fine — `GOTOOLCHAIN=
+// go1.25rc1 go list -m all` against a go.mod reading only `go 1.21` plus
+// an `ignore ./testdata` line succeeds outright — but pre-fix
+// goVersionAtLeast("go1.25rc1", 1, 25) returned false, which made
+// ignoreDirectiveTooOldError (the only caller) Fatal a file the real,
+// currently-selected toolchain parses without complaint: a CI pipeline
+// testing against an upcoming Go release (a real, if uncommon, way to end
+// up with an rc/beta toolchain as the ambient `go`) got an actively wrong
+// "this could never resolve" verdict from goproxycheck's own no-argument
+// CLI mode for a go.mod the real `go` command handles correctly right now.
 func goVersionAtLeast(version string, major, minor int) bool {
 	version = strings.TrimPrefix(strings.TrimSpace(version), "go")
 	parts := strings.SplitN(version, ".", 3)
 	if len(parts) < 2 {
 		return false
 	}
-	vMajor, err1 := strconv.Atoi(parts[0])
-	vMinor, err2 := strconv.Atoi(parts[1])
-	if err1 != nil || err2 != nil {
+	vMajor, ok1 := leadingInt(parts[0])
+	vMinor, ok2 := leadingInt(parts[1])
+	if !ok1 || !ok2 {
 		return false
 	}
 	if vMajor != major {
 		return vMajor > major
 	}
 	return vMinor >= minor
+}
+
+// leadingInt parses the longest leading run of ASCII digits in s as an
+// integer, ignoring any non-digit suffix — e.g. a prerelease marker like
+// "rc1"/"beta2" glued directly onto a Go minor version number with no
+// separating dot (see goVersionAtLeast's doc comment). ok is false when s
+// has no leading digit at all (including an empty string).
+func leadingInt(s string) (n int, ok bool) {
+	i := 0
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+	}
+	if i == 0 {
+		return 0, false
+	}
+	v, err := strconv.Atoi(s[:i])
+	if err != nil {
+		return 0, false
+	}
+	return v, true
 }
 
 // localGoVersion returns the version `go env GOVERSION` reports in the
