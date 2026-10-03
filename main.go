@@ -1001,6 +1001,16 @@ func moduleFromGoMod(path string) (string, error) {
 		// straight through unflagged.
 		return "", fmt.Errorf("%s %s, entirely offline, before ever contacting the proxy, so this could never resolve regardless of the repo or proxy config", path, lineErr)
 	}
+	if lineErr := goModUnknownDirectiveError(string(data)); lineErr != nil {
+		// See goModUnknownDirectiveError's doc comment for the live
+		// confirmation that ANY top-level verb outside go.mod's fixed verb
+		// set — not just a malformed `ignore` (checked just above, a
+		// narrower, version-gated special case of this same family) —
+		// Fatals real `go list -m`/`go build` immediately and entirely
+		// offline, before moduleDirective (checked right below) or anything
+		// else in the file is ever resolved.
+		return "", fmt.Errorf("%s %s, entirely offline, before ever contacting the proxy, so this could never resolve regardless of the repo or proxy config", path, lineErr)
+	}
 	mod, err := moduleDirective(string(data))
 	if err != nil {
 		return "", fmt.Errorf("%s %w", path, err)
@@ -1273,6 +1283,109 @@ func ignoreEntryArgCountError(content string, lineNo int) error {
 	}
 	if moduleLineHasExtraArgs(content) {
 		return fmt.Errorf("has an 'ignore' directive on line %d with more than one argument (%q) — real `go list -m`/`go build` Fatals immediately with `ignore directive expects exactly one argument`", lineNo, content)
+	}
+	return nil
+}
+
+// goModKnownVerbs is the complete set of top-level go.mod directive verbs
+// ever recognized by any supported Go toolchain version: module, go,
+// toolchain, require, exclude, replace, retract, tool (go1.24+), godebug
+// (go1.21+), and ignore (go1.25+ — gated separately and more precisely by
+// ignoreDirectiveTooOldError/ignoreDirectiveArgCountError, both checked
+// ahead of goModUnknownDirectiveError in moduleFromGoMod, so by the time
+// this set is consulted "ignore" is already known to be either absent or
+// safely recognized by whichever toolchain would actually run this file).
+// A verb outside this set was never valid go.mod syntax on any Go version
+// at all, so — unlike tool/godebug/ignore, whose recognition genuinely
+// depends on which toolchain runs the file — flagging it doesn't need its
+// own version check: it's an unconditional Fatal on every version.
+var goModKnownVerbs = map[string]bool{
+	"module":    true,
+	"go":        true,
+	"toolchain": true,
+	"require":   true,
+	"exclude":   true,
+	"replace":   true,
+	"retract":   true,
+	"tool":      true,
+	"godebug":   true,
+	"ignore":    true,
+}
+
+// goModUnknownDirectiveError reports an error if data — a go.mod file's raw
+// body — contains a top-level line whose leading token (verb) isn't one of
+// goModKnownVerbs, in either the single-line or parenthesized block form.
+// Lines inside an already-open block (tracked the same way
+// ignoreDirectiveArgCountError tracks the `ignore` block specifically, just
+// generalized across every verb here) are skipped entirely rather than
+// verb-checked, since they're argument values (e.g. a `require (...)`
+// block's module/version entries), not directives of their own.
+//
+// moduleDirective's own doc comment already flags this exact gap in
+// passing ("confirmed live that real go tokenizes [a stray '/'] as one
+// unrecognized identifier ... a completely different failure this function
+// has no way to diagnose") but never generalized it: moduleFromGoMod's
+// no-argument mode (reading ./go.mod, the shipped GitHub Action's default
+// invocation) had no check at all for an ordinary typo'd directive
+// (`requrie`, `exclud`, a stray leftover word, wrong case like `Require`)
+// appearing ANYWHERE in the file, even nowhere near the module directive
+// itself. Live-verified (go1.24.4 and go1.26.8): a go.mod otherwise reading
+// only `module example.com/foo` / `go 1.21` plus one extra line
+// `bogusverb something here` makes `go list -m all`/`go build` Fatal
+// immediately with `go.mod:N: unknown directive: bogusverb`, GOPROXY=off,
+// zero network access — confirmed for a single-line unknown verb, a bare
+// unknown verb with no arguments at all, and a wrong-case known verb
+// (`Require ...` → `unknown directive: Require`, go.mod verbs are
+// case-sensitive). An unknown verb that opens a parenthesized block
+// (`bogusverb (` ... `)`) Fatals with a *different* message —
+// `go.mod:N: unknown block type: bogusverb` — confirmed live and matched
+// here with its own distinct wording rather than reusing "unknown
+// directive"'s. Also confirmed real go collects/report this as a pure
+// syntax-parse failure *ahead of* any later semantic check: a go.mod with
+// both an invalid module path (line 1) and an unknown directive (line 5)
+// Fatals on the unknown directive alone — the module path's own validity
+// is never even reached, since that check only runs after the whole file
+// has already parsed clean. This is why this check runs ahead of
+// moduleDirective (and therefore ahead of its own CheckPath validation)
+// here, mirroring real parse order.
+//
+// Before this fix, a go.mod like this sailed straight through
+// moduleDirective's scanner (which only ever looks for `module` lines,
+// ignoring every other line's content entirely) and moduleFromGoMod probed
+// the extracted module path/git-tag pair against the live proxy as if the
+// file were perfectly ordinary, reporting a misleading statusModuleUnknown
+// ("check: is the repo public? does the module path ... typo? GOPRIVATE?")
+// for a go.mod that could never resolve via any real `go` command in the
+// first place, for a completely unrelated reason.
+func goModUnknownDirectiveError(data string) error {
+	inBlock := false
+	lineNo := 0
+	for _, raw := range strings.Split(data, "\n") {
+		lineNo++
+		if inBlock {
+			if stripLineComment(strings.TrimSpace(raw)) == ")" {
+				inBlock = false
+			}
+			continue
+		}
+		line := stripLineComment(strings.TrimSpace(raw))
+		if line == "" {
+			continue
+		}
+		verb, rest := line, ""
+		if i := strings.IndexAny(line, " \t("); i >= 0 {
+			verb, rest = line[:i], strings.TrimSpace(line[i:])
+		}
+		if rest == "(" {
+			inBlock = true
+			if !goModKnownVerbs[verb] {
+				return fmt.Errorf("has an unrecognized directive %q opening a block on line %d — real `go list -m`/`go build` Fatals immediately with `go.mod:%d: unknown block type: %s`", verb, lineNo, lineNo, verb)
+			}
+			continue
+		}
+		if !goModKnownVerbs[verb] {
+			return fmt.Errorf("has an unrecognized directive %q on line %d — real `go list -m`/`go build` Fatals immediately with `go.mod:%d: unknown directive: %s`", verb, lineNo, lineNo, verb)
+		}
 	}
 	return nil
 }

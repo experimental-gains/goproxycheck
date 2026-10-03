@@ -592,6 +592,106 @@ func TestModuleFromGoMod_WellFormedIgnoreDirectiveNotRejected(t *testing.T) {
 	}
 }
 
+// TestModuleFromGoMod_UnknownDirective is a regression test for a real
+// bug: moduleDirective's scanner only ever recognizes `module` lines, so
+// an ordinary typo'd top-level directive anywhere else in the file (not
+// just the already-separately-checked `ignore`) sailed straight through
+// unflagged. Confirmed live (go1.24.4 and go1.26.8): a go.mod otherwise
+// reading only `module example.com/foo` / `go 1.21` plus one extra,
+// unrecognized line Fatals real `go list -m all`/`go build` immediately
+// and entirely offline with `go.mod:N: unknown directive: <verb>` (or
+// `unknown block type: <verb>` for the parenthesized-block-open form) —
+// before the module directive, or anything else in the file, is ever
+// resolved, let alone a proxy contacted.
+//
+// Before this fix, moduleFromGoMod extracted "example.com/foo" normally
+// from each of these files and probed it against the live proxy as if the
+// file were perfectly ordinary, reporting the actively misleading
+// statusModuleUnknown verdict for a go.mod that could never resolve via
+// any real `go` command in the first place, for a completely unrelated
+// reason.
+func TestModuleFromGoMod_UnknownDirective(t *testing.T) {
+	for name, content := range map[string]string{
+		"bare unknown verb, no arguments":                     "module example.com/foo\n\ngo 1.21\n\nbogusverb\n",
+		"unknown verb with arguments":                         "module example.com/foo\n\ngo 1.21\n\nbogusverb something here\n",
+		"unknown verb, wrong-case known verb (Require)":       "module example.com/foo\n\ngo 1.21\n\nRequire example.com/bar v1.0.0\n",
+		"unknown verb opening a block, no space before paren": "module example.com/foo\n\ngo 1.21\n\nbogusverb(\n\tx\n)\n",
+		"unknown verb before the module directive":            "bogusverb x\n\nmodule example.com/foo\n\ngo 1.21\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "go.mod")
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := moduleFromGoMod(path)
+			if err == nil {
+				t.Fatalf("expected an error for an unrecognized go.mod directive, got module %q", got)
+			}
+			if !strings.Contains(err.Error(), "unknown directive") && !strings.Contains(err.Error(), "unknown block type") {
+				t.Errorf("error %q doesn't cite real go's own `unknown directive`/`unknown block type` Fatal", err)
+			}
+		})
+	}
+}
+
+// TestModuleFromGoMod_UnknownDirectiveBlockVsSingleLine pins the two
+// distinct real-go error messages for an unknown verb depending on whether
+// it opens a parenthesized block (`unknown block type: %s`) or not
+// (`unknown directive: %s`) — confirmed live they're genuinely different
+// wording, not just this tool's own invention, so a caller scraping either
+// substring out of goproxycheck's own error text gets the right one for
+// the shape that was actually in the file.
+func TestModuleFromGoMod_UnknownDirectiveBlockVsSingleLine(t *testing.T) {
+	dir := t.TempDir()
+
+	singleLine := filepath.Join(dir, "single.mod")
+	if err := os.WriteFile(singleLine, []byte("module example.com/foo\n\ngo 1.21\n\nbogusverb x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := moduleFromGoMod(singleLine); err == nil || !strings.Contains(err.Error(), "unknown directive: bogusverb") {
+		t.Errorf("single-line unknown verb: got error %v, want one citing `unknown directive: bogusverb`", err)
+	}
+
+	block := filepath.Join(dir, "block.mod")
+	if err := os.WriteFile(block, []byte("module example.com/foo\n\ngo 1.21\n\nbogusverb (\n\tx\n)\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := moduleFromGoMod(block); err == nil || !strings.Contains(err.Error(), "unknown block type: bogusverb") {
+		t.Errorf("block-opening unknown verb: got error %v, want one citing `unknown block type: bogusverb`", err)
+	}
+}
+
+// TestModuleFromGoMod_KnownDirectivesNotFlaggedAsUnknown confirms the
+// TestModuleFromGoMod_UnknownDirective fix stays narrowly scoped: every
+// real go.mod verb (including the ones with their own block form, and
+// comments inside a block) must still resolve normally, not get
+// misidentified as an unknown directive by goModUnknownDirectiveError.
+func TestModuleFromGoMod_KnownDirectivesNotFlaggedAsUnknown(t *testing.T) {
+	content := "module example.com/foo\n\ngo 1.21\n\n" +
+		"// a top-level comment\n" +
+		"require golang.org/x/mod v0.19.0\n\n" +
+		"exclude (\n\t// comment inside a block\n\tgolang.org/x/mod v0.1.0\n)\n\n" +
+		"replace golang.org/x/mod => golang.org/x/mod v0.19.0\n\n" +
+		"retract v0.0.1\n\n" +
+		"tool golang.org/x/mod\n\n" +
+		"godebug default=go1.21\n"
+	dir := t.TempDir()
+	path := filepath.Join(dir, "go.mod")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := moduleFromGoMod(path)
+	if err != nil {
+		t.Fatalf("unexpected error for a go.mod using every known directive: %v", err)
+	}
+	if want := "example.com/foo"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
 // TestHasIgnoreDirective pins hasIgnoreDirective's presence-only scan,
 // independent of the argument-shape questions TestModuleFromGoMod_
 // MalformedIgnoreDirective/WellFormedIgnoreDirectiveNotRejected already
