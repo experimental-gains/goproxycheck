@@ -771,6 +771,71 @@ func TestModuleFromGoMod_InvalidQuotedTokenNotOverTriggered(t *testing.T) {
 	}
 }
 
+// TestModuleFromGoMod_RequireExcludeArgCount confirms moduleFromGoMod
+// rejects a `require`/`exclude` directive carrying anything other than
+// exactly two arguments (module path, version) — the version accidentally
+// dropped by a hand-edit or merge conflict is the realistic shape, but a
+// stray extra token is covered too — live-verified against a real
+// go1.24.4 toolchain to Fatal `go list -m`/`go build` immediately and
+// entirely offline with `usage: require/exclude module/path v1.2.3`,
+// before ever contacting the proxy. Before this check, moduleFromGoMod's
+// module-path scanner (moduleDirective) never looks at require/exclude
+// lines at all, so a go.mod broken this way was extracted and probed
+// normally, reporting whatever the module's real proxy state happened to
+// be — confirmed live, a plain statusReady — for a go.mod that can never
+// build in the first place.
+func TestModuleFromGoMod_RequireExcludeArgCount(t *testing.T) {
+	for name, content := range map[string]string{
+		"require, version dropped":             "module example.com/foo\n\ngo 1.21\n\nrequire github.com/pkg/errors\n",
+		"require, extra trailing token":        "module example.com/foo\n\ngo 1.21\n\nrequire github.com/pkg/errors v0.9.1 extra\n",
+		"require block entry, version dropped": "module example.com/foo\n\ngo 1.21\n\nrequire (\n\tgithub.com/pkg/errors\n)\n",
+		"exclude, version dropped":             "module example.com/foo\n\ngo 1.21\n\nexclude github.com/pkg/errors\n",
+		"exclude block entry, version dropped": "module example.com/foo\n\ngo 1.21\n\nexclude (\n\tgithub.com/pkg/errors\n)\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "go.mod")
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := moduleFromGoMod(path)
+			if err == nil {
+				t.Fatalf("expected an error for a require/exclude directive with the wrong argument count, got module %q", got)
+			}
+			if !strings.Contains(err.Error(), "usage:") || !strings.Contains(err.Error(), "module/path v1.2.3") {
+				t.Errorf("error %q doesn't cite real go's own `usage: require/exclude module/path v1.2.3` Fatal", err)
+			}
+		})
+	}
+}
+
+// TestModuleFromGoMod_RequireExcludeArgCountNotOverTriggered confirms the
+// TestModuleFromGoMod_RequireExcludeArgCount fix stays narrowly scoped: an
+// ordinary well-formed require (including one carrying a trailing "//
+// indirect" comment, the common `go mod tidy` shape) and exclude line,
+// single-line and inside a block, must still resolve normally.
+func TestModuleFromGoMod_RequireExcludeArgCountNotOverTriggered(t *testing.T) {
+	content := "module example.com/foo\n\ngo 1.21\n\n" +
+		"require golang.org/x/mod v0.41.0 // indirect\n\n" +
+		"require (\n\tgithub.com/pkg/errors v0.9.1\n\tgolang.org/x/sync v0.5.0 // indirect\n)\n\n" +
+		"exclude example.com/old v0.1.0\n\n" +
+		"exclude (\n\texample.com/older v0.0.1\n)\n"
+	dir := t.TempDir()
+	path := filepath.Join(dir, "go.mod")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := moduleFromGoMod(path)
+	if err != nil {
+		t.Fatalf("unexpected error for a go.mod with well-formed require/exclude directives: %v", err)
+	}
+	if want := "example.com/foo"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
 // TestHasIgnoreDirective pins hasIgnoreDirective's presence-only scan,
 // independent of the argument-shape questions TestModuleFromGoMod_
 // MalformedIgnoreDirective/WellFormedIgnoreDirectiveNotRejected already

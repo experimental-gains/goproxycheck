@@ -1022,6 +1022,16 @@ func moduleFromGoMod(path string) (string, error) {
 		// the file) is ever resolved.
 		return "", fmt.Errorf("%s %s, entirely offline, before ever contacting the proxy, so this could never resolve regardless of the repo or proxy config", path, lineErr)
 	}
+	if lineErr := requireExcludeDirectiveArgCountError(string(data)); lineErr != nil {
+		// See requireExcludeDirectiveArgCountError's doc comment for the live
+		// confirmation that a `require`/`exclude` directive carrying anything
+		// other than exactly two arguments (module path, version) — most
+		// realistically, a version accidentally dropped by a hand-edit or a
+		// merge conflict — Fatals real `go list -m`/`go build` immediately and
+		// entirely offline, before moduleDirective's own module-path
+		// extraction (or anything else in the file) is ever resolved.
+		return "", fmt.Errorf("%s %s, entirely offline, before ever contacting the proxy, so this could never resolve regardless of the repo or proxy config", path, lineErr)
+	}
 	mod, err := moduleDirective(string(data))
 	if err != nil {
 		return "", fmt.Errorf("%s %w", path, err)
@@ -1602,6 +1612,160 @@ func directiveArgQuoteError(s string) (badToken string, bad bool) {
 		}
 	}
 	return "", false
+}
+
+// requireExcludeDirectiveArgCountError scans data — a go.mod file's raw
+// body — for a `require` or `exclude` directive, single-line or inside its
+// parenthesized block form, carrying anything other than exactly two
+// arguments (module path, version).
+//
+// Confirmed directly against golang.org/x/mod/modfile's rule.go: `require`
+// and `exclude` share one case in the top-level directive switch
+// (`case "require", "exclude": if len(args) != 2 { errorf("usage: %s
+// module/path v1.2.3", verb) }`) — the identical "exactly N arguments"
+// shape ignoreDirectiveArgCountError already checks for `ignore` (one
+// argument there instead of two), just never generalized to these two
+// verbs, which moduleDirective's scanner never looks at at all (it only
+// ever recognizes "module" lines) and goModInvalidQuotedTokenError only
+// checks for a stray quote character, not a missing or extra argument.
+//
+// Live-verified (2026-10-03, go1.24.4, GOPROXY=off to rule out any network
+// dependency): a go.mod otherwise reading only `module example.com/foo` /
+// `go 1.21` plus one extra line `require github.com/pkg/errors` (the
+// version accidentally dropped — a realistic hand-edit or merge-conflict
+// mistake, not a contrived shape) makes `go list -m`/`go build` Fatal
+// immediately and entirely offline with `go.mod:N: usage: require
+// module/path v1.2.3` — confirmed identically for `exclude` (same
+// wording, verb substituted), for a THREE-argument line (`require
+// github.com/pkg/errors v0.9.1 extra`), and for the identical one- or
+// three-argument shape written as a single entry inside a `require (...)`/
+// `exclude (...)` block instead of a standalone line.
+//
+// Before this check, a go.mod broken this way had its module path
+// extracted normally by moduleDirective (the malformed require/exclude
+// line sits on an unrelated line) and probed against the live proxy as if
+// the file were perfectly ordinary — confirmed live, this reported a
+// plain statusReady ("a plain `go install` will work") for a go.mod that
+// can never build at all, the opposite of reality, exactly the same "go
+// itself would Fatal first" family as goModUnknownDirectiveError and
+// goModInvalidQuotedTokenError right above, just a directive-argument
+// shape neither of those already covers.
+//
+// Deliberately scoped to `require`/`exclude` only, the two verbs that
+// share this exact "always exactly two arguments" grammar — `replace`
+// (its own, more elaborate "A [B] => C [D]" shape) and `retract` (a bare
+// version OR a bracketed [low, high] interval) have different enough
+// argument grammars that generalizing this same count check to them would
+// misfire; left as a narrower, deliberate scope boundary rather than
+// guessed at, the same way ignoreDirectiveArgCountError's own doc comment
+// already leaves a malformed-quoting sub-case of its own scope unfixed.
+func requireExcludeDirectiveArgCountError(data string) error {
+	inBlock := false
+	blockVerb := ""
+	lineNo := 0
+	for _, raw := range strings.Split(data, "\n") {
+		lineNo++
+		line := stripLineComment(strings.TrimSpace(raw))
+		if inBlock {
+			if line == ")" {
+				inBlock = false
+				continue
+			}
+			if line == "" {
+				continue
+			}
+			// Only require/exclude's own block entries share their directive's
+			// "exactly two arguments" grammar — a block opened by some other
+			// verb (module, ignore, retract, tool, godebug, replace) has its
+			// own, different entry shape, already validated (if at all) by that
+			// verb's own dedicated check elsewhere in this file, not this one.
+			if blockVerb == "require" || blockVerb == "exclude" {
+				if err := requireExcludeArgCountError(blockVerb, line, lineNo); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if line == "" {
+			continue
+		}
+		verb, rest := line, ""
+		if i := strings.IndexAny(line, " \t("); i >= 0 {
+			verb, rest = line[:i], strings.TrimSpace(line[i:])
+		}
+		if verb != "require" && verb != "exclude" {
+			if rest == "(" {
+				// Some other verb's block (require/exclude's own block-open is
+				// handled in the branch below); still need to track it so its
+				// entries aren't mistaken for top-level lines by this scan.
+				inBlock = true
+				blockVerb = verb
+			}
+			continue
+		}
+		if rest == "(" {
+			inBlock = true
+			blockVerb = verb
+			continue
+		}
+		if err := requireExcludeArgCountError(verb, rest, lineNo); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// requireExcludeArgCountError checks a single `require`/`exclude`
+// directive's argument text (content after the verb, or a block entry
+// line — either way, with any trailing "//" comment already stripped,
+// including the "// indirect" comment `require` entries commonly carry)
+// for anything other than exactly two go.mod-lexer tokens, using
+// directiveArgCount's same quote-aware counting directiveArgQuoteError
+// already relies on for the sibling quoted-token check.
+func requireExcludeArgCountError(verb, content string, lineNo int) error {
+	content = strings.TrimSpace(content)
+	n := directiveArgCount(content)
+	if n == 2 || n < 0 {
+		// n < 0 means a token opened with '"' but never closed on this line —
+		// a different, already-separately-scoped Fatal shape
+		// (directiveArgQuoteError's doc comment: "unexpected newline in
+		// string"), left for goModInvalidQuotedTokenError rather than
+		// miscounted here.
+		return nil
+	}
+	return fmt.Errorf("has a %q directive on line %d with %d argument(s) instead of exactly two (module path, version) — real `go list -m`/`go build` Fatals immediately with `usage: %s module/path v1.2.3`", verb, lineNo, n, verb)
+}
+
+// directiveArgCount counts the go.mod-lexer tokens in s (the already
+// comment-stripped argument text of a go.mod directive line, or one entry
+// inside its already-open block form), where a double-quoted Go string
+// literal counts as exactly one token regardless of any embedded
+// whitespace — mirroring directiveArgQuoteError's identical quote-aware
+// walk, just counting fields instead of scanning for a bad one. Returns -1
+// if a token opens with '"' but strconv.QuotedPrefix never finds a
+// well-formed close on the same line (go.mod strings can't span a physical
+// line); see requireExcludeArgCountError's doc comment for why that's left
+// to a different, already-existing check rather than miscounted here.
+func directiveArgCount(s string) int {
+	n := 0
+	for s != "" {
+		if s[0] == '"' {
+			prefix, err := strconv.QuotedPrefix(s)
+			if err != nil {
+				return -1
+			}
+			s = strings.TrimSpace(s[len(prefix):])
+			n++
+			continue
+		}
+		if i := strings.IndexAny(s, " \t"); i >= 0 {
+			s = strings.TrimSpace(s[i+1:])
+		} else {
+			s = ""
+		}
+		n++
+	}
+	return n
 }
 
 // moduleDirective extracts the module path from a go.mod-format body's
