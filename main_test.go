@@ -692,6 +692,85 @@ func TestModuleFromGoMod_KnownDirectivesNotFlaggedAsUnknown(t *testing.T) {
 	}
 }
 
+// TestModuleFromGoMod_InvalidQuotedTokenInOtherDirectives is a regression
+// test for a real bug: parseModulePath already rejected a backtick- or
+// single-quote-involving token in the module directive's own path
+// (TestModuleFromGoMod_BacktickQuoted above), but that fix was scoped to
+// moduleDirective's module-only scanner — a stray quote character in any
+// OTHER go.mod directive's own argument (require/exclude/replace/retract/
+// tool/godebug/ignore) sailed straight through unflagged, since
+// moduleDirective only ever looks for "module" lines.
+//
+// Confirmed live (go1.24.4 and go1.26.8, GOPROXY=off): a go.mod otherwise
+// reading only `module example.com/foo` / `go 1.21` plus one extra line
+// like a backtick-quoted require version Fatals real `go list -m`/`go
+// build` immediately and entirely offline with `invalid quoted string:
+// unquoted string cannot contain quote`, before the module directive (or
+// anything else in the file) is ever resolved, let alone a proxy
+// contacted — confirmed for a backtick-quoted, single-quote-quoted, and
+// bare-glued-quote shape, across require, exclude, replace, tool, and a
+// require block entry.
+//
+// Before this fix, moduleFromGoMod extracted "example.com/foo" normally
+// from each of these files and probed it against the live proxy as if
+// the file were perfectly ordinary, reporting whatever the module's real
+// proxy/sumdb state happened to be for a go.mod that could never resolve
+// via any real `go` command in the first place, for a completely
+// unrelated reason.
+func TestModuleFromGoMod_InvalidQuotedTokenInOtherDirectives(t *testing.T) {
+	for name, content := range map[string]string{
+		"require, backtick-quoted version":       "module example.com/foo\n\ngo 1.21\n\nrequire example.com/bar `v1.0.0`\n",
+		"require block entry, backtick-quoted":   "module example.com/foo\n\ngo 1.21\n\nrequire (\n\texample.com/bar `v1.0.0`\n)\n",
+		"exclude, single-quote-quoted version":   "module example.com/foo\n\ngo 1.21\n\nexclude example.com/bar 'v1.0.0'\n",
+		"replace, backtick-quoted new version":   "module example.com/foo\n\ngo 1.21\n\nreplace example.com/bar => example.com/baz `v1.0.0`\n",
+		"tool, bare glued backtick, no verb sep": "module example.com/foo\n\ngo 1.21\n\ntool example.com/bar`baz`\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "go.mod")
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := moduleFromGoMod(path)
+			if err == nil {
+				t.Fatalf("expected an error for a directive argument involving a stray quote, got module %q", got)
+			}
+			if !strings.Contains(err.Error(), "invalid quoted string") || !strings.Contains(err.Error(), "cannot contain quote") {
+				t.Errorf("error %q doesn't cite real go's own `invalid quoted string: unquoted string cannot contain quote` Fatal", err)
+			}
+		})
+	}
+}
+
+// TestModuleFromGoMod_InvalidQuotedTokenNotOverTriggered confirms the
+// TestModuleFromGoMod_InvalidQuotedTokenInOtherDirectives fix stays
+// narrowly scoped: a go.mod using every known directive, including a
+// legitimately double-quoted require path/version, a retract range, and
+// comments, must still resolve normally.
+func TestModuleFromGoMod_InvalidQuotedTokenNotOverTriggered(t *testing.T) {
+	content := "module example.com/foo\n\ngo 1.21\n\n" +
+		"require (\n\t\"example.com/bar\" v1.0.0 // comment\n\texample.com/baz v1.2.3\n)\n\n" +
+		"exclude example.com/old v0.1.0\n\n" +
+		"replace example.com/bar => example.com/fork v1.0.0\n\n" +
+		"retract [v1.0.0, v1.9.9]\n\n" +
+		"tool example.com/foo/cmd/gen\n\n" +
+		"godebug http2client=0\n"
+	dir := t.TempDir()
+	path := filepath.Join(dir, "go.mod")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := moduleFromGoMod(path)
+	if err != nil {
+		t.Fatalf("unexpected error for a go.mod with no stray quote characters: %v", err)
+	}
+	if want := "example.com/foo"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
 // TestHasIgnoreDirective pins hasIgnoreDirective's presence-only scan,
 // independent of the argument-shape questions TestModuleFromGoMod_
 // MalformedIgnoreDirective/WellFormedIgnoreDirectiveNotRejected already

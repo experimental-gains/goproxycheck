@@ -1011,6 +1011,17 @@ func moduleFromGoMod(path string) (string, error) {
 		// else in the file is ever resolved.
 		return "", fmt.Errorf("%s %s, entirely offline, before ever contacting the proxy, so this could never resolve regardless of the repo or proxy config", path, lineErr)
 	}
+	if lineErr := goModInvalidQuotedTokenError(string(data)); lineErr != nil {
+		// See goModInvalidQuotedTokenError's doc comment for the live
+		// confirmation that a stray, unquoted quote character anywhere in a
+		// require/exclude/replace/retract/tool/godebug/ignore directive's
+		// own argument — not just the module directive's path, already
+		// checked by moduleDirective/parseModulePath below — Fatals real
+		// `go list -m`/`go build` immediately and entirely offline, before
+		// moduleDirective's own module-path extraction (or anything else in
+		// the file) is ever resolved.
+		return "", fmt.Errorf("%s %s, entirely offline, before ever contacting the proxy, so this could never resolve regardless of the repo or proxy config", path, lineErr)
+	}
 	mod, err := moduleDirective(string(data))
 	if err != nil {
 		return "", fmt.Errorf("%s %w", path, err)
@@ -1435,6 +1446,162 @@ func goModUnknownDirectiveError(data string) error {
 		}
 	}
 	return nil
+}
+
+// goModInvalidQuotedTokenError scans data — a go.mod file's raw body — for
+// a KNOWN directive (require, exclude, replace, retract, tool, godebug,
+// ignore — everything goModKnownVerbs recognizes except "module", which
+// moduleDirective/parseModulePath already check this exact way with a
+// more specific message, and "go"/"toolchain", which never take a
+// quoted-string argument at all) whose own argument text — on a
+// single-line directive, or one entry inside its parenthesized block form
+// — contains a token golang.org/x/mod/modfile's parseString (rule.go)
+// rejects outright: a token not starting with '"' that nonetheless
+// contains a '"', '\”, or '`' anywhere (not just one wholly wrapped in
+// one of those characters), per that function's own comment ("Other
+// quotes are reserved both for possible future expansion and to avoid
+// confusion").
+//
+// parseModulePath already fixed this exact mis-ported "backtick is a
+// valid quote" assumption for the module directive's own path (technique
+// #126 in this project's real-world-testing catalog) — but that fix was
+// scoped to moduleDirective's module-only scanner, so a backtick, stray
+// single quote, or glued-on quote character in any OTHER directive's
+// argument (a require/exclude version, a replace directive's old or new
+// module/version, a retract range, a tool path, a godebug key/value, or
+// an ignore path) sailed straight through unflagged: moduleDirective only
+// ever looks for "module" lines, so the rest of the file's content was
+// never checked for this failure mode at all.
+//
+// Live-verified (2026-10, go1.24.4 and go1.26.8, GOPROXY=off to rule out
+// any network dependency): a go.mod otherwise reading only `module
+// example.com/foo` / `go 1.21` plus one extra line like
+//
+//	require example.com/bar `v1.0.0`
+//
+// makes `go list -m`/`go build` Fatal immediately and entirely offline
+// with go.mod:N: require example.com/bar: version "`v1.0.0`" invalid:
+// unquoted string cannot contain quote — confirmed the identical Fatal
+// (modulo each directive's own message prefix) for a backtick-quoted
+// `exclude`/`replace`/`retract`/`tool`/`ignore` argument too, for a
+// single-quote-wrapped version, for a bare backtick-wrapped `tool` path
+// with no directive-specific prefix at all (just `go.mod:N: invalid
+// quoted string: unquoted string cannot contain quote`), and for the
+// identical token sitting inside a `require ( ... )` block entry instead
+// of a single-line directive — before resolving a single requirement or
+// contacting a proxy. Also confirmed real go reports this error even when
+// a go.mod already has an unrecognized directive elsewhere in the same
+// file: unlike CheckPath's later, semantic module-path validation (which
+// a syntax error anywhere fully suppresses — see
+// goModUnknownDirectiveError's doc comment), "invalid quoted string" is
+// itself a syntax-level lexer error real go collects alongside any other
+// syntax error in the same parse pass, rather than one that's gated
+// behind the file parsing cleanly first — so this check's placement
+// relative to goModUnknownDirectiveError doesn't need to match real go's
+// own internal priority, only correctly recognize its own condition.
+//
+// Before this check, a go.mod broken this way had its module path
+// extracted normally by moduleDirective (the stray quote sits on an
+// unrelated line) and probed against the live proxy as if the file were
+// perfectly ordinary, reporting whatever the module's real proxy/sumdb
+// state happened to be (e.g. a misleading statusGoproxyOffLocally/
+// statusReady) for a go.mod that could never resolve via any real `go`
+// command in the first place, for a completely unrelated reason — the
+// same "go itself would Fatal first" family as goModUnknownDirectiveError
+// and every BOM/ignore-directive check already in this file, just one
+// directive-argument shape those checks never covered.
+func goModInvalidQuotedTokenError(data string) error {
+	inBlock := false
+	blockVerb := ""
+	lineNo := 0
+	for _, raw := range strings.Split(data, "\n") {
+		lineNo++
+		line := stripLineComment(strings.TrimSpace(raw))
+		if inBlock {
+			if line == ")" {
+				inBlock = false
+				continue
+			}
+			if line == "" {
+				continue
+			}
+			if tok, bad := directiveArgQuoteError(line); bad {
+				return fmt.Errorf("has a %q directive block entry on line %d with a stray, unquoted quote character (%q) — real `go list -m`/`go build` Fatals immediately with `invalid quoted string: unquoted string cannot contain quote`", blockVerb, lineNo, tok)
+			}
+			continue
+		}
+		if line == "" {
+			continue
+		}
+		verb, rest := line, ""
+		if i := strings.IndexAny(line, " \t("); i >= 0 {
+			verb, rest = line[:i], strings.TrimSpace(line[i:])
+		}
+		// Unknown verbs are goModUnknownDirectiveError's job; "module"'s own
+		// argument is already checked, with a more specific message, by
+		// moduleDirective/parseModulePath; "go"/"toolchain" never take a
+		// quoted-string argument (see this function's doc comment).
+		if !goModKnownVerbs[verb] || verb == "module" || verb == "go" || verb == "toolchain" {
+			if rest == "(" {
+				// An unknown verb opening a block is goModUnknownDirectiveError's
+				// job too — still need to track the block so its entries aren't
+				// mistaken for top-level lines by the rest of this scan.
+				inBlock = true
+				blockVerb = verb
+			}
+			continue
+		}
+		if rest == "(" {
+			inBlock = true
+			blockVerb = verb
+			continue
+		}
+		if tok, bad := directiveArgQuoteError(rest); bad {
+			return fmt.Errorf("has a %q directive on line %d with a stray, unquoted quote character (%q) — real `go list -m`/`go build` Fatals immediately with `invalid quoted string: unquoted string cannot contain quote`", verb, lineNo, tok)
+		}
+	}
+	return nil
+}
+
+// directiveArgQuoteError reports whether s — the already comment-stripped
+// argument text of a go.mod directive line (or one entry inside its
+// already-open block form) — contains a token real go's parseString
+// rejects outright, even though a naive whitespace split would otherwise
+// happily treat it as an ordinary (garbage) field. See
+// goModInvalidQuotedTokenError's doc comment for the live confirmation
+// and general rule: a token is only ever a valid quoted string if it
+// starts with '"' and strconv.QuotedPrefix recognizes it as a complete,
+// well-formed double-quoted Go string literal; any OTHER token (quoted or
+// not) containing a '"', '\”, or '`' anywhere is invalid.
+//
+// Deliberately narrower in one way, confirmed live and left alone rather
+// than guessed at (mirrors parseModulePath's own identical scope
+// restriction): a token that opens with '"' but has no well-formed
+// closing quote on the same line (go.mod strings can't span a physical
+// line) is a DIFFERENT real Fatal shape ("unexpected newline in string"),
+// so this function simply stops and reports no finding for that line
+// rather than misquoting the wrong error text.
+func directiveArgQuoteError(s string) (badToken string, bad bool) {
+	for s != "" {
+		if s[0] == '"' {
+			prefix, err := strconv.QuotedPrefix(s)
+			if err != nil {
+				return "", false
+			}
+			s = strings.TrimSpace(s[len(prefix):])
+			continue
+		}
+		var tok string
+		if i := strings.IndexAny(s, " \t"); i >= 0 {
+			tok, s = s[:i], strings.TrimSpace(s[i+1:])
+		} else {
+			tok, s = s, ""
+		}
+		if strings.ContainsAny(tok, "\"'`") {
+			return tok, true
+		}
+	}
+	return "", false
 }
 
 // moduleDirective extracts the module path from a go.mod-format body's
