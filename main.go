@@ -581,6 +581,57 @@ func isVersionPrefix(v string) bool {
 	return true
 }
 
+// nonASCIIVersionLetterError reports the real, verbatim `go get`/`go install`
+// Fatal for a version/revision string containing a non-ASCII Unicode letter
+// (e.g. an accented character in a hand-named branch, or a copy-pasted
+// smart/non-Latin character) — a genuinely different failure shape than
+// resolveTarget's neighboring "disallowed version string" check just below,
+// confirmed live and by reading golang.org/x/mod/module's own source
+// (module.go, this repo's pinned v0.41.0) directly:
+//
+// EscapeVersion validates version/revision strings via `checkElem(v,
+// filePath)`, which defers to fileNameOK — and fileNameOK's own doc comment
+// says plainly "we allow all Unicode letters" (its code: `return
+// unicode.IsLetter(r)` for any rune >= utf8.RuneSelf) — so a version like
+// "café" or "日本語" passes this validation step cleanly, completely unlike
+// an ordinary disallowed character (a colon, question mark, asterisk, ...),
+// which checkElem rejects immediately with "disallowed version string" (see
+// the sibling check just below). Only EscapeVersion's *second* step,
+// escapeString, actually fails on it: that function's own loop treats any
+// rune >= utf8.RuneSelf as a case it should never see ("This should be
+// disallowed by CheckPath, but diagnose anyway" — a comment written for the
+// module-PATH case, EscapePath, where CheckPath really does reject non-ASCII
+// outright; it doesn't hold for the version/file-path case EscapeVersion
+// shares the same helper with), and returns a bare, unwrapped `"internal
+// error: inconsistency in EscapePath"` instead of an *module.
+// InvalidVersionError the way every other rejection does.
+//
+// That type difference propagates all the way out to the real error text:
+// cmd/go's own modfetch/proxy.go (proxyRepo.versionError) wraps whatever
+// EscapeVersion returned in a fresh outer *module.InvalidVersionError, then
+// module.ModuleError.Error() special-cases printing when that outer error's
+// own .Err is itself an *InvalidVersionError (the ordinary case) by adding
+// the "version %q invalid:" phrase and the quoted version string — but
+// skips that extra wrapping entirely when .Err is a plain error (this case),
+// printing the bare inner message directly instead. Confirmed live
+// (2026-10-03, go1.26.8, entirely offline — this Fatals before any proxy
+// contact, as fast as the ordinary-disallowed-character case):
+//
+//	$ go get golang.org/x/mod@café
+//	go: golang.org/x/mod@café: invalid version: internal error: inconsistency in EscapePath
+//
+// — no quoted "café", no "version ... invalid:" phrase, nothing resembling
+// "disallowed version string" at all. Before this check existed,
+// resolveTarget's sibling EscapeVersion-failure branch unconditionally
+// quoted the ordinary-case wording for every failure alike, so goproxycheck
+// told a caller hitting this exact shape that real `go` rejects it with a
+// message real `go` never actually prints for this input — actively
+// misdirecting anyone trying to match goproxycheck's own quoted error text
+// against their terminal's real output, or grep a CI log for it.
+func nonASCIIVersionLetterError(module, version string, escapeErr error) error {
+	return fmt.Errorf("version %q contains a non-ASCII Unicode letter — a real `go get`/`go install` Fatals immediately and offline on this exact input, but not with the ordinary \"disallowed version string\" wording: golang.org/x/mod/module's own version validation (fileNameOK) explicitly allows Unicode letters, so it passes that check, then fails one step later with a bare internal-error message cmd/go surfaces verbatim: `%s@%s: invalid version: %v`. Either way, this could never resolve no matter how long you --wait or retry — check for an accented character, a non-Latin script, or a stray smart-quote/copy-paste artifact in the version string", version, module, version, escapeErr)
+}
+
 // resolveTarget parses "module@version" from args, or falls back to reading
 // the module path from ./go.mod and the version from the most recent git
 // tag — the shape of "just tagged a release, is it live yet?" this tool is
@@ -858,6 +909,22 @@ func resolveTarget(args []string) (module, version string, err error) {
 			// allowed" instead of any answer about the version that was
 			// actually asked about.
 			if _, err := modulepkg.EscapeVersion(parts[1]); err != nil {
+				if _, ok := err.(*modulepkg.InvalidVersionError); !ok {
+					// See nonASCIIVersionLetterError's doc comment: a version
+					// string containing a non-ASCII Unicode letter takes a
+					// completely different failure path through x/mod/module
+					// than every other disallowed-character shape above —
+					// EscapeVersion's own checkElem/fileNameOK validation
+					// actually ACCEPTS it (fileNameOK's doc comment: "we allow
+					// all Unicode letters"), so this isn't that "disallowed
+					// version string" rejection at all; it only fails one
+					// step later, inside escapeString itself, with an
+					// internal-error message real `go` surfaces verbatim and
+					// unwrapped — no quoted version string, no "invalid
+					// version: version %q invalid:" prefix the way every
+					// other case in this function gets.
+					return "", "", nonASCIIVersionLetterError(parts[0], parts[1], err)
+				}
 				return "", "", fmt.Errorf("version %q is not a valid module version/revision string (%v) — a real `go get`/`go install` rejects this exact string immediately with `invalid version: version %q invalid: disallowed version string`, entirely offline, before ever contacting the proxy, so this could never resolve no matter how long you --wait or retry. Check for a stray character from copy-paste, URL-encoding, or shell quoting (e.g. a colon, question mark, backslash, asterisk, pipe, or quote)", parts[1], err, parts[1])
 			}
 		}

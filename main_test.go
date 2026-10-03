@@ -1039,6 +1039,47 @@ func TestResolveTarget_DisallowedVersionCharsRejected(t *testing.T) {
 	}
 }
 
+// TestResolveTarget_NonASCIIVersionLetterGetsAccurateMessage is a regression
+// test for a real bug: a version/revision string containing a non-ASCII
+// Unicode letter (e.g. an accented character or a non-Latin script) is NOT
+// rejected by golang.org/x/mod/module's own validation the way an ordinary
+// disallowed character is — fileNameOK's doc comment says plainly "we allow
+// all Unicode letters" — so it passes that check cleanly and only fails one
+// step later, inside EscapeVersion's own escapeString helper, with a bare
+// "internal error: inconsistency in EscapePath" that cmd/go surfaces
+// verbatim and UNWRAPPED, with no quoted version string and no "version %q
+// invalid:" phrase at all. Confirmed live (2026-10-03, go1.26.8, entirely
+// offline, before any proxy contact):
+//
+//	$ go get golang.org/x/mod@café
+//	go: golang.org/x/mod@café: invalid version: internal error: inconsistency in EscapePath
+//
+// Before this check, resolveTarget's sibling EscapeVersion-failure branch
+// (TestResolveTarget_DisallowedVersionCharsRejected, just below) claimed
+// every EscapeVersion failure alike gets real go's "disallowed version
+// string" wording — false for this exact input shape, actively misdirecting
+// anyone trying to match goproxycheck's own quoted error text against their
+// terminal's real output.
+func TestResolveTarget_NonASCIIVersionLetterGetsAccurateMessage(t *testing.T) {
+	for _, version := range []string{
+		"v1.2.3-café", // accented Latin letter
+		"日本語",         // non-Latin script
+	} {
+		t.Run(version, func(t *testing.T) {
+			_, _, err := resolveTarget([]string{"example.com/mod@" + version})
+			if err == nil {
+				t.Fatalf("expected an error for non-ASCII version %q", version)
+			}
+			if strings.Contains(err.Error(), "invalid: disallowed version string") {
+				t.Errorf("error wrongly quotes the ordinary \"...invalid: disallowed version string\" wording as what real `go` prints, which it does not for a non-ASCII Unicode letter: %v", err)
+			}
+			if !strings.Contains(err.Error(), "internal error: inconsistency in EscapePath") {
+				t.Errorf("error should quote real go's actual, different verbatim message (\"internal error: inconsistency in EscapePath\"): %v", err)
+			}
+		})
+	}
+}
+
 // TestResolveTarget_ComparisonVersionQueryNotRejected is a regression test
 // guarding the isComparisonVersionQuery exclusion added alongside the
 // disallowed-version-character check above: a version-range query like
