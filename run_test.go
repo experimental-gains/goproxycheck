@@ -681,6 +681,135 @@ func TestRun_LocalModulePrivate_GovcsUsesRepoRootNotFullModulePath(t *testing.T)
 	}
 }
 
+// TestRun_LocalModulePrivate_GovcsDisallowed_Bitbucket is the run()-level
+// regression case for vcsStaticRepoRoot's widened host coverage (see
+// TestVcsStaticRepoRoot in govcs_test.go): before this fix, run()'s
+// GOVCS-disallowed case in both the GOPRIVATE/GONOPROXY-direct-fetch branch
+// and the GOPROXY=direct branch was gated on
+// `githubRepoPattern.MatchString(module)` specifically, so a non-github.com
+// module NEVER reached localGovcsAllowsGit at all — not merely with the
+// wrong (untruncated) repo root, as technique-#476's original github.com
+// fix addressed, but not reached even for a GOVCS rule matching the
+// module's full import path *exactly*, with no subdirectory/truncation
+// question involved whatsoever. Confirmed live (2026-10-04, go1.24.4,
+// GOPROXY=direct GOSUMDB=off, a fresh GOMODCACHE): with
+// GOPRIVATE="bitbucket.org/owner/fake-repo" and
+// GOVCS="bitbucket.org/owner/fake-repo:off" (an exact, non-nested match —
+// no truncation needed at all), `go mod download
+// bitbucket.org/owner/fake-repo@v1.0.0` Fatals immediately and offline with
+// "GOVCS disallows using git for private bitbucket.org/owner/fake-repo; see
+// 'go help vcs'". Before this fix, this tool's switch fell straight to its
+// default case and reported statusPrivateModuleLocally ("will fetch it
+// directly, no problem") for a fetch the real command refuses outright.
+func TestRun_LocalModulePrivate_GovcsDisallowed_Bitbucket(t *testing.T) {
+	t.Setenv("GOPRIVATE", "bitbucket.org/owner/fake-repo")
+	t.Setenv("GOVCS", "bitbucket.org/owner/fake-repo:off")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"bitbucket.org/owner/fake-repo@v1.0.0"}, &stdout, &stderr, endpoints{})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "govcs-disallowed-locally") {
+		t.Errorf("stdout = %q, want it to mention govcs-disallowed-locally", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "GOVCS disallows using git for private bitbucket.org/owner/fake-repo;") {
+		t.Errorf("stdout = %q, want it to quote real go's exact error", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "private-module-locally") {
+		t.Errorf("stdout = %q, want it NOT to fall back to the plain private-module-locally message", stdout.String())
+	}
+}
+
+// TestRun_LocalModulePrivate_GovcsUsesRepoRootNotFullModulePath_Bitbucket
+// mirrors TestRun_LocalModulePrivate_GovcsUsesRepoRootNotFullModulePath
+// (the github.com/googleapis/gax-go/v2 case) for bitbucket.org, the other
+// host vcsStaticRepoRoot statically truncates: a GOPRIVATE pattern naming a
+// module's full, subdirectory-including import path matches that full path
+// but never matches the truncated bitbucket.org/owner/repo root real
+// cmd/go's GOVCS classification actually checks. Confirmed live
+// (2026-10-04, go1.24.4): with GOPRIVATE="bitbucket.org/owner/fake-repo/sub"
+// (naming the nested path exactly) and GOVCS="bitbucket.org/owner/fake-repo:off"
+// (naming only the truncated two-segment root), `go mod download
+// bitbucket.org/owner/fake-repo/sub@v1.0.0` Fatals with "GOVCS disallows
+// using git for public bitbucket.org/owner/fake-repo; see 'go help vcs'" —
+// real go classified it public (the truncated root doesn't match the
+// GOPRIVATE pattern), even though GOPRIVATE matches the full module path
+// exactly.
+func TestRun_LocalModulePrivate_GovcsUsesRepoRootNotFullModulePath_Bitbucket(t *testing.T) {
+	t.Setenv("GOPRIVATE", "bitbucket.org/owner/fake-repo/sub")
+	t.Setenv("GOVCS", "bitbucket.org/owner/fake-repo:off")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"bitbucket.org/owner/fake-repo/sub@v1.0.0"}, &stdout, &stderr, endpoints{})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "govcs-disallowed-locally") {
+		t.Errorf("stdout = %q, want it to mention govcs-disallowed-locally", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "GOVCS disallows using git for public bitbucket.org/owner/fake-repo;") {
+		t.Errorf("stdout = %q, want it to quote real go's exact error naming the truncated repo root, not the full module path", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "private-module-locally") {
+		t.Errorf("stdout = %q, want it NOT to fall back to the plain private-module-locally message", stdout.String())
+	}
+}
+
+// TestRun_LocalModulePrivate_GovcsAllowed_FullPathNotTruncated_Bitbucket is
+// the mirror-image negative control for the two tests above: when GOVCS
+// names the module's full, UNtruncated import path (not the repo root),
+// real go does NOT block the fetch at all — confirmed live (2026-10-04,
+// go1.24.4, GOPROXY=direct GOSUMDB=off): with
+// GOVCS="bitbucket.org/owner/fake-repo/sub:off" (the full nested path, not
+// the two-segment root), `go mod download -x
+// bitbucket.org/owner/fake-repo/sub@v1.0.0` proceeds straight into a real
+// git-fetch attempt (reaching the network) rather than Fataling offline.
+// This guards against an overly-broad fix that started matching GOVCS
+// against the full module path for bitbucket.org instead of the truncated
+// root.
+func TestRun_LocalModulePrivate_GovcsAllowed_FullPathNotTruncated_Bitbucket(t *testing.T) {
+	t.Setenv("GOPRIVATE", "bitbucket.org/owner/fake-repo/sub")
+	t.Setenv("GOVCS", "bitbucket.org/owner/fake-repo/sub:off")
+	ep := readyEndpoints(t)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"bitbucket.org/owner/fake-repo/sub@v1.0.0"}, &stdout, &stderr, ep)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stdout.String(), "govcs-disallowed-locally") {
+		t.Errorf("stdout = %q, want it NOT to report govcs-disallowed-locally (real go's GOVCS pattern only covers the repo root, not this full nested path)", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "private-module-locally") {
+		t.Errorf("stdout = %q, want it to report private-module-locally", stdout.String())
+	}
+}
+
+// TestRun_LocalModulePrivate_GovcsNotDisallowed_NonGitSuffixOutOfScope is a
+// negative control: a module whose import path spells out a literal VCS
+// suffix that ISN'T ".git" (here ".hg") must NOT get the govcs-disallowed
+// treatment, even though generalVCSGitSuffixPattern's real-go counterpart
+// (cmd/go's any-host catch-all vcsPaths entry) resolves a static root for
+// it too — because the real VCS for that host is mercurial, not git, so
+// this tool's git-specific "GOVCS disallows using git for ..." wording
+// would misdescribe the real Fatal (which actually reads "... using hg for
+// ...", confirmed live, go1.24.4, with GOVCS="example.com/foo/bar.hg:off").
+// This guards against generalVCSGitSuffixPattern accidentally widening to
+// the full bzr/fossil/git/hg/svn alternation goprivaudit's own copy uses.
+func TestRun_LocalModulePrivate_GovcsNotDisallowed_NonGitSuffixOutOfScope(t *testing.T) {
+	t.Setenv("GOPRIVATE", "example.com/foo/bar.hg/sub")
+	t.Setenv("GOVCS", "example.com/foo/bar.hg:off")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"example.com/foo/bar.hg/sub@v1.0.0"}, &stdout, &stderr, endpoints{})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stdout.String(), "govcs-disallowed-locally") {
+		t.Errorf("stdout = %q, want it NOT to report govcs-disallowed-locally (this tool has no VCS-type certainty for a .hg-suffixed path)", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "private-module-locally") {
+		t.Errorf("stdout = %q, want it to report private-module-locally (unchanged, out-of-scope behavior)", stdout.String())
+	}
+}
+
 // TestRun_LocalModulePrivate_LeadingSpaceDoesNotMatch is the run()-level
 // regression case for the splitPatterns leading-space bug (see
 // pattern_test.go's TestSplitPatterns_LeadingSpaceBreaksMatch for the

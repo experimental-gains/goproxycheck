@@ -147,8 +147,10 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 		// "GOVCS disallows using git for private <module>", not fetch it,
 		// while this tool used to unconditionally claim the fetch would
 		// succeed. Only checkable when the VCS is known for certain
-		// (github.com is always git; see githubRepoPattern's doc comment
-		// for why other hosts are out of scope) — but the parse-error check
+		// (statically resolved for github.com, bitbucket.org, hub.jazz.net/git,
+		// git.openstack.org, and any host with a literal ".git" suffix
+		// segment; see vcsStaticRepoRoot's doc comment in govcs.go) — but
+		// the parse-error check
 		// ahead of it needs no such certainty, since a malformed GOVCS string
 		// breaks every direct fetch regardless of host or VCS type.
 		govcsPrivate := localGovcsPrivate(module)
@@ -158,8 +160,8 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 				"your local `GOPRIVATE`/`GONOPROXY` config matches %s via the pattern %q, so `go install`/`go get` would normally fetch it directly from its VCS host — but your local `GOVCS` setting is itself malformed (%v), which makes every direct-VCS-requiring `go` command fail outright with this exact parse error, not just for this module, and regardless of whether some other rule in the list would otherwise have allowed it. "+
 					"That's your machine's own config, not a proxy-availability problem, and this tool's proxy/sumdb checks don't apply to it either way. Fix your `GOVCS` setting (see `go help vcs`) — real `go` validates the whole list up front, so one bad entry anywhere breaks every direct fetch.",
 				module, pattern, govcsErr)}
-		case githubRepoPattern.MatchString(module) && !localGovcsAllowsGit(module, govcsPrivate):
-			// The quoted error text below names githubRepoRoot(module), not
+		case vcsStaticRepoRoot(module) != "" && !localGovcsAllowsGit(module, govcsPrivate):
+			// The quoted error text below names vcsStaticRepoRoot(module), not
 			// module itself: real cmd/go's own "GOVCS disallows using %s for
 			// %s %s" error (checkGOVCS) names the VCS-resolved repo root, the
 			// same truncated value localGovcsPrivate/localGovcsAllowsGit now
@@ -167,11 +169,19 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 			// module with a major-version suffix or monorepo subdirectory,
 			// that's shorter than module itself, and this message used to
 			// name the untruncated module here, which wouldn't match what a
-			// user pastes from their own terminal.
+			// user pastes from their own terminal. This case used to be
+			// gated on githubRepoPattern.MatchString(module) specifically,
+			// so any non-github.com module (bitbucket.org, hub.jazz.net/git,
+			// git.openstack.org, a ".git"-suffixed vanity path) never reached
+			// this case at all — not just with the wrong root, but not
+			// reached even when a GOVCS rule matched such a module's full
+			// import path exactly, with no truncation question involved.
+			// See vcsStaticRepoRoot's doc comment (govcs.go) for the live
+			// verification.
 			d = diagnosis{statusGovcsDisallowedLocally, fmt.Sprintf(
 				"your local `GOPRIVATE`/`GONOPROXY` config matches %s via the pattern %q, so `go install`/`go get` would normally fetch it directly from its VCS host — but your local `GOVCS` setting disallows git for this (%[3]s) module, so the real command fails outright with `GOVCS disallows using git for %[3]s %[4]s; see 'go help vcs'` instead of succeeding. "+
 					"That's your machine's own config, not a proxy-availability problem, and this tool's proxy/sumdb checks don't apply to it either way. Adjust `GOVCS` (or `go env -w GOVCS=...`) if you meant to allow this.",
-				module, pattern, govcsWhat(govcsPrivate), githubRepoRoot(module))}
+				module, pattern, govcsWhat(govcsPrivate), vcsStaticRepoRoot(module))}
 		default:
 			d = diagnosis{statusPrivateModuleLocally, fmt.Sprintf(
 				"your local `GOPRIVATE`/`GONOPROXY` config matches %s via the pattern %q, so `go install`/`go get` will fetch it directly from its VCS host here, never through proxy.golang.org — "+
@@ -209,14 +219,15 @@ func run(args []string, stdout, stderr io.Writer, ep endpoints) int {
 				"your local `GOPROXY` resolves to `direct` (via env var or `go env -w`), so `go install`/`go get` would normally fetch %s@%s straight from its VCS host — but your local `GOVCS` setting is itself malformed (%v), which makes every direct-VCS-requiring `go` command fail outright with this exact parse error, regardless of whether some other rule in the list would otherwise have allowed this fetch. "+
 					"That's your machine's own config, not a proxy-availability problem, and this tool's proxy/sumdb checks don't apply to it either way. Fix your `GOVCS` setting (see `go help vcs`) — real `go` validates the whole list up front, so one bad entry anywhere breaks every direct fetch.",
 				module, version, govcsErr)}
-		case githubRepoPattern.MatchString(module) && !localGovcsAllowsGit(module, govcsPrivate):
+		case vcsStaticRepoRoot(module) != "" && !localGovcsAllowsGit(module, govcsPrivate):
 			// See the equivalent case in the private-module branch above for
-			// why githubRepoRoot(module), not module, is named in the quoted
-			// error text.
+			// why vcsStaticRepoRoot(module), not module, is named in the
+			// quoted error text, and for why this case is no longer gated
+			// on githubRepoPattern.MatchString(module) specifically.
 			d = diagnosis{statusGovcsDisallowedLocally, fmt.Sprintf(
 				"your local `GOPROXY` resolves to `direct` (via env var or `go env -w`), so `go install`/`go get` would normally fetch %s@%s straight from its VCS host — but your local `GOVCS` setting disallows git for this (%[3]s) module, so the real command fails outright with `GOVCS disallows using git for %[3]s %[4]s; see 'go help vcs'` instead of succeeding. "+
 					"That's your machine's own config, not a proxy-availability problem, and this tool's proxy/sumdb checks don't apply to it either way. Adjust `GOVCS` (or `go env -w GOVCS=...`) if you meant to allow this.",
-				module, version, govcsWhat(govcsPrivate), githubRepoRoot(module))}
+				module, version, govcsWhat(govcsPrivate), vcsStaticRepoRoot(module))}
 		default:
 			d = diagnosis{statusGoproxyDirectLocally, fmt.Sprintf(
 				"your local `GOPROXY` resolves to `direct` (via env var or `go env -w`), so `go install`/`go get` will fetch %s@%s straight from its VCS host here, never through proxy.golang.org — "+
@@ -2727,17 +2738,17 @@ func localGoproxyDirectFallback() bool {
 // proxy negative cache — see localGoproxyDirectFallback's doc comment.
 // Returns "" when that isn't actually established: either the GOPROXY
 // chain doesn't fall back to direct immediately after the public proxy, the
-// module isn't rooted at github.com (the only host this tool has VCS-type
-// certainty for — see githubRepoPattern's doc comment), or the local GOVCS
-// setting would itself block or fail to parse for a direct git fetch of
-// this module (mirroring the same two-stage GOVCS check used elsewhere in
-// run(): a malformed GOVCS blocks every direct fetch outright, regardless
-// of whether any one rule would otherwise have allowed this module).
+// module isn't rooted at a host this tool has VCS-type certainty for (see
+// vcsStaticRepoRoot's doc comment in govcs.go), or the local GOVCS setting
+// would itself block or fail to parse for a direct git fetch of this module
+// (mirroring the same two-stage GOVCS check used elsewhere in run(): a
+// malformed GOVCS blocks every direct fetch outright, regardless of whether
+// any one rule would otherwise have allowed this module).
 func negativeCacheDirectFallbackNote(module string) string {
 	if !localGoproxyDirectFallback() {
 		return ""
 	}
-	if !githubRepoPattern.MatchString(module) {
+	if vcsStaticRepoRoot(module) == "" {
 		return ""
 	}
 	if localGovcsConfigError() != nil {
@@ -2806,13 +2817,15 @@ func localModulePrivate(module string) (bool, string) {
 // problem") when a real `go mod download`/`go install` fails outright with
 // "GOVCS disallows using git for ...".
 //
-// Matches against githubRepoRoot(module), NOT module itself: real cmd/go's
-// checkGOVCS (internal/vcs/vcs.go) computes `private` from
+// Matches against vcsStaticRepoRoot(module), NOT module itself: real
+// cmd/go's checkGOVCS (internal/vcs/vcs.go) computes `private` from
 // `module.MatchPrefixPatterns(cfg.GOPRIVATE, root)`, where root comes from
-// VCS-root resolution (vcsPaths' github.com regexp, `^(?P<root>github\.com/
-// [\w.\-]+/[\w.\-]+)(/[\w.\-]+)*$`) — always exactly two path segments after
-// "github.com", discarding anything past it, including a major-version
-// suffix like "/v2" or a monorepo subdirectory. A GOPRIVATE pattern that's
+// VCS-root resolution (vcsPaths' per-host static regexps — github.com,
+// bitbucket.org, hub.jazz.net/git, git.openstack.org, or any host spelling
+// out a literal ".git" suffix segment; see vcsStaticRepoRoot's doc comment
+// in govcs.go) — always truncated to the host's own fixed root shape,
+// discarding anything past it, including a major-version suffix like "/v2"
+// or a monorepo subdirectory. A GOPRIVATE pattern that's
 // more specific than the repo root (e.g. it names the versioned or nested
 // import path itself, not just the bare owner/repo) can match the full
 // module path while never matching the truncated root real `go` actually
@@ -2835,7 +2848,7 @@ func localGovcsPrivate(module string) bool {
 		return false // best-effort: don't block the real check on this
 	}
 	root := module
-	if r := githubRepoRoot(module); r != "" {
+	if r := vcsStaticRepoRoot(module); r != "" {
 		root = r
 	}
 	return matchesAnyPattern(root, splitPatterns(strings.TrimSpace(string(out))))
@@ -2862,25 +2875,29 @@ func govcsWhat(private bool) string {
 // localGoproxyOff shape above.
 //
 // Callers must only invoke this for a module whose direct-fetch VCS is
-// known to be git — this tool only has that certainty for github.com-hosted
-// modules (see githubRepoPattern's doc comment on why other hosts are out
-// of scope), so it's gated on that at the call site in run(), not here. That
-// same precondition means githubRepoRoot(module) is always non-empty here.
+// known to be git — this tool only has that certainty for the hosts
+// vcsStaticRepoRoot resolves (github.com, bitbucket.org, hub.jazz.net/git,
+// git.openstack.org, or any host spelling out a literal ".git" suffix
+// segment; see that function's doc comment in govcs.go for why every other
+// host is out of scope), so it's gated on that at the call site in run(),
+// not here. That same precondition means vcsStaticRepoRoot(module) is
+// always non-empty here.
 //
-// Passes githubRepoRoot(module), not module itself, to govcsAllowsGit's own
-// pattern-glob matching (the non-public/non-private "default:" case in its
-// rule loop): real cmd/go's checkGOVCS calls govcs.allow(root, ...) with the
-// same VCS-resolved root used for the private/public classification (see
-// localGovcsPrivate's doc comment for why that's truncated to just
-// owner/repo), so a GOVCS host pattern as specific as the full module path
-// (e.g. "github.com/googleapis/gax-go/v2:off") would match module directly
-// but never match the root real go actually checks it against.
+// Passes vcsStaticRepoRoot(module), not module itself, to govcsAllowsGit's
+// own pattern-glob matching (the non-public/non-private "default:" case in
+// its rule loop): real cmd/go's checkGOVCS calls govcs.allow(root, ...) with
+// the same VCS-resolved root used for the private/public classification
+// (see localGovcsPrivate's doc comment for why that's truncated to the
+// host's own fixed root shape), so a GOVCS host pattern as specific as the
+// full module path (e.g. "github.com/googleapis/gax-go/v2:off", or
+// "bitbucket.org/owner/repo/sub:off") would match module directly but never
+// match the root real go actually checks it against.
 func localGovcsAllowsGit(module string, private bool) bool {
 	out, err := exec.Command("go", "env", "GOVCS").Output()
 	if err != nil {
 		return true // best-effort: don't block the real check on this
 	}
-	return govcsAllowsGit(githubRepoRoot(module), private, strings.TrimSpace(string(out)))
+	return govcsAllowsGit(vcsStaticRepoRoot(module), private, strings.TrimSpace(string(out)))
 }
 
 // localGovcsConfigError reports the parse error the local `go` command's

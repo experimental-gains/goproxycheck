@@ -160,6 +160,58 @@ func TestLocalGovcsPrivate_UsesRepoRootNotFullModulePath(t *testing.T) {
 	}
 }
 
+// TestVcsStaticRepoRoot covers vcsStaticRepoRoot's five offline-resolvable
+// shapes (github.com, bitbucket.org, hub.jazz.net/git, git.openstack.org,
+// and any host with a literal ".git" suffix segment) plus two negative
+// controls: a host with no statically-known root at all, and a host
+// spelling out a literal VCS-suffix segment that ISN'T ".git" (".hg"),
+// which this tool deliberately treats as out of scope — see
+// generalVCSGitSuffixPattern's doc comment for why only ".git" is safe to
+// treat as "VCS is certainly git" here, unlike goprivaudit's own copy of
+// this pattern (which only ever asks "is git specifically disallowed," a
+// question that stays valid regardless of which VCS the path would really
+// resolve to).
+//
+// Every positive case here was confirmed live against a real go1.24.4
+// toolchain (GOPROXY=direct GOSUMDB=off, a fresh GOMODCACHE): GOVCS naming
+// the truncated root Fatals with "GOVCS disallows using git for ..."
+// immediately and offline, while GOVCS naming the full, untruncated import
+// path does not Fatal at all — it proceeds to a real git-fetch attempt
+// instead. See the per-pattern doc comments in govcs.go for the exact
+// commands and output; the bitbucket.org case is additionally covered
+// end-to-end in run_test.go (TestRun_LocalModulePrivate_GovcsDisallowed_Bitbucket),
+// including the total-miss shape (an exact, non-nested match that needed no
+// truncation at all, yet this tool's GOVCS-disallowed check never even ran
+// for it pre-fix, since it was gated on githubRepoPattern.MatchString(module)
+// specifically).
+func TestVcsStaticRepoRoot(t *testing.T) {
+	cases := []struct {
+		name   string
+		module string
+		want   string
+	}{
+		{"github.com root, no subpath", "github.com/owner/repo", "github.com/owner/repo"},
+		{"github.com root, major-version subpath truncated", "github.com/owner/repo/v2", "github.com/owner/repo"},
+		{"bitbucket.org root, no subpath", "bitbucket.org/owner/repo", "bitbucket.org/owner/repo"},
+		{"bitbucket.org root, subpath truncated", "bitbucket.org/owner/repo/sub/pkg", "bitbucket.org/owner/repo"},
+		{"hub.jazz.net/git root, subpath truncated", "hub.jazz.net/git/abc123/myproject/subpkg", "hub.jazz.net/git/abc123/myproject"},
+		{"git.openstack.org root, no subpath", "git.openstack.org/openstack/nova", "git.openstack.org/openstack/nova"},
+		{"git.openstack.org root, subpath truncated", "git.openstack.org/openstack/nova/sub", "git.openstack.org/openstack/nova"},
+		{"general .git-suffix host, subpath truncated", "example.com/foo/bar.git/sub", "example.com/foo/bar.git"},
+		{"general .git-suffix host, no subpath", "example.com/foo/bar.git", "example.com/foo/bar.git"},
+		{"host with no statically-known root at all", "gitlab.com/owner/repo", ""},
+		{"literal .hg suffix is deliberately out of scope (not certainly git)", "example.com/foo/bar.hg/sub", ""},
+		{"literal .svn suffix is deliberately out of scope", "example.com/foo/bar.svn", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := vcsStaticRepoRoot(c.module); got != c.want {
+				t.Errorf("vcsStaticRepoRoot(%q) = %q, want %q", c.module, got, c.want)
+			}
+		})
+	}
+}
+
 // TestGovcsConfigError covers govcsConfigError against the five malformed
 // shapes confirmed live against a real toolchain (2026-09-27, GOPROXY=direct
 // against a fresh GOMODCACHE so the direct-VCS/checkGOVCS path is actually

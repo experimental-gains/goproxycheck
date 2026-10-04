@@ -2,8 +2,165 @@ package main
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 )
+
+// bitbucketRepoPattern is githubRepoPattern's (proxy.go) sibling for
+// bitbucket.org — also a static, two-segment-root entry in real cmd/go's
+// own vcsPaths table (go1.24.4 source,
+// cmd/go/internal/vcs/vcs.go:1538-1544:
+// `^(?P<root>bitbucket\.org/[\w.\-]+/[\w.\-]+)(/[\w.\-]+)*$`, vcs: "git"),
+// truncating any path segment past "owner/repo" exactly the way github.com's
+// entry truncates past "owner/repo". Live-verified (2026-10-04, go1.24.4,
+// GOPROXY=direct GOSUMDB=off, a fresh, isolated GOMODCACHE): with
+// GOVCS="bitbucket.org/owner/fake-repo/sub:off" (naming a bitbucket.org
+// import path's own subdirectory, not its two-segment repo root), `go mod
+// download -x bitbucket.org/owner/fake-repo/sub@v1.0.0` does NOT hit a
+// "GOVCS disallows" Fatal at all — it proceeds straight into a real `git
+// ls-remote` attempt against bitbucket.org (reaching the network and 404ing
+// on the repo's own nonexistence, exactly the same "got past the local
+// config check, hit a real remote failure next" shape a genuine leak would
+// show reaching sum.golang.org) — while GOVCS="bitbucket.org/owner/fake-repo:off"
+// (naming exactly the truncated root) Fatals immediately and offline with
+// "GOVCS disallows using git for public bitbucket.org/owner/fake-repo; see
+// 'go help vcs'". Before this fix, this tool's GOVCS-disallowed check (in
+// run(), both the GOPRIVATE/GONOPROXY-direct-fetch branch and the
+// GOPROXY=direct branch) was gated on githubRepoPattern.MatchString(module)
+// specifically — meaning for a bitbucket.org module it never even attempted
+// localGovcsAllowsGit at all, not just with the wrong (untruncated) root:
+// any GOVCS rule naming a bitbucket.org module, even one matching the full
+// import path *exactly* with no subdirectory at all (no truncation question
+// involved whatsoever), was silently ignored and the tool reported "will
+// fetch it directly, no problem" for a module a real `go install` Fatals on
+// outright. Confirmed this exact total-miss shape live too: with
+// GOVCS="bitbucket.org/owner/fake-repo:off" matching a *non-nested*
+// bitbucket.org/owner/fake-repo@v1.0.0 exactly, real go still Fatals
+// identically ("GOVCS disallows using git for public
+// bitbucket.org/owner/fake-repo"), but the pre-fix tool reported
+// statusPrivateModuleLocally regardless, since the call site never reached
+// localGovcsAllowsGit for any non-github.com host in the first place.
+var bitbucketRepoPattern = regexp.MustCompile(`^bitbucket\.org/([^/]+)/([^/]+)`)
+
+// hubJazzNetRepoPattern is githubRepoPattern's sibling for IBM DevOps
+// Services' old JazzHub — a third hardcoded, static-root vcsPaths entry
+// (cmd/go/internal/vcs/vcs.go:1547-1553:
+// `^(?P<root>hub\.jazz\.net/git/[a-z0-9]+/[\w.\-]+)(/[\w.\-]+)*$`, vcs:
+// "git"), truncating any path segment past "git/<user>/<project>" the same
+// way github.com's and bitbucket.org's entries truncate past "owner/repo".
+var hubJazzNetRepoPattern = regexp.MustCompile(`^hub\.jazz\.net/git/[a-z0-9]+/([^/]+)`)
+
+// openstackRepoPattern is githubRepoPattern's sibling for the old
+// git.openstack.org — a fourth hardcoded, static-root vcsPaths entry
+// (cmd/go/internal/vcs/vcs.go:1564-1569:
+// `^(?P<root>git\.openstack\.org/[\w.\-]+/[\w.\-]+)(\.git)?(/[\w.\-]+)*$`,
+// vcs: "git"), truncating any path segment past "<project>/<repo>" the same
+// way bitbucket.org's entry truncates past "owner/repo". Unlike
+// git.apache.org's sibling table entry (whose repo name must always
+// literally end in ".git", so it's already resolvable via
+// generalVCSGitSuffixPattern below) and chiselapp.com's (anchored with a
+// trailing "$", so it allows no subdirectory past its root at all — its
+// "root" and "full import path" are always identical, nothing to
+// truncate), git.openstack.org's ".git" suffix is optional, so a path with
+// no literal suffix segment at all (the common case) needs this dedicated
+// entry.
+var openstackRepoPattern = regexp.MustCompile(`^git\.openstack\.org/([^/]+)/([^/]+)`)
+
+// generalVCSGitSuffixPattern mirrors cmd/go/internal/vcs's vcsPaths table's
+// last entry — "General syntax for any server", explicitly comment-marked
+// "Must be last." in the real go1.24.4 source
+// (cmd/go/internal/vcs/vcs.go:1579-1584) — which resolves an import path to
+// a fixed VCS repo root for literally ANY host, not just the four above,
+// whenever the path spells out a literal VCS-suffix segment. The real
+// table's regexp recognizes five suffixes (bzr/fossil/git/hg/svn) and reads
+// the matched one back out to pick which VCS tool to invoke — but this
+// tool's whole GOVCS-disallow diagnosis is worded specifically around git
+// ("GOVCS disallows using git for ..."), so it's only sound to treat a
+// match here as "VCS is certainly git" for the literal ".git" suffix;
+// narrowed to just that one suffix, deliberately not the full alternation,
+// unlike goprivaudit's own copy of this pattern (which only ever asks "is
+// git specifically disallowed," a question that stays valid regardless of
+// which VCS the path would really resolve to).
+//
+// Live-verified (2026-10-04, go1.24.4, GOPROXY=direct GOSUMDB=off): a
+// require for "example.com/foo/bar.git/sub@v1.0.0". GOVCS=
+// "example.com/foo/bar.git/sub:off" (the module's own full, uncollapsed
+// path) does NOT block it — `go mod download -x` proceeds straight to an
+// ordinary direct git-fetch attempt against example.com (reaching the
+// network: the command actually dials out). GOVCS="example.com/foo/bar.git:off"
+// (the regex-truncated root, dropping "/sub") DOES block it: `go:
+// example.com/foo/bar.git/sub@v1.0.0: GOVCS disallows using git for public
+// example.com/foo/bar.git; see 'go help vcs'`, Fatal, zero network access.
+var generalVCSGitSuffixPattern = regexp.MustCompile(`^(([a-z0-9.\-]+\.)+[a-z0-9.\-]+(:[0-9]+)?(/~?[\w.\-]+)+?\.git)(/~?[\w.\-]+)*$`)
+
+// bitbucketRepoRoot returns modulePath's "bitbucket.org/owner/repo" prefix,
+// or "" if modulePath isn't bitbucket.org-hosted. See bitbucketRepoPattern.
+func bitbucketRepoRoot(modulePath string) string {
+	return bitbucketRepoPattern.FindString(modulePath)
+}
+
+// hubJazzNetRepoRoot returns modulePath's "hub.jazz.net/git/user/project"
+// prefix, or "" if modulePath isn't hub.jazz.net/git-hosted. See
+// hubJazzNetRepoPattern.
+func hubJazzNetRepoRoot(modulePath string) string {
+	return hubJazzNetRepoPattern.FindString(modulePath)
+}
+
+// openstackRepoRoot returns modulePath's "git.openstack.org/project/repo"
+// prefix, or "" if modulePath isn't git.openstack.org-hosted. See
+// openstackRepoPattern.
+func openstackRepoRoot(modulePath string) string {
+	return openstackRepoPattern.FindString(modulePath)
+}
+
+// generalVCSGitSuffixRoot returns modulePath's VCS repo root per
+// generalVCSGitSuffixPattern — the segment up to and including its literal
+// ".git" suffix — or "" if modulePath contains no such suffix.
+func generalVCSGitSuffixRoot(modulePath string) string {
+	m := generalVCSGitSuffixPattern.FindStringSubmatch(modulePath)
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
+// vcsStaticRepoRoot returns modulePath's statically-known, certainly-git
+// VCS repo root — see githubRepoPattern (proxy.go), bitbucketRepoPattern,
+// hubJazzNetRepoPattern, openstackRepoPattern, and
+// generalVCSGitSuffixPattern above — or "" if modulePath doesn't match any
+// of the shapes this tool can resolve offline with certainty. Used by
+// localGovcsPrivate/localGovcsAllowsGit (main.go) in place of modulePath
+// itself, and by run() to decide whether its GOVCS-disallowed check applies
+// to a module at all: see those callers' doc comments for why a GOVCS/
+// GOPRIVATE pattern more specific than the real VCS-resolved root (a
+// "/v2"-suffixed or monorepo-nested import path, say) can match modulePath
+// directly without ever matching the root real go actually classifies and
+// matches against — and why, before this function existed, every host
+// besides github.com was entirely out of scope for this tool's
+// GOVCS-disallowed diagnosis, not just mishandled for the truncation case.
+//
+// git.apache.org and chiselapp.com — cmd/go/internal/vcs's remaining two
+// pathPrefix-gated vcsPaths entries — are deliberately not added as their
+// own cases here, mirroring goprivaudit's own vcsStaticRepoRoot: every
+// valid git.apache.org path already ends in ".git" literally, so
+// generalVCSGitSuffixRoot already resolves it; chiselapp.com's repo
+// (fossil, not git, and anchored with a trailing "$" besides) is out of
+// scope for a git-specific check either way.
+func vcsStaticRepoRoot(modulePath string) string {
+	if root := githubRepoRoot(modulePath); root != "" {
+		return root
+	}
+	if root := bitbucketRepoRoot(modulePath); root != "" {
+		return root
+	}
+	if root := hubJazzNetRepoRoot(modulePath); root != "" {
+		return root
+	}
+	if root := openstackRepoRoot(modulePath); root != "" {
+		return root
+	}
+	return generalVCSGitSuffixRoot(modulePath)
+}
 
 // govcsDefault is cmd/go's own built-in fallback rule, applied whenever no
 // explicit GOVCS entry matches (see `go help vcs`: "the 'go get' command
