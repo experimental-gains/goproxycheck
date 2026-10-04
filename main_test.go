@@ -836,6 +836,149 @@ func TestModuleFromGoMod_RequireExcludeArgCountNotOverTriggered(t *testing.T) {
 	}
 }
 
+// TestModuleFromGoMod_ReplaceArgCount is a regression test for a real bug
+// (testing-practice technique #201): moduleFromGoMod had no model at all of
+// `replace`'s own argument grammar — real golang.org/x/mod/modfile's
+// parseReplace (rule.go) Fatals unless the token right after the module
+// path (and optional old version) is a literal "=>", with exactly the
+// right number of arguments around it. requireExcludeDirectiveArgCountError
+// deliberately left this verb out of its own "exactly two arguments" check
+// (see its doc comment) since replace's grammar doesn't fit that shape at
+// all — leaving it completely unchecked.
+//
+// Live-verified (2026-10-04, go1.24.4, GOPROXY=off): both shapes below
+// Fatal real `go list -m`/`go build` immediately and entirely offline with
+// `go.mod:N: usage: replace module/path [v1.2.3] => other/module v1.4`,
+// before moduleDirective's own module-path extraction (or anything else in
+// the file) is ever resolved. Before this fix, moduleFromGoMod extracted
+// the module path normally and probed the live proxy as if the file were
+// ordinary — confirmed live, a plain statusModuleUnknown verdict — for a
+// go.mod that can never build at all.
+func TestModuleFromGoMod_ReplaceArgCount(t *testing.T) {
+	for name, content := range map[string]string{
+		"missing arrow entirely":       "module example.com/foo\n\ngo 1.21\n\nreplace example.com/bar v1.0.0\n",
+		"arrow present, nothing after": "module example.com/foo\n\ngo 1.21\n\nreplace example.com/bar => \n",
+		"block entry, missing arrow":   "module example.com/foo\n\ngo 1.21\n\nreplace (\n\texample.com/bar v1.0.0\n)\n",
+		"too many tokens after arrow":  "module example.com/foo\n\ngo 1.21\n\nreplace example.com/bar => example.com/baz v1.0.0 extra\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "go.mod")
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := moduleFromGoMod(path)
+			if err == nil {
+				t.Fatalf("expected an error for a malformed replace directive, got module %q", got)
+			}
+			if !strings.Contains(err.Error(), "usage: replace module/path") {
+				t.Errorf("error %q doesn't cite real go's own `usage: replace module/path ...` Fatal", err)
+			}
+		})
+	}
+}
+
+// TestModuleFromGoMod_ReplaceArgCountNotOverTriggered confirms the above
+// fix stays narrowly scoped: well-formed replace directives — with and
+// without an old version, with and without a new version, single-line and
+// inside a block, and spelling the target as either another module or a
+// local directory path — must still resolve normally.
+func TestModuleFromGoMod_ReplaceArgCountNotOverTriggered(t *testing.T) {
+	content := "module example.com/foo\n\ngo 1.21\n\n" +
+		"replace example.com/bar v1.0.0 => example.com/baz v1.0.0\n\n" +
+		"replace example.com/qux => ../local/qux\n\n" +
+		"replace (\n" +
+		"\texample.com/a v1.0.0 => example.com/b v1.0.0\n" +
+		"\texample.com/c => ../local/c\n" +
+		")\n"
+	dir := t.TempDir()
+	path := filepath.Join(dir, "go.mod")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := moduleFromGoMod(path)
+	if err != nil {
+		t.Fatalf("unexpected error for a go.mod with well-formed replace directives: %v", err)
+	}
+	if want := "example.com/foo"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// TestModuleFromGoMod_RetractArgCount is a regression test for a real bug
+// (testing-practice technique #201), the `retract` sibling of
+// TestModuleFromGoMod_ReplaceArgCount: real golang.org/x/mod/modfile's
+// parseVersionInterval (rule.go) requires retract's argument to be either a
+// single bare version, or a bracketed "[low, high]" interval, with nothing
+// else on the line — a shape requireExcludeDirectiveArgCountError's own doc
+// comment deliberately leaves out of its "exactly two arguments" check.
+//
+// Live-verified (2026-10-04, go1.24.4, GOPROXY=off): `retract v1.0.0
+// v2.0.0` (a bare range, missing the required brackets — a realistic typo)
+// Fatals with `go.mod:N: unexpected token after version: "v2.0.0"`, and a
+// bare `retract` with no argument Fatals with `go.mod:N: expected '[' or
+// version` — both entirely offline, before moduleDirective or anything
+// else in the file is ever resolved. Before this fix, moduleFromGoMod
+// extracted the module path normally and probed the live proxy, reporting
+// a plain statusModuleUnknown verdict for a go.mod that can never build.
+func TestModuleFromGoMod_RetractArgCount(t *testing.T) {
+	for name, content := range map[string]string{
+		"bare range missing brackets":   "module example.com/foo\n\ngo 1.21\n\nretract v1.0.0 v2.0.0\n",
+		"no argument at all":            "module example.com/foo\n\ngo 1.21\n\nretract\n",
+		"unclosed bracket":              "module example.com/foo\n\ngo 1.21\n\nretract [v1.0.0\n",
+		"missing comma in range":        "module example.com/foo\n\ngo 1.21\n\nretract [v1.0.0 v2.0.0]\n",
+		"missing closing bracket":       "module example.com/foo\n\ngo 1.21\n\nretract [v1.0.0, v2.0.0\n",
+		"block entry, missing brackets": "module example.com/foo\n\ngo 1.21\n\nretract (\n\tv1.0.0 v2.0.0\n)\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "go.mod")
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := moduleFromGoMod(path)
+			if err == nil {
+				t.Fatalf("expected an error for a malformed retract directive, got module %q", got)
+			}
+			if !strings.Contains(err.Error(), "retract") {
+				t.Errorf("error %q doesn't mention the malformed retract directive", err)
+			}
+		})
+	}
+}
+
+// TestModuleFromGoMod_RetractArgCountNotOverTriggered confirms the above
+// fix stays narrowly scoped: a well-formed bare-version retract and a
+// well-formed bracketed-range retract — with and without spaces around the
+// brackets/comma, single-line and inside a block, with and without a
+// trailing rationale comment — must still resolve normally.
+func TestModuleFromGoMod_RetractArgCountNotOverTriggered(t *testing.T) {
+	content := "module example.com/foo\n\ngo 1.21\n\n" +
+		"retract v1.0.0\n\n" +
+		"retract [v1.1.0, v1.2.0]\n\n" +
+		"retract [v1.3.0,v1.4.0]\n\n" +
+		"retract (\n" +
+		"\tv1.5.0 // mistake\n" +
+		"\t[v1.6.0, v1.7.0] // bad release\n" +
+		")\n"
+	dir := t.TempDir()
+	path := filepath.Join(dir, "go.mod")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := moduleFromGoMod(path)
+	if err != nil {
+		t.Fatalf("unexpected error for a go.mod with well-formed retract directives: %v", err)
+	}
+	if want := "example.com/foo"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
 // TestModuleFromGoMod_BlockComment is a regression test for a real bug:
 // go.mod has no block-comment syntax at all — golang.org/x/mod/modfile's
 // lexer Fatals unconditionally the moment it sees "/*" outside a quoted

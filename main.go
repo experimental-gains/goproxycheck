@@ -1070,6 +1070,27 @@ func moduleFromGoMod(path string) (string, error) {
 		// extraction (or anything else in the file) is ever resolved.
 		return "", fmt.Errorf("%s %s, entirely offline, before ever contacting the proxy, so this could never resolve regardless of the repo or proxy config", path, lineErr)
 	}
+	if lineErr := replaceDirectiveArgCountError(string(data)); lineErr != nil {
+		// See replaceDirectiveArgCountError's doc comment for the live
+		// confirmation that a `replace` directive whose "=>" arrow is
+		// missing, misplaced, or surrounded by the wrong number of
+		// arguments — a realistic hand-edit or merge-conflict mistake, not
+		// a contrived shape — Fatals real `go list -m`/`go build`
+		// immediately and entirely offline, before moduleDirective's own
+		// module-path extraction (or anything else in the file) is ever
+		// resolved. Deliberately left unchecked by
+		// requireExcludeDirectiveArgCountError's own doc comment (a
+		// materially different argument grammar, not a fixed argument
+		// count).
+		return "", fmt.Errorf("%s %s, entirely offline, before ever contacting the proxy, so this could never resolve regardless of the repo or proxy config", path, lineErr)
+	}
+	if lineErr := retractDirectiveArgCountError(string(data)); lineErr != nil {
+		// Same family as the replace check just above, for `retract`'s own
+		// "bare version, or bracketed [low, high] interval, nothing else"
+		// grammar — see retractDirectiveArgCountError's doc comment for the
+		// live confirmation.
+		return "", fmt.Errorf("%s %s, entirely offline, before ever contacting the proxy, so this could never resolve regardless of the repo or proxy config", path, lineErr)
+	}
 	mod, err := moduleDirective(string(data))
 	if err != nil {
 		return "", fmt.Errorf("%s %w", path, err)
@@ -1899,9 +1920,12 @@ func directiveArgQuoteError(s string) (badToken string, bad bool) {
 // (its own, more elaborate "A [B] => C [D]" shape) and `retract` (a bare
 // version OR a bracketed [low, high] interval) have different enough
 // argument grammars that generalizing this same count check to them would
-// misfire; left as a narrower, deliberate scope boundary rather than
-// guessed at, the same way ignoreDirectiveArgCountError's own doc comment
-// already leaves a malformed-quoting sub-case of its own scope unfixed.
+// misfire; they instead get their own, separately-scoped
+// replaceDirectiveArgCountError/retractDirectiveArgCountError checks
+// (testing-practice technique #201) mirroring this function's scan
+// structure but each with its own grammar, the same way
+// ignoreDirectiveArgCountError's own doc comment already leaves a
+// malformed-quoting sub-case of its own scope unfixed.
 func requireExcludeDirectiveArgCountError(data string) error {
 	inBlock := false
 	blockVerb := ""
@@ -2009,6 +2033,291 @@ func directiveArgCount(s string) int {
 		n++
 	}
 	return n
+}
+
+// directiveArgTokens tokenizes s (the already comment-stripped argument
+// text of a go.mod directive line, or one entry inside its already-open
+// block form) the same quote-aware way directiveArgCount counts tokens,
+// but returns the actual token strings instead of only a count — needed by
+// replaceArgCountError/retractArgCountError below, which must inspect
+// specific token POSITIONS (is tokens[1] a literal "=>"? is tokens[0] a
+// literal "["?), not just how many tokens there are.
+//
+// Unlike directiveArgCount's plain whitespace split, this also treats each
+// of '(', ')', '[', ']', '{', '}', ',' as its own single-character token
+// even with no surrounding whitespace — mirroring golang.org/x/mod/modfile's
+// own lexer exactly (read.go's isIdent, which excludes precisely this set
+// of runes from an identifier run) — needed because retract's bracketed
+// "[low, high]" interval syntax is valid, and parses identically, whether
+// or not it's written with spaces around the brackets/comma. Confirmed
+// live (2026-10-04, go1.24.4): `retract [v1.0.0,v2.0.0]` (no space before
+// "v2.0.0") and `retract [v1.0.0, v2.0.0]` both pass real go's own
+// shape-check identically (both fail later, on the unrelated semantic
+// "major version mismatch" check, for an otherwise-identical reason) —
+// so a tokenizer that only split on whitespace would wrongly treat
+// "[v1.0.0," as one glued token and misreport a perfectly valid directive
+// as malformed.
+//
+// ok is false if a token opens with '"' but strconv.QuotedPrefix never
+// finds a well-formed close on the same line — the same "different,
+// already-separately-scoped Fatal shape" directiveArgCount's own doc
+// comment describes via its -1 sentinel; callers should report nothing in
+// that case rather than miscounting.
+func directiveArgTokens(s string) (tokens []string, ok bool) {
+	const punct = "()[]{},"
+	for s != "" {
+		if s[0] == ' ' || s[0] == '\t' {
+			s = s[1:]
+			continue
+		}
+		if s[0] == '"' {
+			prefix, err := strconv.QuotedPrefix(s)
+			if err != nil {
+				return nil, false
+			}
+			tokens = append(tokens, prefix)
+			s = s[len(prefix):]
+			continue
+		}
+		if strings.IndexByte(punct, s[0]) >= 0 {
+			tokens = append(tokens, s[:1])
+			s = s[1:]
+			continue
+		}
+		i := 1
+		for i < len(s) && s[i] != ' ' && s[i] != '\t' && strings.IndexByte(punct, s[i]) < 0 {
+			i++
+		}
+		tokens = append(tokens, s[:i])
+		s = s[i:]
+	}
+	return tokens, true
+}
+
+// replaceDirectiveArgCountError scans data — a go.mod file's raw body —
+// for a `replace` directive, single-line or inside its parenthesized block
+// form, that doesn't match real golang.org/x/mod/modfile's own grammar for
+// it (rule.go's parseReplace) — deliberately left unchecked by
+// requireExcludeDirectiveArgCountError's own doc comment ("replace ... has
+// [a] more elaborate... shape [and] generalizing this same count check to
+// [it] would misfire").
+//
+// Confirmed directly against rule.go's parseReplace: it computes an
+// "arrow" position that defaults to 2 (old/path old-version => new/path
+// [new-version]) but drops to 1 the moment the token right after the first
+// one is literally "=>" (old/path => new/path [new-version], no old
+// version given), then Fatals with a fixed "usage: ..." message unless the
+// total argument count is exactly arrow+2 or arrow+3 AND the token at the
+// arrow position is literally "=>".
+//
+// Live-verified (2026-10-04, go1.24.4, GOPROXY=off): a go.mod with
+// `replace example.com/bar v1.0.0` (the "=>" dropped entirely — a
+// realistic hand-edit or merge-conflict mistake, not a contrived shape)
+// Fatals `go list -m`/`go build` immediately and entirely offline with
+// `go.mod:N: usage: replace module/path [v1.2.3] => other/module v1.4` (a
+// second message line names the local-directory-path alternative) —
+// confirmed identically for `replace example.com/bar => ` (the arrow
+// present with nothing after it) and for both shapes written as a single
+// entry inside a `replace (...)` block instead of a standalone line.
+//
+// Before this check, goproxycheck's no-argument local-go.mod mode
+// extracted the module path normally (moduleDirective's scanner never
+// looks at the replace line at all) and probed the live proxy as if the
+// file were perfectly ordinary — confirmed live, this reported a plain
+// statusModuleUnknown verdict ("check: is the repo public? does the module
+// path... typo? GOPRIVATE?") for a go.mod that can never build at all,
+// actively misdirecting the user away from the real, unconditional answer
+// that their own go.mod is unparseable.
+//
+// Deliberately scoped to the "usage:" arg-count/arrow shape only, the same
+// way ignoreDirectiveArgCountError's own doc comment leaves a
+// malformed-quoting sub-case of its own scope unfixed: a replace whose
+// arrow and argument count are both correct can still Fatal on a deeper
+// semantic rule (e.g. "replacement module without version must be
+// directory path"), left unchecked here.
+func replaceDirectiveArgCountError(data string) error {
+	inBlock := false
+	blockVerb := ""
+	lineNo := 0
+	for _, raw := range strings.Split(data, "\n") {
+		lineNo++
+		line := stripLineComment(strings.TrimSpace(raw))
+		if inBlock {
+			if line == ")" {
+				inBlock = false
+				continue
+			}
+			if line == "" {
+				continue
+			}
+			if blockVerb == "replace" {
+				if err := replaceArgCountError(line, lineNo); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if line == "" {
+			continue
+		}
+		verb, rest := line, ""
+		if i := strings.IndexAny(line, " \t("); i >= 0 {
+			verb, rest = line[:i], strings.TrimSpace(line[i:])
+		}
+		if verb != "replace" {
+			if rest == "(" {
+				inBlock = true
+				blockVerb = verb
+			}
+			continue
+		}
+		if rest == "(" {
+			inBlock = true
+			blockVerb = verb
+			continue
+		}
+		if err := replaceArgCountError(rest, lineNo); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// replaceArgCountError checks a single `replace` directive's argument text
+// (content after the verb, or a block entry line — either way, with any
+// trailing "//" comment already stripped) against real
+// golang.org/x/mod/modfile's parseReplace gate — see
+// replaceDirectiveArgCountError's doc comment for the exact rule and live
+// confirmation.
+func replaceArgCountError(content string, lineNo int) error {
+	content = strings.TrimSpace(content)
+	tokens, ok := directiveArgTokens(content)
+	if !ok {
+		// An unterminated quoted token is a different, already-separately
+		// -scoped Fatal shape (goModInvalidQuotedTokenError), left alone
+		// rather than misreported here.
+		return nil
+	}
+	arrow := 2
+	if len(tokens) >= 2 && tokens[1] == "=>" {
+		arrow = 1
+	}
+	if len(tokens) < arrow+2 || len(tokens) > arrow+3 || tokens[arrow] != "=>" {
+		return fmt.Errorf("has a 'replace' directive on line %d that doesn't match the required shape — real `go list -m`/`go build` Fatals immediately with `usage: replace module/path [v1.2.3] => other/module v1.4` (or `replace module/path [v1.2.3] => ../local/directory`)", lineNo)
+	}
+	return nil
+}
+
+// retractDirectiveArgCountError scans data for a `retract` directive,
+// single-line or inside its parenthesized block form, that doesn't match
+// real golang.org/x/mod/modfile's own grammar for it (rule.go's
+// parseVersionInterval plus its caller's own leftover-token check): either
+// a single bare version, or a bracketed "[low, high]" interval, with
+// nothing else on the line — deliberately left unchecked by
+// requireExcludeDirectiveArgCountError's own doc comment for the same
+// reason replace was (a materially different argument grammar, not a
+// fixed argument count).
+//
+// Live-verified (2026-10-04, go1.24.4, GOPROXY=off): `retract v1.0.0
+// v2.0.0` (a bare two-version range, missing the required "[", ",", "]"
+// brackets around it — a realistic typo, not a contrived shape) Fatals
+// `go list -m`/`go build` immediately and entirely offline with
+// `go.mod:N: unexpected token after version: "v2.0.0"`; a bare `retract`
+// with no argument at all Fatals with `go.mod:N: expected '[' or
+// version`; confirmed identically for both shapes written as a single
+// entry inside a `retract (...)` block instead of a standalone line.
+//
+// Before this check, goproxycheck's no-argument local-go.mod mode
+// extracted the module path normally and probed the live proxy as if the
+// file were perfectly ordinary, reporting a plain statusModuleUnknown
+// verdict for a go.mod that can never build at all — the same misdirection
+// replaceDirectiveArgCountError's doc comment describes for `replace`.
+func retractDirectiveArgCountError(data string) error {
+	inBlock := false
+	blockVerb := ""
+	lineNo := 0
+	for _, raw := range strings.Split(data, "\n") {
+		lineNo++
+		line := stripLineComment(strings.TrimSpace(raw))
+		if inBlock {
+			if line == ")" {
+				inBlock = false
+				continue
+			}
+			if line == "" {
+				continue
+			}
+			if blockVerb == "retract" {
+				if err := retractArgCountError(line, lineNo); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if line == "" {
+			continue
+		}
+		verb, rest := line, ""
+		if i := strings.IndexAny(line, " \t("); i >= 0 {
+			verb, rest = line[:i], strings.TrimSpace(line[i:])
+		}
+		if verb != "retract" {
+			if rest == "(" {
+				inBlock = true
+				blockVerb = verb
+			}
+			continue
+		}
+		if rest == "(" {
+			inBlock = true
+			blockVerb = verb
+			continue
+		}
+		if err := retractArgCountError(rest, lineNo); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// retractArgCountError checks a single `retract` directive's argument text
+// (content after the verb, or a block entry line — either way, with any
+// trailing "//" rationale comment already stripped) against real
+// golang.org/x/mod/modfile's own grammar — see
+// retractDirectiveArgCountError's doc comment for the exact rule and live
+// confirmation.
+func retractArgCountError(content string, lineNo int) error {
+	content = strings.TrimSpace(content)
+	tokens, ok := directiveArgTokens(content)
+	if !ok {
+		return nil
+	}
+	if len(tokens) == 0 || tokens[0] == "(" {
+		return fmt.Errorf("has a 'retract' directive on line %d with no version — real `go list -m`/`go build` Fatals immediately with `expected '[' or version`", lineNo)
+	}
+	if tokens[0] != "[" {
+		if len(tokens) > 1 {
+			return fmt.Errorf("has a 'retract' directive on line %d with an unexpected extra token (%q) after its version — real `go list -m`/`go build` Fatals immediately with `unexpected token after version: %q` (a version range needs square brackets: `retract [v1.0.0, v2.0.0]`)", lineNo, tokens[1], tokens[1])
+		}
+		return nil
+	}
+	// Bracketed interval: "[" low "," high "]", nothing more.
+	if len(tokens) < 2 {
+		return fmt.Errorf("has a 'retract' directive on line %d with an unclosed '[' and no version after it — real `go list -m`/`go build` Fatals immediately with `expected version after '['`", lineNo)
+	}
+	if len(tokens) < 3 || tokens[2] != "," {
+		return fmt.Errorf("has a 'retract' directive on line %d missing the ',' that must separate a version range's low and high bounds — real `go list -m`/`go build` Fatals immediately with `expected ',' after version`", lineNo)
+	}
+	if len(tokens) < 4 {
+		return fmt.Errorf("has a 'retract' directive on line %d with no version after its ',' — real `go list -m`/`go build` Fatals immediately with `expected version after ','`", lineNo)
+	}
+	if len(tokens) < 5 || tokens[4] != "]" {
+		return fmt.Errorf("has a 'retract' directive on line %d missing the ']' that must close a version range — real `go list -m`/`go build` Fatals immediately with `expected ']' after version`", lineNo)
+	}
+	if len(tokens) > 5 {
+		return fmt.Errorf("has a 'retract' directive on line %d with an unexpected extra token (%q) after its closing ']' — real `go list -m`/`go build` Fatals immediately with `unexpected token after version: %q`", lineNo, tokens[5], tokens[5])
+	}
+	return nil
 }
 
 // moduleDirective extracts the module path from a go.mod-format body's
