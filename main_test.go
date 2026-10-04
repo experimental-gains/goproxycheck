@@ -836,6 +836,151 @@ func TestModuleFromGoMod_RequireExcludeArgCountNotOverTriggered(t *testing.T) {
 	}
 }
 
+// TestModuleFromGoMod_BlockComment is a regression test for a real bug:
+// go.mod has no block-comment syntax at all — golang.org/x/mod/modfile's
+// lexer Fatals unconditionally the moment it sees "/*" outside a quoted
+// string, regardless of whether it ever finds a closing "*/". Confirmed
+// live (go1.24.4 and go1.26.8, GOPROXY=off): every shape below Fatals real
+// `go list -m`/`go build` immediately and entirely offline with
+// `go.mod:N: mod files must use // comments (not /* */ comments)`, before
+// resolving the module directive or anything else.
+//
+// Before this fix, moduleFromGoMod had no model of block comments at all: a
+// bare "/*" line was misdiagnosed by goModUnknownDirectiveError as an
+// "unknown directive: /*" (a real goproxycheck error message, just the
+// wrong one — real go never reaches its unknown-directive check for this
+// input), and a "/*"/"*/" pair sitting inside a require(...) block's own
+// entries was misdiagnosed even more confusingly by
+// requireExcludeDirectiveArgCountError as a bogus "3 argument(s) instead of
+// exactly two" arg-count mismatch, treating the comment delimiters as
+// ordinary tokens.
+func TestModuleFromGoMod_BlockComment(t *testing.T) {
+	for name, content := range map[string]string{
+		"bare block comment on its own line":        "module example.com/foo\n\ngo 1.21\n\n/*\nrequire example.com/bar v1.0.0\n*/\n",
+		"block comment before the module directive": "/* leading */\nmodule example.com/foo\n\ngo 1.21\n",
+		"block comment trailing a require line":     "module example.com/foo\n\ngo 1.21\n\nrequire example.com/bar v1.0.0 /* trailing */\n",
+		"unterminated block comment":                "module example.com/foo\n\ngo 1.21\n/* never closed\n",
+		"block comment inside a require(...) block": "module example.com/foo\n\ngo 1.21\n\nrequire (\n\texample.com/bar v1.0.0\n\t/* comment */\n\texample.com/baz v2.0.0\n)\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "go.mod")
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := moduleFromGoMod(path)
+			if err == nil {
+				t.Fatalf("expected an error for a go.mod containing a \"/* */\" block comment, got module %q", got)
+			}
+			if strings.Contains(err.Error(), "unknown directive") || strings.Contains(err.Error(), "instead of exactly two") {
+				t.Errorf("error %q blames the wrong check (unknown-directive or arg-count) instead of real go's own block-comment Fatal", err)
+			}
+			if !strings.Contains(err.Error(), "mod files must use // comments") {
+				t.Errorf("error %q doesn't cite real go's own `mod files must use // comments (not /* */ comments)` Fatal", err)
+			}
+		})
+	}
+}
+
+// TestModuleFromGoMod_BlockCommentNotOverTriggered confirms the
+// TestModuleFromGoMod_BlockComment fix stays narrowly scoped: a "/*"-looking
+// substring that's either inside a quoted string or past a "//" line
+// comment on the same line must not be mistaken for a live block comment.
+func TestModuleFromGoMod_BlockCommentNotOverTriggered(t *testing.T) {
+	for name, content := range map[string]string{
+		"a line comment whose own text happens to contain '/*'": "module example.com/foo\n\ngo 1.21\n\n// has /* inside a line comment\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "go.mod")
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := moduleFromGoMod(path)
+			if err != nil {
+				t.Fatalf("unexpected error for a go.mod with no live block comment: %v", err)
+			}
+			if want := "example.com/foo"; got != want {
+				t.Errorf("got %q, want %q", got, want)
+			}
+		})
+	}
+
+	// A "/*"-looking substring fully inside a quoted module path is real
+	// go's own CheckPath problem ("invalid char '*'"), not a block-comment
+	// Fatal — confirmed live the quoted-string lexer case never re-enters
+	// the "/*"-checking scan until the matching close quote.
+	t.Run("a '/*'-looking substring inside a quoted module path", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "go.mod")
+		content := "module \"example.com/foo/*oddpath*/bar\"\n\ngo 1.21\n"
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		_, err := moduleFromGoMod(path)
+		if err == nil {
+			t.Fatal("expected an error (an invalid module path), got none")
+		}
+		if strings.Contains(err.Error(), "mod files must use // comments") {
+			t.Errorf("error %q wrongly treated a quoted-string substring as a live block comment", err)
+		}
+		if !strings.Contains(err.Error(), "invalid char") {
+			t.Errorf("error %q doesn't cite real go's own CheckPath `invalid char` Fatal", err)
+		}
+	})
+}
+
+// TestGoModBlockCommentError_Priority pins the real-go-confirmed ordering
+// between a block comment and every other syntax-level condition this file
+// checks for: a lexer-level error ("/*") always wins over a parse-level one
+// (an unknown directive, a malformed quoted token, a wrong argument count),
+// regardless of which line each sits on. Only a leading UTF-8 BOM — checked
+// ahead of goModBlockCommentError in moduleFromGoMod, since it breaks the
+// very first character the lexer reads — outranks it.
+func TestGoModBlockCommentError_Priority(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+	}{
+		{
+			name:    "unknown directive on an earlier line than the block comment",
+			content: "module example.com/foo\n\ngo 1.21\nbogusverb something\n/*\nfoo\n*/\n",
+		},
+		{
+			name:    "block comment on an earlier line than the unknown directive",
+			content: "module example.com/foo\n\ngo 1.21\n/*\nfoo\n*/\nbogusverb something\n",
+		},
+		{
+			name:    "require missing its version on an earlier line than the block comment",
+			content: "module example.com/foo\n\ngo 1.21\nrequire example.com/bar\n/*\nfoo\n*/\n",
+		},
+		{
+			name:    "invalid quoted token on an earlier line than the block comment",
+			content: "module example.com/foo\n\ngo 1.21\nrequire example.com/bar `v1.0.0`\n/*\nfoo\n*/\n",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "go.mod")
+			if err := os.WriteFile(path, []byte(c.content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := moduleFromGoMod(path)
+			if err == nil {
+				t.Fatalf("expected an error, got module %q", got)
+			}
+			if !strings.Contains(err.Error(), "mod files must use // comments") {
+				t.Errorf("error %q doesn't cite the block-comment Fatal, which real go always reports first regardless of source order", err)
+			}
+		})
+	}
+}
+
 // TestHasIgnoreDirective pins hasIgnoreDirective's presence-only scan,
 // independent of the argument-shape questions TestModuleFromGoMod_
 // MalformedIgnoreDirective/WellFormedIgnoreDirectiveNotRejected already

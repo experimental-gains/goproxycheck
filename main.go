@@ -991,6 +991,20 @@ func moduleFromGoMod(path string) (string, error) {
 	if strings.HasPrefix(string(data), utf8BOM) {
 		return "", fmt.Errorf("%s begins with a UTF-8 byte order mark — a real `go list -m`/`go build` Fatals immediately with `go.mod:1: unexpected input character`, entirely offline, before ever contacting the proxy, so this could never resolve regardless of the repo or proxy config. Re-save the file as plain UTF-8 without a byte-order mark and try again", path)
 	}
+	if lineErr := goModBlockCommentError(string(data)); lineErr != nil {
+		// See goModBlockCommentError's doc comment for the live confirmation
+		// that a "/* */" block comment anywhere in the file — not just the
+		// proxy-served go.mod diagnose.go's statusGoModUnparseable already
+		// catches this for via modfile.Parse — is a pure lexer-level Fatal
+		// that preempts every OTHER check below, including
+		// goModUnknownDirectiveError/goModInvalidQuotedTokenError/
+		// requireExcludeDirectiveArgCountError, regardless of which line
+		// those other conditions sit on relative to the block comment. Only
+		// the UTF-8 BOM check above outranks it (a BOM breaks the very first
+		// character the lexer reads, before it even gets to skipping
+		// whitespace/comments).
+		return "", fmt.Errorf("%s %s, entirely offline, before ever contacting the proxy, so this could never resolve regardless of the repo or proxy config", path, lineErr)
+	}
 	if lineErr := ignoreDirectiveTooOldError(string(data), localGoVersion()); lineErr != nil {
 		// Checked ahead of ignoreDirectiveArgCountError just below: see
 		// ignoreDirectiveTooOldError's doc comment for the live confirmation
@@ -1362,6 +1376,110 @@ func ignoreEntryArgCountError(content string, lineNo int) error {
 	}
 	if moduleLineHasExtraArgs(content) {
 		return fmt.Errorf("has an 'ignore' directive on line %d with more than one argument (%q) — real `go list -m`/`go build` Fatals immediately with `ignore directive expects exactly one argument`", lineNo, content)
+	}
+	return nil
+}
+
+// goModBlockCommentError reports an error if data — a go.mod file's raw
+// body — contains a C-style "/* ... */" block comment anywhere it's
+// syntactically live: outside a double- or backtick-quoted string, and
+// before any "//" line comment on the same line. go.mod has no block-comment
+// syntax at all — confirmed directly against golang.org/x/mod/modfile's own
+// lexer (read.go's readToken): while skipping whitespace between tokens, and
+// again while scanning through an unquoted identifier token, it checks
+// in.peekPrefix("/*") and unconditionally calls in.Error("mod files must use
+// // comments (not /* */ comments)") the moment it sees one — there is no
+// code path anywhere in the lexer that ever treats "/*" as the start of a
+// comment to be skipped over; it's purely an immediate Fatal.
+//
+// Live-verified (go1.24.4 and go1.26.8, GOPROXY=off, entirely offline): a
+// go.mod otherwise reading only `module example.com/foo` / `go 1.21` plus a
+// "/*" appearing ANYWHERE else in the file — on its own line, trailing on a
+// directive's own line, opening before the module directive, or inside a
+// require(...) block's entries — makes `go list -m all`/`go build` Fatal
+// immediately with `go.mod:N: mod files must use // comments (not /* */
+// comments)`, citing the line the "/*" itself sits on (not the line of
+// whatever "*/" eventually closes it, if any — an unterminated block comment
+// Fatals identically, at the opening line, since the lexer errors the
+// instant it sees "/*" without ever looking for a closing "*/" at all).
+// Confirmed as a negative control that a "/*"-looking substring INSIDE a
+// quoted module path (e.g. `module "example.com/foo/*oddpath*/bar"`) does
+// NOT trigger this Fatal — real go's quote-handling switch case takes over
+// entirely once it sees the opening quote and never re-enters the
+// "/*"-checking whitespace/identifier scan until the matching close quote,
+// so that shape instead fails CheckPath's later, unrelated "invalid char
+// '*'" check (already handled by moduleFromGoMod's existing CheckPath call).
+// Also confirmed "//" occurring first on a line correctly suppresses this
+// check for the rest of that line (a line comment that happens to contain
+// the two characters "/*" in its own text is not a block comment).
+//
+// Also confirmed live, by crafting every pairwise combination: a "/*" always
+// wins the real go Fatal over every other syntax-level condition this file
+// checks for (goModUnknownDirectiveError, goModInvalidQuotedTokenError,
+// requireExcludeDirectiveArgCountError, ignoreDirectiveArgCountError) no
+// matter which line each condition sits on relative to the other — e.g. an
+// unknown directive on line 4 and a "/*" on line 5 still Fatals citing line
+// 5, not line 4. This matches modfile's two-phase design: lexing (where
+// "/*" is caught) always runs strictly before parsing (where an unknown
+// verb or a malformed directive's argument count is caught), so a
+// lexer-level error always wins regardless of source order. Only a leading
+// UTF-8 BOM (checked just above this function's call site in
+// moduleFromGoMod) outranks it, since a BOM breaks the very first character
+// the lexer reads, before it even starts skipping whitespace/comments.
+//
+// diagnose.go's statusGoModUnparseable already catches this same class of
+// problem for the *proxy-served* go.mod of the version being checked (it
+// runs golang.org/x/mod/modfile.Parse directly, which rejects a block
+// comment the same way it rejects a BOM) — moduleDirective's own doc
+// comment even cites "/* */" block comments in passing as an example of
+// what that other check already covers. But this function's caller,
+// moduleFromGoMod, is a separate, earlier code path — the no-argument CLI
+// mode that reads the *local* ./go.mod to discover which module to probe in
+// the first place, the shipped GitHub Action's default invocation — and
+// before this fix it had no model of block comments at all: a "/*" was
+// either silently treated as an ordinary token by whichever hand-rolled
+// scanner happened to reach it first (moduleDirective's single-line path
+// just skips any non-"module" line) or, worse, misdiagnosed by
+// goModUnknownDirectiveError as an "unknown directive: /*" — a real error
+// message, just the wrong one, since real go never reaches its
+// unknown-directive check for this input at all. A "/*" sitting inside a
+// require(...) block's own entries was misdiagnosed even more confusingly,
+// as a bogus "3 argument(s) instead of exactly two" arg-count mismatch from
+// requireExcludeDirectiveArgCountError treating "/*"/"*/" as ordinary
+// tokens. Both are the same "plausible but wrong" failure mode as every
+// other message-text bug in this project's catalog (e.g. the
+// EscapeVersion/"invalid version" mismatch): the tool reached the right
+// high-level conclusion (this file can never resolve) by the wrong,
+// misleading path.
+func goModBlockCommentError(data string) error {
+	for i, raw := range strings.Split(data, "\n") {
+		lineNo := i + 1
+		var quote byte
+		for j := 0; j < len(raw); j++ {
+			c := raw[j]
+			if quote != 0 {
+				if quote == '"' && c == '\\' && j+1 < len(raw) {
+					j++
+					continue
+				}
+				if c == quote {
+					quote = 0
+				}
+				continue
+			}
+			if c == '"' || c == '`' {
+				quote = c
+				continue
+			}
+			if c == '/' && j+1 < len(raw) {
+				if raw[j+1] == '/' {
+					break
+				}
+				if raw[j+1] == '*' {
+					return fmt.Errorf("has a \"/* */\" block comment on line %d — real `go list -m`/`go build` Fatals immediately with `go.mod:%d: mod files must use // comments (not /* */ comments)`", lineNo, lineNo)
+				}
+			}
+		}
 	}
 	return nil
 }
