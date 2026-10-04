@@ -483,37 +483,34 @@ func diagnose(r report) diagnosis {
 	}
 
 	// Checked ahead of every "module known" diagnosis below, specifically for
-	// a "latest" query: r.moduleKnown() above can be satisfied purely by
-	// @v/list succeeding even when @latest itself failed (see moduleKnown's
-	// doc comment) — and probe() has no dedicated way to resolve a "latest"
-	// query once @latest itself is unusable, since there is no @v/latest.info
-	// endpoint: querying it literally always 404s with "invalid version"
-	// regardless of module health (see probe()'s "Confirmed live" comment on
-	// exactly that). So when @latest fails with a genuine proxy-error status
-	// (a 429, 500, ... — a transport error is already ruled out above, and a
-	// clean 404/410 is the ordinary "module has no @latest" case handled
-	// below), r.versionInfo ends up probed against that literal, meaningless
-	// "latest" string instead of any real version, and used to fall through
-	// silently to the generic not-yet-indexed fallback further down —
-	// "MODULE@latest is not in @v/list yet ... retry in a minute, or use
-	// --wait" — even when @v/list plainly listed real tagged versions right
-	// there in the same probe.
-	//
-	// That's not just misleadingly worded, it's the wrong diagnosis: per the
-	// documented protocol (see isProxyErrorStatus/proxyErrorDiagnosis above),
-	// a real `go install module@latest` does NOT wait out or retry a non-404/
-	// 410 error on @latest, it fails outright with that exact error right
-	// now. Confirmed directly against cmd/go's own source
-	// (modfetch/proxy.go's proxyRepo.Latest): it only falls back to deriving
-	// a version from @v/list when @latest fails with a 404/410
-	// (fs.ErrNotExist-equivalent, per web/api.go's Response.Err mapping) —
-	// any other error status is returned to the caller immediately,
-	// unconditionally, with no @v/list fallback at all. Reproduced live with
-	// a fake proxy returning HTTP 500 on @latest while @v/list serves two
-	// perfectly ordinary tagged versions: before this check, goproxycheck
-	// reported statusNotYetIndexed and, under --wait, polled the doomed
-	// literal "@v/latest.info" 404 for the full --timeout instead of
-	// surfacing the real, actionable @latest error immediately.
+	// a "latest"/"upgrade" query whose resolution (probe()'s @v/list-based
+	// walk, via resolveIncompatibleLatest) still came up empty despite a
+	// genuine @latest proxy-error status (a 429, 500, ... — a transport error
+	// is already ruled out above, and a clean 404/410 is the ordinary "module
+	// has no @latest" case handled below): real cmd/go's own "latest" query
+	// resolution (modload/query.go's Query, verified directly against that
+	// source) only ever calls proxyRepo.Latest — the function that actually
+	// issues the @latest HTTP request — as a last resort, when @v/list's
+	// releases and prereleases are BOTH empty; whenever @v/list has anything
+	// usable, cmd/go resolves from that directly and never requests @latest
+	// at all, so a broken @latest is irrelevant and harmless in that case.
+	// Gating on r.resolvedVersion == "" (rather than unconditionally on
+	// isProxyErrorStatus, this check's own old behavior) mirrors that: probe()
+	// already leaves r.resolvedVersion set whenever its @v/list-based
+	// resolution succeeded, @latest's own error notwithstanding, and that
+	// successful resolution is real — it's what a real `go get`/`go install`
+	// run against this exact proxy state actually fetches, errored @latest or
+	// not. Confirmed live two ways with a fake proxy returning HTTP 500 on
+	// @latest: with @v/list serving two perfectly ordinary tagged versions,
+	// `go list -m -x` against that exact server never even requests @latest
+	// and resolves/installs the highest one fine — a real success this check
+	// must not override with a stale proxy-error verdict; with @v/list empty
+	// (or absent) instead, probe() can't resolve anything either, matching
+	// the case where real cmd/go's own Query would actually have to call
+	// Latest and hit the identical 500, failing outright with that exact
+	// error right now, not "retry in a minute" — the terminal-error semantics
+	// isProxyErrorStatus/proxyErrorDiagnosis already give every other
+	// endpoint in this file.
 	// "upgrade" belongs alongside "latest" here for the same reason it's
 	// folded into the same branch in probe(): per cmd/go's own
 	// modload/query.go, "upgrade" resolves via the identical Latest lookup as
@@ -521,8 +518,9 @@ func diagnose(r report) diagnosis {
 	// always true for a bare goproxycheck module@version argument (see
 	// probe()'s "upgrade" comment) — so a genuine @latest proxy error fails a
 	// real `go get module@upgrade` immediately and unconditionally too, not
-	// just `go get module@latest`.
-	if (r.version == "latest" || r.version == "upgrade") && isProxyErrorStatus(r.latest.statusCode) {
+	// just `go get module@latest`, under the identical "nothing else resolved
+	// it" condition.
+	if (r.version == "latest" || r.version == "upgrade") && r.resolvedVersion == "" && isProxyErrorStatus(r.latest.statusCode) {
 		return proxyErrorDiagnosis("proxy.golang.org", "@latest", r.latest.statusCode)
 	}
 

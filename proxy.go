@@ -262,7 +262,7 @@ func (e endpoints) probe(module, version string) report {
 	}
 
 	checkVersion := version
-	if (version == "latest" || version == "upgrade") && r.latest.ok {
+	if version == "latest" || version == "upgrade" {
 		// Confirmed live: `goproxycheck somemodule@latest` — the natural
 		// invocation by analogy to `go install somemodule@latest`, the
 		// standard Go idiom — used to probe @v/latest.info literally, which
@@ -291,28 +291,62 @@ func (e endpoints) probe(module, version string) report {
 		// (confirmed live), falling through to statusNotYetIndexed and, under
 		// --wait, polling to timeout for a literal "upgrade" that can never
 		// appear in @v/list.
-		if info, err := parseVersionInfo(r.latest.body); err == nil && info.Version != "" {
-			resolved := info.Version
-			// proxy.golang.org's own @latest endpoint is not always
-			// authoritative when it names a "+incompatible" version: see
-			// resolveIncompatibleLatest's doc comment for the live-confirmed
-			// divergence (github.com/minio/minio-go) and the real cmd/go rule
-			// it replicates. Gated on the "+incompatible" suffix so every
-			// module without any pre-modules legacy major-version tags — the
-			// overwhelming majority — takes zero extra requests and sees zero
-			// behavior change.
-			if r.list.ok && strings.HasSuffix(resolved, "+incompatible") {
-				isRetracted := func(v string) bool {
-					if !r.latestModFile.ok {
-						return false
-					}
-					_, retracted := retraction(r.latestModFile.body, v)
-					return retracted
-				}
-				if corrected, ok := e.resolveIncompatibleLatest(mod, module, r.listedVersions(), isRetracted); ok {
-					resolved = corrected
-				}
+		resolved := ""
+		if r.latest.ok {
+			if info, err := parseVersionInfo(r.latest.body); err == nil && info.Version != "" {
+				resolved = info.Version
 			}
+		}
+		// proxy.golang.org's own @latest endpoint is not authoritative at all
+		// once @v/list has any usable (non-retracted) tagged version,
+		// "+incompatible" or not, and r.latest.ok or not — real cmd/go's own
+		// "latest" query resolution (modload/query.go's Query, verified
+		// directly against that source) only ever calls repo.Latest (the
+		// @latest endpoint) as a last resort, when @v/list's releases AND
+		// prereleases are both empty; otherwise it resolves straight from
+		// @v/list via resolveIncompatibleLatest's own release-over-prerelease,
+		// incompatible-aware walk, never requesting @latest at all. Confirmed
+		// live (2026-10-04) with `go list -x -m MODULE@latest`: against
+		// github.com/natefinch/lumberjack, github.com/tchap/go-patricia,
+		// gotest.tools, and github.com/ipfs/go-ipfs-cmds, the trace never
+		// fetches @latest at all, going straight from @v/list to the correct
+		// version's .info/.mod — yet proxy.golang.org's own raw @latest
+		// response for every one of those names a stale, wrong version with
+		// NO "+incompatible" suffix at all (lumberjack's raw @latest is the
+		// pseudo-version of the repo's HEAD commit, whose go.mod declares the
+		// unrelated path "gopkg.in/natefinch/lumberjack.v2" — not even a
+		// version of the requested import path); github.com/go-ozzo/
+		// ozzo-validation's raw @latest 404s outright ("no matching versions
+		// for query \"latest\"") even though @v/list lists five perfectly good
+		// releases. The old code here only ran this correction when
+		// r.latest.ok was true AND the raw @latest answer itself happened to
+		// end in "+incompatible" (the github.com/minio/minio-go shape
+		// resolveIncompatibleLatest's own doc comment documents), which missed
+		// every one of these: for lumberjack this surfaced as a false
+		// statusWrongImportPath ("use gopkg.in/natefinch/lumberjack.v2
+		// instead"), and for ozzo-validation it skipped this whole block
+		// entirely (r.latest.ok was false), falling through to the same
+		// doomed literal-"latest"-probe bug this block's own top comment
+		// already describes fixing — when a real `go get` for either resolves
+		// and installs fine. resolveIncompatibleLatest already produces the
+		// right answer unconditionally (confirmed it still matches real `go
+		// list -m` for every already-tested ordinary/prerelease-exclusion/
+		// retraction case, plus all cases above), so this runs whenever
+		// r.list.ok, regardless of r.latest.ok, and its result (when found)
+		// overrides whatever raw @latest said.
+		if r.list.ok {
+			isRetracted := func(v string) bool {
+				if !r.latestModFile.ok {
+					return false
+				}
+				_, retracted := retraction(r.latestModFile.body, v)
+				return retracted
+			}
+			if corrected, ok := e.resolveIncompatibleLatest(mod, module, r.listedVersions(), isRetracted); ok {
+				resolved = corrected
+			}
+		}
+		if resolved != "" {
 			checkVersion = resolved
 			r.resolvedVersion = resolved
 		}

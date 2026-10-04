@@ -1700,28 +1700,24 @@ func TestDiagnose_ProxyErrorStatus_Sum(t *testing.T) {
 }
 
 // TestDiagnose_LatestProxyError_WhileListSucceeds covers a case the other
-// ProxyErrorStatus tests above don't: @v/list succeeds on its own (so
-// r.moduleKnown() is already true, per its own doc comment) while @latest
-// itself returns a genuine proxy-error status rather than a 404/410. A
-// "latest" query has no dedicated @v/latest.info endpoint — probe() can only
-// resolve "latest" by reading @latest's own body — so before this fix,
-// r.versionInfo ended up probed against the literal string "latest", which
-// proxy.golang.org always 404s with "not found: invalid version" regardless
-// of module health (confirmed live against
-// https://proxy.golang.org/golang.org/x/mod/@v/latest.info, 2026-09-27).
-// That fell through to the generic not-yet-indexed fallback ("MODULE@latest
-// is not in @v/list yet ... retry in a minute, or use --wait"), even though
-// @v/list plainly listed real tagged versions in the very same probe.
-//
-// Confirmed against cmd/go's own source (modfetch/proxy.go's
-// proxyRepo.Latest): it only falls back to a @v/list-derived resolution when
-// @latest fails with a 404/410 (fs.ErrNotExist-equivalent, per
-// web/api.go's Response.Err mapping) — any other error status (a 429, 500,
-// ...) is returned to the caller immediately and unconditionally, with no
-// @v/list fallback at all. So a real `go install module@latest` fails
-// outright with the @latest error right now, not "retry in a minute" —
-// exactly the terminal-error semantics isProxyErrorStatus/proxyErrorDiagnosis
-// already give every other endpoint in this file.
+// ProxyErrorStatus tests above don't: @v/list succeeds on its own, with real
+// tagged versions, while @latest itself returns a genuine proxy-error status
+// rather than a 404/410. This used to be diagnosed as statusProxyError
+// unconditionally — but that's wrong, confirmed directly against cmd/go's own
+// source (modload/query.go's Query) and live with a from-scratch GOPROXY
+// server reproducing this exact shape: Query only ever calls
+// proxyRepo.Latest — the function that actually issues the @latest HTTP
+// request — as a last resort, when @v/list's releases and prereleases are
+// BOTH empty; whenever @v/list has anything usable (as it does here:
+// v1.0.0/v1.1.0), cmd/go resolves straight from that and never requests
+// @latest at all, so a broken @latest never gets in the way. `go list -x -m`
+// against a fake GOPROXY matching this exact test (@v/list: "v1.0.0\nv1.1.0",
+// @latest: HTTP 500) confirms this directly: no request for @latest appears
+// in the trace at all, and the command resolves/reports v1.1.0 successfully.
+// So the real, correct diagnosis here is statusReady for v1.1.0, not a proxy
+// error — see TestDiagnose_LatestProxyError_NoFallbackWhenListEmpty below for
+// the complementary case (no usable @v/list candidates) where a broken
+// @latest genuinely is fatal, matching real cmd/go's own fallback trigger.
 func TestDiagnose_LatestProxyError_WhileListSucceeds(t *testing.T) {
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -1731,6 +1727,94 @@ func TestDiagnose_LatestProxyError_WhileListSucceeds(t *testing.T) {
 		case "/example.com/mod/@v/list":
 			w.WriteHeader(http.StatusOK)
 			_, _ = fmt.Fprint(w, "v1.0.0\nv1.1.0\n")
+		case "/example.com/mod/@v/v1.1.0.info":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, `{"Version":"v1.1.0"}`)
+		case "/example.com/mod/@v/v1.1.0.mod", "/example.com/mod/@v/v1.0.0.mod":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "module example.com/mod\n")
+		default:
+			t.Fatalf("unexpected request to %s", r.URL.Path)
+		}
+	}))
+	defer proxy.Close()
+	sum := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer sum.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, client: proxy.Client()}
+	r := ep.probe("example.com/mod", "latest")
+	got := diagnose(r)
+	if got.status != statusReady {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusReady, got.message)
+	}
+	if r.resolvedVersion != "v1.1.0" {
+		t.Fatalf("resolvedVersion = %q, want %q", r.resolvedVersion, "v1.1.0")
+	}
+}
+
+// TestDiagnose_UpgradeProxyError_WhileListSucceeds mirrors
+// TestDiagnose_LatestProxyError_WhileListSucceeds above for the "upgrade"
+// version query: per cmd/go's own modload/query.go, "upgrade" resolves via
+// the identical Latest lookup as "latest" when there's no existing
+// requirement (always true for goproxycheck's bare module@version
+// argument), so it must resolve straight from @v/list the same way, ignoring
+// a broken @latest, rather than being diagnosed as a proxy error.
+func TestDiagnose_UpgradeProxyError_WhileListSucceeds(t *testing.T) {
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/example.com/mod/@latest":
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = fmt.Fprint(w, "internal error")
+		case "/example.com/mod/@v/list":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "v1.0.0\nv1.1.0\n")
+		case "/example.com/mod/@v/v1.1.0.info":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, `{"Version":"v1.1.0"}`)
+		case "/example.com/mod/@v/v1.1.0.mod", "/example.com/mod/@v/v1.0.0.mod":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "module example.com/mod\n")
+		default:
+			t.Fatalf("unexpected request to %s", r.URL.Path)
+		}
+	}))
+	defer proxy.Close()
+	sum := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer sum.Close()
+
+	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, client: proxy.Client()}
+	r := ep.probe("example.com/mod", "upgrade")
+	got := diagnose(r)
+	if got.status != statusReady {
+		t.Fatalf("status = %s, want %s; message: %s", got.status, statusReady, got.message)
+	}
+	if r.resolvedVersion != "v1.1.0" {
+		t.Fatalf("resolvedVersion = %q, want %q", r.resolvedVersion, "v1.1.0")
+	}
+}
+
+// TestDiagnose_LatestProxyError_NoFallbackWhenListEmpty covers the
+// complementary case TestDiagnose_LatestProxyError_WhileListSucceeds above
+// relies on: @v/list succeeds but lists zero versions (so r.moduleKnown() is
+// still true — see its own doc comment — but there's nothing for
+// resolveIncompatibleLatest to resolve from), while @latest returns a
+// genuine proxy-error status. Here real cmd/go's own Query genuinely would
+// call proxyRepo.Latest (no releases or prereleases to resolve from instead),
+// so the broken @latest is exactly as fatal as isProxyErrorStatus/
+// proxyErrorDiagnosis already treat every other endpoint in this file.
+func TestDiagnose_LatestProxyError_NoFallbackWhenListEmpty(t *testing.T) {
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/example.com/mod/@latest":
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = fmt.Fprint(w, "internal error")
+		case "/example.com/mod/@v/list":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "")
 		case "/example.com/mod/@v/latest.info":
 			// Confirmed live against the real proxy.golang.org: this literal
 			// request always 404s this way, for any module, healthy or not.
@@ -1754,57 +1838,6 @@ func TestDiagnose_LatestProxyError_WhileListSucceeds(t *testing.T) {
 	}
 	if !strings.Contains(got.message, "500") || !strings.Contains(got.message, "@latest") {
 		t.Fatalf("message should name the actual endpoint and status code: %s", got.message)
-	}
-	if strings.Contains(got.message, "not in @v/list yet") {
-		t.Fatalf("must not claim the module isn't in @v/list when it plainly lists real versions: %s", got.message)
-	}
-}
-
-// TestDiagnose_UpgradeProxyError_WhileListSucceeds mirrors
-// TestDiagnose_LatestProxyError_WhileListSucceeds above for the "upgrade"
-// version query: per cmd/go's own modload/query.go, "upgrade" resolves via
-// the identical Latest lookup as "latest" when there's no existing
-// requirement (always true for goproxycheck's bare module@version
-// argument), so a genuine @latest proxy error (429/500/...) must fail a
-// `goproxycheck module@upgrade` check the same way it fails
-// `module@latest`, not fall through to a doomed literal-"upgrade" probe of
-// @v/upgrade.info (confirmed live it 404s "not found: invalid version" for
-// any module, healthy or not) and the generic not-yet-indexed fallback.
-func TestDiagnose_UpgradeProxyError_WhileListSucceeds(t *testing.T) {
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/example.com/mod/@latest":
-			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = fmt.Fprint(w, "internal error")
-		case "/example.com/mod/@v/list":
-			w.WriteHeader(http.StatusOK)
-			_, _ = fmt.Fprint(w, "v1.0.0\nv1.1.0\n")
-		case "/example.com/mod/@v/upgrade.info":
-			// Confirmed live against the real proxy.golang.org: this literal
-			// request always 404s this way, for any module, healthy or not.
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = fmt.Fprint(w, "not found: invalid version")
-		default:
-			t.Fatalf("unexpected request to %s", r.URL.Path)
-		}
-	}))
-	defer proxy.Close()
-	sum := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer sum.Close()
-
-	ep := endpoints{proxyBase: proxy.URL, sumBase: sum.URL, client: proxy.Client()}
-	r := ep.probe("example.com/mod", "upgrade")
-	got := diagnose(r)
-	if got.status != statusProxyError {
-		t.Fatalf("status = %s, want %s; message: %s", got.status, statusProxyError, got.message)
-	}
-	if !strings.Contains(got.message, "500") || !strings.Contains(got.message, "@latest") {
-		t.Fatalf("message should name the actual endpoint and status code: %s", got.message)
-	}
-	if strings.Contains(got.message, "not in @v/list yet") {
-		t.Fatalf("must not claim the module isn't in @v/list when it plainly lists real versions: %s", got.message)
 	}
 }
 

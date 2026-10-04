@@ -897,6 +897,122 @@ func TestProbe_LatestQueryReconsidersIncompatibleVersion(t *testing.T) {
 	}
 }
 
+// TestProbe_LatestQueryReconsidersStaleLatestWithoutIncompatibleSuffix
+// reproduces a real, live shape on github.com/natefinch/lumberjack
+// (2026-10-04) that TestProbe_LatestQueryReconsidersIncompatibleVersion above
+// doesn't cover: proxy.golang.org's own raw @latest response names a stale,
+// wrong version that does NOT itself carry a "+incompatible" suffix at all —
+// it's the pseudo-version of the repo's current HEAD commit, whose go.mod
+// declares a completely different module path ("gopkg.in/natefinch/
+// lumberjack.v2"), not even a version of the requested import path — while
+// @v/list's only real tagged release, v2.0.0+incompatible, is correct.
+//
+// Before this fix, probe() only ever ran the @v/list-based correction when
+// the RAW @latest answer's own string ended in "+incompatible" (gating on
+// strings.HasSuffix(resolved, "+incompatible")), so a case shaped like this
+// sailed straight through unresolved: checkVersion ended up being the
+// pseudo-version's own go.mod path, which — since it names a different
+// module entirely — made goproxycheck report a false statusWrongImportPath
+// ("use gopkg.in/natefinch/lumberjack.v2 instead"), when a real `go get
+// github.com/natefinch/lumberjack@latest` resolves and installs
+// v2.0.0+incompatible under the requested path just fine (confirmed live via
+// `go list -x -m github.com/natefinch/lumberjack@latest`: the trace never
+// requests @latest at all, going straight from @v/list to
+// v2.0.0+incompatible's own .info/.mod).
+func TestProbe_LatestQueryReconsidersStaleLatestWithoutIncompatibleSuffix(t *testing.T) {
+	const module = "github.com/natefinch/lumberjack"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v0.0.0-20230206193814-4cb27fcfbb0f","Time":"2023-02-06T19:38:14Z"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("v2.0.0+incompatible\n"))
+		case strings.HasSuffix(r.URL.Path, "/@v/v2.0.0+incompatible.info"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v2.0.0+incompatible"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/v2.0.0+incompatible.mod"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("module " + module + "\n"))
+		case strings.HasSuffix(r.URL.Path, "/@v/v0.0.0-20230206193814-4cb27fcfbb0f.mod"):
+			// latestModFile's own major-line-scoped walk (see report's doc
+			// comment) finds no v0/v1 release in @v/list at all here (the
+			// only release, v2.0.0+incompatible, is a different major line),
+			// so it falls back to fetching the raw @latest pseudo-version's
+			// own go.mod unmodified — matching the real proxy, which serves
+			// the unrelated gopkg.in go.mod for this exact path. Harmless:
+			// retraction()/deprecation() just find nothing in it, and
+			// canonicalModulePath (diagnose.go) checks r.modFile, not
+			// r.latestModFile, so this doesn't feed into that check at all.
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("module gopkg.in/natefinch/lumberjack.v2\n\ngo 1.13\n"))
+		case strings.Contains(r.URL.Path, "/lookup/"):
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Errorf("unexpected request to %s: this stale @latest pseudo-version must never be probed as checkVersion once @v/list resolves the real release", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	ep := endpoints{proxyBase: srv.URL, sumBase: srv.URL, client: srv.Client()}
+
+	r := ep.probe(module, "latest")
+	if r.resolvedVersion != "v2.0.0+incompatible" {
+		t.Errorf("resolvedVersion = %q, want %q (a stale raw @latest with no \"+incompatible\" suffix must still be reconsidered against @v/list)", r.resolvedVersion, "v2.0.0+incompatible")
+	}
+	got := diagnose(r)
+	if got.status != statusReady {
+		t.Errorf("status = %s, want %s; message: %s", got.status, statusReady, got.message)
+	}
+}
+
+// TestProbe_LatestQueryResolvesFromListWhenLatestErrors reproduces a real,
+// live shape on github.com/go-ozzo/ozzo-validation (2026-10-04): @latest
+// itself 404s outright ("not found: module ...: no matching versions for
+// query \"latest\"") even though @v/list lists five perfectly good tagged
+// releases. Before this fix, probe()'s whole @v/list-based resolution block
+// was gated on r.latest.ok, so a failed @latest skipped it entirely —
+// falling through to the same doomed literal-"latest" probe this file's
+// surrounding comments already describe fixing once, when a real `go get
+// github.com/go-ozzo/ozzo-validation@latest` resolves and installs
+// v3.6.0+incompatible fine (confirmed live via `go list -x -m`: the trace
+// never requests @latest at all).
+func TestProbe_LatestQueryResolvesFromListWhenLatestErrors(t *testing.T) {
+	const module = "github.com/go-ozzo/ozzo-validation"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`not found: module ` + module + `: no matching versions for query "latest"`))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("v3.0.1+incompatible\nv3.4.0+incompatible\nv3.6.0+incompatible\n"))
+		case strings.HasSuffix(r.URL.Path, "/@v/v3.6.0+incompatible.info"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Version":"v3.6.0+incompatible"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/v3.6.0+incompatible.mod"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("module " + module + "\n"))
+		case strings.Contains(r.URL.Path, "/lookup/"):
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	ep := endpoints{proxyBase: srv.URL, sumBase: srv.URL, client: srv.Client()}
+
+	r := ep.probe(module, "latest")
+	if r.resolvedVersion != "v3.6.0+incompatible" {
+		t.Errorf("resolvedVersion = %q, want %q (a 404 on @latest must not block resolving \"latest\" from a perfectly healthy @v/list)", r.resolvedVersion, "v3.6.0+incompatible")
+	}
+	got := diagnose(r)
+	if got.status != statusReady {
+		t.Errorf("status = %s, want %s; message: %s", got.status, statusReady, got.message)
+	}
+}
+
 func TestReady(t *testing.T) {
 	cases := []struct {
 		name string
