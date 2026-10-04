@@ -1250,6 +1250,260 @@ func systemGoDir(t *testing.T) string {
 	return filepath.Dir(resolved)
 }
 
+// --- tool/godebug toolchain-gating (mirrors the `ignore` family above) ---
+//
+// goModKnownVerbs already listed `tool`/`godebug` as unconditionally
+// recognized, with no equivalent of ignoreDirectiveTooOldError's
+// toolchain-version gating at all — a go.mod with a `tool`/`godebug`
+// directive and a `go` line too old, audited by a locally selected
+// toolchain also too old, sailed through moduleFromGoMod unflagged, when
+// the real toolchain Fatals immediately with `unknown directive: tool`/
+// `unknown directive: godebug` before resolving anything. Live-verified
+// against real installed golang.org/dl toolchain binaries (go1.21.0,
+// go1.22.0, go1.23.0, go1.24.4) — see toolDirectiveTooOldError's and
+// godebugDirectiveTooOldError's own doc comments for the exact transcripts.
+
+// TestToolDirectiveTooOldError_NoToolDirective confirms a go.mod with no
+// `tool` directive at all is never flagged, regardless of its own `go` line
+// or the (deliberately low, to prove it's irrelevant here) local version.
+func TestToolDirectiveTooOldError_NoToolDirective(t *testing.T) {
+	if err := toolDirectiveTooOldError("module example.com/foo\n\ngo 1.20\n", "go1.20.0"); err != nil {
+		t.Errorf("unexpected error for a go.mod with no 'tool' directive: %v", err)
+	}
+}
+
+// TestToolDirectiveTooOldError_OwnGoDirectiveSatisfies confirms a go.mod
+// whose own `go` directive already requires go1.24 or newer is never
+// flagged — a deliberately low localVersion proves the own-`go`-directive
+// short-circuit fires before localVersion is even consulted.
+func TestToolDirectiveTooOldError_OwnGoDirectiveSatisfies(t *testing.T) {
+	if err := toolDirectiveTooOldError("module example.com/foo\n\ngo 1.24\n\ntool example.com/foo/cmd/bar\n", "go1.20.0"); err != nil {
+		t.Errorf("unexpected error for a go.mod whose own 'go' directive (1.24) already satisfies go1.24+: %v", err)
+	}
+}
+
+// TestToolDirectiveTooOldError_TooOld is the direct regression test: a
+// go.mod whose own `go` directive stays below 1.24 falls back to the
+// toolchain that would actually run it, and when that's also below 1.24,
+// `tool` isn't recognized as a go.mod directive at all. Live-verified
+// (2026-10-04): a from-scratch go.mod reading only `module example.com/foo`,
+// `go 1.20`, and `tool example.com/foo/cmd/bar` makes real go1.21.0/
+// go1.22.0/go1.23.0 (GOTOOLCHAIN=local, GOPROXY=off) Fatal instantly with
+// `go.mod:5: unknown directive: tool`, zero network access, while the
+// identical file parses clean under go1.24.4.
+func TestToolDirectiveTooOldError_TooOld(t *testing.T) {
+	err := toolDirectiveTooOldError("module example.com/foo\n\ngo 1.20\n\ntool example.com/foo/cmd/bar\n", "go1.23.0")
+	if err == nil {
+		t.Fatal("expected an error for a 'tool' directive older than both the file's own `go` line and the local toolchain, got none")
+	}
+	if !strings.Contains(err.Error(), "unknown directive: tool") {
+		t.Errorf("error %q doesn't cite real go's own `unknown directive: tool` Fatal", err)
+	}
+}
+
+// TestToolDirectiveTooOldError_LocalVersionSatisfies is the mirror image of
+// TestToolDirectiveTooOldError_TooOld: the file's own `go` directive is too
+// low, but the toolchain actually selected to run it is go1.24+, so `tool`
+// resolves fine.
+func TestToolDirectiveTooOldError_LocalVersionSatisfies(t *testing.T) {
+	if err := toolDirectiveTooOldError("module example.com/foo\n\ngo 1.20\n\ntool example.com/foo/cmd/bar\n", "go1.24.4"); err != nil {
+		t.Errorf("unexpected error when the locally selected toolchain (go1.24.4) satisfies go1.24+: %v", err)
+	}
+}
+
+// TestToolDirectiveTooOldError_UnresolvableLocalVersion confirms the
+// fail-open convention every other go-env-derived check in this file
+// already uses: an empty localVersion must not be treated as "too old."
+func TestToolDirectiveTooOldError_UnresolvableLocalVersion(t *testing.T) {
+	if err := toolDirectiveTooOldError("module example.com/foo\n\ngo 1.20\n\ntool example.com/foo/cmd/bar\n", ""); err != nil {
+		t.Errorf("unexpected error for an unresolvable local version: %v", err)
+	}
+}
+
+// TestHasToolDirective_ToolchainNotMistakenForTool is a false-positive
+// guard: "toolchain" shares "tool" as a literal prefix, but must never be
+// mistaken for a `tool` directive by hasToolDirective's CutPrefix check.
+func TestHasToolDirective_ToolchainNotMistakenForTool(t *testing.T) {
+	if hasToolDirective("module example.com/foo\n\ngo 1.24\n\ntoolchain go1.24.4\n") {
+		t.Error("hasToolDirective should not match a 'toolchain' directive")
+	}
+}
+
+// TestGodebugDirectiveTooOldError_NoGodebugDirective confirms a go.mod with
+// no `godebug` directive at all is never flagged.
+func TestGodebugDirectiveTooOldError_NoGodebugDirective(t *testing.T) {
+	if err := godebugDirectiveTooOldError("module example.com/foo\n\ngo 1.17\n", "go1.17.0"); err != nil {
+		t.Errorf("unexpected error for a go.mod with no 'godebug' directive: %v", err)
+	}
+}
+
+// TestGodebugDirectiveTooOldError_OwnGoDirectiveSatisfies confirms a go.mod
+// whose own `go` directive already requires go1.23 or newer is never
+// flagged.
+func TestGodebugDirectiveTooOldError_OwnGoDirectiveSatisfies(t *testing.T) {
+	if err := godebugDirectiveTooOldError("module example.com/foo\n\ngo 1.23\n\ngodebug default=go1.20\n", "go1.20.0"); err != nil {
+		t.Errorf("unexpected error for a go.mod whose own 'go' directive (1.23) already satisfies go1.23+: %v", err)
+	}
+}
+
+// TestGodebugDirectiveTooOldError_TooOld is the direct regression test:
+// live-verified (2026-10-04) that a from-scratch go.mod reading only
+// `module example.com/foo`, `go 1.20`, and `godebug default=go1.20` makes
+// real go1.21.0/go1.22.0 (GOTOOLCHAIN=local, GOPROXY=off) Fatal instantly
+// with `go.mod:5: unknown directive: godebug`, zero network access, while
+// the identical file parses clean under go1.23.0/go1.24.4 — `godebug`'s
+// real boundary is go1.23, not go1.21 (an earlier version of this file's
+// own goModKnownVerbs comment claimed go1.21+ without checking against a
+// real pre-1.23 toolchain).
+func TestGodebugDirectiveTooOldError_TooOld(t *testing.T) {
+	err := godebugDirectiveTooOldError("module example.com/foo\n\ngo 1.20\n\ngodebug default=go1.20\n", "go1.22.0")
+	if err == nil {
+		t.Fatal("expected an error for a 'godebug' directive older than both the file's own `go` line and the local toolchain, got none")
+	}
+	if !strings.Contains(err.Error(), "unknown directive: godebug") {
+		t.Errorf("error %q doesn't cite real go's own `unknown directive: godebug` Fatal", err)
+	}
+}
+
+// TestGodebugDirectiveTooOldError_LocalVersionSatisfies is the mirror image
+// of TestGodebugDirectiveTooOldError_TooOld: the file's own `go` directive
+// is too low, but the toolchain actually selected is go1.23+, so `godebug`
+// resolves fine.
+func TestGodebugDirectiveTooOldError_LocalVersionSatisfies(t *testing.T) {
+	if err := godebugDirectiveTooOldError("module example.com/foo\n\ngo 1.20\n\ngodebug default=go1.20\n", "go1.23.0"); err != nil {
+		t.Errorf("unexpected error when the locally selected toolchain (go1.23.0) satisfies go1.23+: %v", err)
+	}
+}
+
+// TestGodebugDirectiveTooOldError_UnresolvableLocalVersion confirms the
+// fail-open convention every other go-env-derived check in this file
+// already uses.
+func TestGodebugDirectiveTooOldError_UnresolvableLocalVersion(t *testing.T) {
+	if err := godebugDirectiveTooOldError("module example.com/foo\n\ngo 1.20\n\ngodebug default=go1.20\n", ""); err != nil {
+		t.Errorf("unexpected error for an unresolvable local version: %v", err)
+	}
+}
+
+// oldGoDir returns the bin directory of a golang.org/dl-downloaded Go SDK
+// version (e.g. "go1.22.0"), found at the standard `$HOME/sdk/<version>`
+// install location that `go run golang.org/dl/go1.22.0@latest && go1.22.0
+// download` leaves it in, or Skips the calling test if that SDK isn't
+// present on this machine. Needed because — unlike `ignore`'s own
+// moduleFromGoMod-level test above, which could rely on this sandbox's
+// plain system go (go1.24.4) already sitting below ignore's 1.25 boundary
+// — go1.24.4 is NOT below tool's (1.24) or godebug's (1.23) own boundary,
+// so exercising the real too-old path end-to-end (as opposed to the
+// pinned-localVersion unit tests above, which cover the same logic without
+// needing any particular toolchain installed) needs a genuinely older real
+// toolchain binary.
+func oldGoDir(t *testing.T, version string) string {
+	t.Helper()
+	dir := filepath.Join(os.Getenv("HOME"), "sdk", version, "bin")
+	if _, err := os.Stat(filepath.Join(dir, "go")); err != nil {
+		t.Skipf("no %s SDK at %s to exercise the real too-old-toolchain path end-to-end (download via `go run golang.org/dl/%s@latest && %s download`); the pinned-localVersion unit tests above already cover the same logic without it: %v", version, dir, version, version, err)
+		return ""
+	}
+	return dir
+}
+
+// TestModuleFromGoMod_ToolDirectiveTooOldForToolchain is the
+// moduleFromGoMod-level counterpart of TestToolDirectiveTooOldError_TooOld,
+// confirming the check is actually wired into the no-argument CLI mode's
+// real entry point via a real, genuinely-too-old go1.22.0 toolchain binary
+// (not a pinned string) put ahead of PATH.
+func TestModuleFromGoMod_ToolDirectiveTooOldForToolchain(t *testing.T) {
+	oldGo := oldGoDir(t, "go1.22.0")
+	t.Setenv("PATH", oldGo+string(os.PathListSeparator)+os.Getenv("PATH"))
+	dir := t.TempDir()
+	t.Chdir(dir)
+	path := filepath.Join(dir, "go.mod")
+	content := "module example.com/foo\n\ngo 1.20\n\ntool example.com/foo/cmd/bar\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := moduleFromGoMod(path)
+	if err == nil {
+		t.Fatalf("expected an error for a 'tool' directive too new for the selected toolchain, got module %q", got)
+	}
+	if !strings.Contains(err.Error(), "unknown directive: tool") {
+		t.Errorf("error %q doesn't cite real go's own `unknown directive: tool` Fatal", err)
+	}
+}
+
+// TestModuleFromGoMod_ToolDirectiveModernToolchainStillOk proves the fix
+// doesn't overreach: the identical shape of go.mod, but with this
+// sandbox's plain system go (go1.24.4, which already recognizes `tool`)
+// ahead of PATH, must resolve with no error at all.
+func TestModuleFromGoMod_ToolDirectiveModernToolchainStillOk(t *testing.T) {
+	if systemPath := systemGoDir(t); systemPath != "" {
+		t.Setenv("PATH", systemPath+string(os.PathListSeparator)+os.Getenv("PATH"))
+	}
+	dir := t.TempDir()
+	t.Chdir(dir)
+	path := filepath.Join(dir, "go.mod")
+	content := "module example.com/foo\n\ngo 1.20\n\ntool example.com/foo/cmd/bar\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := moduleFromGoMod(path)
+	if err != nil {
+		t.Fatalf("unexpected error for a 'tool' directive on a modern (go1.24+) toolchain: %v", err)
+	}
+	if got != "example.com/foo" {
+		t.Errorf("got module %q, want example.com/foo", got)
+	}
+}
+
+// TestModuleFromGoMod_GodebugDirectiveTooOldForToolchain is the
+// moduleFromGoMod-level counterpart of
+// TestGodebugDirectiveTooOldError_TooOld, using a real, genuinely-too-old
+// go1.22.0 toolchain binary (below godebug's own 1.23 boundary).
+func TestModuleFromGoMod_GodebugDirectiveTooOldForToolchain(t *testing.T) {
+	oldGo := oldGoDir(t, "go1.22.0")
+	t.Setenv("PATH", oldGo+string(os.PathListSeparator)+os.Getenv("PATH"))
+	dir := t.TempDir()
+	t.Chdir(dir)
+	path := filepath.Join(dir, "go.mod")
+	content := "module example.com/foo\n\ngo 1.20\n\ngodebug default=go1.20\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := moduleFromGoMod(path)
+	if err == nil {
+		t.Fatalf("expected an error for a 'godebug' directive too new for the selected toolchain, got module %q", got)
+	}
+	if !strings.Contains(err.Error(), "unknown directive: godebug") {
+		t.Errorf("error %q doesn't cite real go's own `unknown directive: godebug` Fatal", err)
+	}
+}
+
+// TestModuleFromGoMod_GodebugDirectiveModernToolchainStillOk proves the fix
+// doesn't overreach, the godebug counterpart of
+// TestModuleFromGoMod_ToolDirectiveModernToolchainStillOk.
+func TestModuleFromGoMod_GodebugDirectiveModernToolchainStillOk(t *testing.T) {
+	if systemPath := systemGoDir(t); systemPath != "" {
+		t.Setenv("PATH", systemPath+string(os.PathListSeparator)+os.Getenv("PATH"))
+	}
+	dir := t.TempDir()
+	t.Chdir(dir)
+	path := filepath.Join(dir, "go.mod")
+	content := "module example.com/foo\n\ngo 1.20\n\ngodebug default=go1.20\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := moduleFromGoMod(path)
+	if err != nil {
+		t.Fatalf("unexpected error for a 'godebug' directive on a modern (go1.23+) toolchain: %v", err)
+	}
+	if got != "example.com/foo" {
+		t.Errorf("got module %q, want example.com/foo", got)
+	}
+}
+
 func TestResolveTarget_ExplicitArg(t *testing.T) {
 	module, version, err := resolveTarget([]string{"example.com/mod@v1.2.3"})
 	if err != nil {

@@ -1015,6 +1015,19 @@ func moduleFromGoMod(path string) (string, error) {
 		// validation in the first place.
 		return "", fmt.Errorf("%s %s, entirely offline, before ever contacting the proxy, so this could never resolve regardless of the repo or proxy config", path, lineErr)
 	}
+	if lineErr := toolDirectiveTooOldError(string(data), localGoVersion()); lineErr != nil {
+		// Same toolchain-recognition gap as the ignore check just above,
+		// one version boundary lower (go1.24 instead of go1.25) — see
+		// toolDirectiveTooOldError's doc comment for the live confirmation.
+		return "", fmt.Errorf("%s %s, entirely offline, before ever contacting the proxy, so this could never resolve regardless of the repo or proxy config", path, lineErr)
+	}
+	if lineErr := godebugDirectiveTooOldError(string(data), localGoVersion()); lineErr != nil {
+		// Same toolchain-recognition gap as the ignore/tool checks just
+		// above, one version boundary lower still (go1.23) — see
+		// godebugDirectiveTooOldError's doc comment for the live
+		// confirmation.
+		return "", fmt.Errorf("%s %s, entirely offline, before ever contacting the proxy, so this could never resolve regardless of the repo or proxy config", path, lineErr)
+	}
 	if lineErr := ignoreDirectiveArgCountError(string(data)); lineErr != nil {
 		// See ignoreDirectiveArgCountError's doc comment for the live
 		// confirmation (go1.26.8, 2026-10-03) that a malformed `ignore`
@@ -1274,6 +1287,102 @@ func ignoreDirectiveTooOldError(data, localVersion string) error {
 	return fmt.Errorf("has an 'ignore' directive, but neither its own `go` directive (%q) nor the locally selected toolchain (%s) is go1.25 or newer — `ignore` wasn't recognized as a go.mod directive before go1.25, so `go list -m`/`go build` Fatals immediately with `unknown directive: ignore`", goDirectiveVersion(data), localVersion)
 }
 
+// hasToolDirective reports whether data — a go.mod file's raw body —
+// contains a top-level `tool` directive at all, single-line or inside its
+// parenthesized block form. Mirrors hasIgnoreDirective exactly (see its doc
+// comment), with one added wrinkle: a plain prefix match on "tool" would
+// also match "toolchain" lines, so this additionally requires rest[0] not
+// be a letter — "toolchain ..." has rest == "chain ...", whose first byte
+// 'c' already fails the space/tab/paren/"//" check below anyway, so no
+// change in behavior was actually needed, but the comment is worth leaving
+// since the shared prefix is easy to miss on a quick read. Used only by
+// toolDirectiveTooOldError.
+func hasToolDirective(data string) bool {
+	for _, raw := range strings.Split(data, "\n") {
+		line := strings.TrimSpace(raw)
+		rest, ok := strings.CutPrefix(line, "tool")
+		if ok && (rest == "" || rest[0] == ' ' || rest[0] == '\t' || rest[0] == '(' || strings.HasPrefix(rest, "//")) {
+			return true
+		}
+	}
+	return false
+}
+
+// toolDirectiveTooOldError is tool's analog of ignoreDirectiveTooOldError —
+// same reasoning, same max(own `go` directive, locally selected toolchain)
+// comparison, same fail-open-on-unresolvable-localVersion convention — just
+// gated at go1.24 instead of go1.25, confirmed live against real installed
+// toolchains (2026-10-04): a go.mod reading only `module example.com/foo`,
+// `go 1.20`, and `tool example.com/foo/cmd/bar` Fatals immediately with
+// `go.mod:5: unknown directive: tool` under real go1.21.0/go1.22.0/go1.23.0
+// (GOTOOLCHAIN=local, GOPROXY=off, zero network access), while the
+// identical file parses clean under go1.24.4 — `tool` was added in Go 1.24
+// (confirmed absent from golang.org/x/mod/modfile as vendored into
+// go1.23.0's own cmd/go, present starting go1.24.0; matches this project's
+// sibling tool goprivaudit's own independently-verified finding, testing-
+// practice technique #191). Before this check, moduleFromGoMod's
+// no-argument-mode callers (the shipped GitHub Action's default
+// invocation) had no awareness of this toolchain-gating at all: the module
+// path was extracted normally and probed against the live proxy as if the
+// file were perfectly ordinary, exactly like the already-fixed `ignore`
+// case this mirrors.
+func toolDirectiveTooOldError(data, localVersion string) error {
+	if !hasToolDirective(data) {
+		return nil
+	}
+	if goVersionAtLeast(goDirectiveVersion(data), 1, 24) {
+		return nil
+	}
+	if localVersion == "" || goVersionAtLeast(localVersion, 1, 24) {
+		return nil
+	}
+	return fmt.Errorf("has a 'tool' directive, but neither its own `go` directive (%q) nor the locally selected toolchain (%s) is go1.24 or newer — `tool` wasn't recognized as a go.mod directive before go1.24, so `go list -m`/`go build` Fatals immediately with `unknown directive: tool`", goDirectiveVersion(data), localVersion)
+}
+
+// hasGodebugDirective reports whether data — a go.mod file's raw body —
+// contains a top-level `godebug` directive at all, single-line or inside
+// its parenthesized block form. Mirrors hasIgnoreDirective exactly (see its
+// doc comment). Used only by godebugDirectiveTooOldError.
+func hasGodebugDirective(data string) bool {
+	for _, raw := range strings.Split(data, "\n") {
+		line := strings.TrimSpace(raw)
+		rest, ok := strings.CutPrefix(line, "godebug")
+		if ok && (rest == "" || rest[0] == ' ' || rest[0] == '\t' || rest[0] == '(' || strings.HasPrefix(rest, "//")) {
+			return true
+		}
+	}
+	return false
+}
+
+// godebugDirectiveTooOldError is godebug's analog of
+// ignoreDirectiveTooOldError — same reasoning, same max(own `go` directive,
+// locally selected toolchain) comparison, same fail-open-on-unresolvable-
+// localVersion convention — gated at go1.23. Confirmed live against real
+// installed toolchains (2026-10-04): a go.mod reading only `module
+// example.com/foo`, `go 1.20`, and `godebug default=go1.20` Fatals
+// immediately with `go.mod:5: unknown directive: godebug` under real
+// go1.21.0/go1.22.0 (GOTOOLCHAIN=local, GOPROXY=off, zero network access),
+// while the identical file parses clean under go1.23.0/go1.24.4 — `godebug`
+// was added in Go 1.23, NOT Go 1.21 as an earlier version of this file's own
+// goModKnownVerbs comment claimed (that comment was never checked against a
+// real pre-1.23 toolchain; corrected here alongside this fix). Matches this
+// project's sibling tool goprivaudit's own independently-verified finding
+// (testing-practice technique #192). Before this check, moduleFromGoMod's
+// no-argument-mode callers had no awareness of this toolchain-gating at
+// all, exactly like the already-fixed `ignore`/`tool` cases this mirrors.
+func godebugDirectiveTooOldError(data, localVersion string) error {
+	if !hasGodebugDirective(data) {
+		return nil
+	}
+	if goVersionAtLeast(goDirectiveVersion(data), 1, 23) {
+		return nil
+	}
+	if localVersion == "" || goVersionAtLeast(localVersion, 1, 23) {
+		return nil
+	}
+	return fmt.Errorf("has a 'godebug' directive, but neither its own `go` directive (%q) nor the locally selected toolchain (%s) is go1.23 or newer — `godebug` wasn't recognized as a go.mod directive before go1.23, so `go list -m`/`go build` Fatals immediately with `unknown directive: godebug`", goDirectiveVersion(data), localVersion)
+}
+
 // ignoreDirectiveArgCountError scans data — a go.mod file's raw body — for
 // an `ignore` directive, single-line or inside its parenthesized block
 // form (both forms accept an optional or missing space before the opening
@@ -1486,14 +1595,19 @@ func goModBlockCommentError(data string) error {
 
 // goModKnownVerbs is the complete set of top-level go.mod directive verbs
 // ever recognized by any supported Go toolchain version: module, go,
-// toolchain, require, exclude, replace, retract, tool (go1.24+), godebug
-// (go1.21+), and ignore (go1.25+ — gated separately and more precisely by
-// ignoreDirectiveTooOldError/ignoreDirectiveArgCountError, both checked
-// ahead of goModUnknownDirectiveError in moduleFromGoMod, so by the time
-// this set is consulted "ignore" is already known to be either absent or
-// safely recognized by whichever toolchain would actually run this file).
+// toolchain, require, exclude, replace, retract, godebug (go1.23+ —
+// confirmed live against real go1.21.0/go1.22.0/go1.23.0; an earlier
+// version of this comment claimed go1.21+ without checking a real
+// pre-1.23 toolchain), tool (go1.24+), and ignore (go1.25+) — each of
+// these three newer verbs gated separately and more precisely by its own
+// hasXDirective/xDirectiveTooOldError pair (godebugDirectiveTooOldError/
+// toolDirectiveTooOldError/ignoreDirectiveTooOldError, plus
+// ignoreDirectiveArgCountError), all checked ahead of
+// goModUnknownDirectiveError in moduleFromGoMod, so by the time this set is
+// consulted each of the three is already known to be either absent or
+// safely recognized by whichever toolchain would actually run this file.
 // A verb outside this set was never valid go.mod syntax on any Go version
-// at all, so — unlike tool/godebug/ignore, whose recognition genuinely
+// at all, so — unlike godebug/tool/ignore, whose recognition genuinely
 // depends on which toolchain runs the file — flagging it doesn't need its
 // own version check: it's an unconditional Fatal on every version.
 var goModKnownVerbs = map[string]bool{
