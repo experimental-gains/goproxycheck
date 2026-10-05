@@ -1145,7 +1145,146 @@ func moduleFromGoMod(path string) (string, error) {
 		// of the repo or proxy config.
 		return "", fmt.Errorf("%s has a 'module' directive with an invalid path %q — a real `go list -m`/`go build` rejects this exact string immediately with `%v`, entirely offline, before ever contacting the proxy, so this could never resolve regardless of the repo or proxy config. Check for a stray character, leading/trailing dot, or non-ASCII letter in the module path", path, mod, err)
 	}
+	if lineErr := duplicateRequireError(string(data)); lineErr != nil {
+		// Checked last, after moduleDirective/CheckPath above: see
+		// duplicateRequireError's doc comment for the live confirmation that
+		// this is a build-list consistency Fatal (real cmd/go's own
+		// `-mod=readonly` requirement check), not a modfile.Parse-time lexer
+		// error like every check earlier in this chain — confirmed live it
+		// loses to a malformed replace/retract/require line, an unknown
+		// directive, or an invalid main-module path (all parse first,
+		// Fataling before the build list is ever even assembled), but still
+		// Fatals entirely offline and before ever contacting the proxy
+		// whenever none of those earlier conditions also apply.
+		return "", fmt.Errorf("%s %s, entirely offline, before ever contacting the proxy, so this could never resolve regardless of the repo or proxy config", path, lineErr)
+	}
 	return mod, nil
+}
+
+// duplicateRequireError scans data — a go.mod file's raw body — for two
+// `require` directives (single-line or inside the parenthesized block
+// form) naming the same module path with two different version strings.
+//
+// This is NOT a modfile.Parse-time lexer error like
+// requireExcludeDirectiveArgCountError/replaceDirectiveArgCountError/
+// retractDirectiveArgCountError above — a go.mod with two `require` lines
+// for the same module parses just fine. The Fatal instead comes one layer
+// later, from real cmd/go's default `-mod=readonly` build-list consistency
+// check, which refuses to silently choose between two explicitly-pinned,
+// disagreeing versions of the same module the way MVS would if only one
+// line existed.
+//
+// Live-verified (2026-10-05, go1.26.8, GOPROXY=off to rule out any network
+// dependency, using local `replace` targets so the modules involved don't
+// even need to be real): a go.mod with `require example.com/dep v1.0.0`
+// and `require example.com/dep v1.1.0` (a realistic merge-conflict
+// mistake — both lines kept instead of one replacing the other) Fatals
+// `go build`/`go list -m all`/`go vet` immediately and entirely offline
+// with `go: updates to go.mod needed; to update it: go mod tidy` —
+// confirmed regardless of whether the duplicated module is ever actually
+// imported, and identically for the same two lines written inside a
+// `require (...)` block instead of as standalone lines. Confirmed this
+// Fatal fires even when the module named is a hallucinated path that has
+// never existed on any proxy — the build list is checked before a single
+// network request is made.
+//
+// Two occurrences of the SAME module with the IDENTICAL version string are
+// explicitly NOT this bug: live-verified a go.mod with that exact literal
+// duplicate line (twice) builds, vets, and `go list -m all`s cleanly with
+// zero complaint — real go silently treats an exact repeat as a no-op, so
+// this function only flags a mismatch, never a plain repeat. `exclude` was
+// checked too and ruled out: unlike `require`, which pins a single desired
+// version cmd/go must reconcile, `exclude` is a pure set of banned
+// versions with no possible internal conflict — two `exclude` lines for
+// the same module, same or different versions, never Fatal.
+//
+// Before this check, a go.mod broken this way had its module path
+// extracted normally by moduleDirective and probed against the live proxy
+// as if the file were perfectly ordinary — confirmed live, this reported
+// a plain statusReady ("a plain `go install` will work") for a go.mod
+// that can never build at all, the same "go itself would Fatal first"
+// family as every other check in this chain, just one the build-list
+// layer rather than the parser.
+//
+// Checked only against already argument-count-valid `require` lines (any
+// malformed line is already Fataled by requireExcludeDirectiveArgCountError
+// earlier in moduleFromGoMod's dispatch, confirmed live to win the race —
+// see this function's call site) — a line that doesn't tokenize to exactly
+// (module path, version) is silently skipped here rather than
+// double-reported.
+func duplicateRequireError(data string) error {
+	type seenRequire struct {
+		version string
+		lineNo  int
+	}
+	seen := map[string]seenRequire{}
+	checkEntry := func(content string, lineNo int) error {
+		tokens, ok := directiveArgTokens(strings.TrimSpace(content))
+		if !ok || len(tokens) != 2 {
+			return nil
+		}
+		modPath, err := parseModulePath(tokens[0])
+		if err != nil || modPath == "" {
+			return nil
+		}
+		version, err := parseModulePath(tokens[1])
+		if err != nil || version == "" {
+			return nil
+		}
+		if prev, ok := seen[modPath]; ok {
+			if prev.version != version {
+				return fmt.Errorf("has two 'require' directives for %s with different versions (%s on line %d, %s on line %d) — real `go list -m`/`go build` Fatals immediately with `go: updates to go.mod needed; to update it: go mod tidy`", modPath, prev.version, prev.lineNo, version, lineNo)
+			}
+			return nil
+		}
+		seen[modPath] = seenRequire{version, lineNo}
+		return nil
+	}
+	inBlock := false
+	blockVerb := ""
+	lineNo := 0
+	for _, raw := range strings.Split(data, "\n") {
+		lineNo++
+		line := stripLineComment(strings.TrimSpace(raw))
+		if inBlock {
+			if line == ")" {
+				inBlock = false
+				continue
+			}
+			if line == "" {
+				continue
+			}
+			if blockVerb == "require" {
+				if err := checkEntry(line, lineNo); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if line == "" {
+			continue
+		}
+		verb, rest := line, ""
+		if i := strings.IndexAny(line, " \t("); i >= 0 {
+			verb, rest = line[:i], strings.TrimSpace(line[i:])
+		}
+		if verb != "require" {
+			if rest == "(" {
+				inBlock = true
+				blockVerb = verb
+			}
+			continue
+		}
+		if rest == "(" {
+			inBlock = true
+			blockVerb = verb
+			continue
+		}
+		if err := checkEntry(rest, lineNo); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // hasIgnoreDirective reports whether data — a go.mod file's raw body —

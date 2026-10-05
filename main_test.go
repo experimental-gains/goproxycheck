@@ -896,6 +896,102 @@ func TestModuleFromGoMod_RequireExcludeArgCountNotOverTriggered(t *testing.T) {
 	}
 }
 
+// TestModuleFromGoMod_DuplicateRequireDifferentVersions is a regression
+// test for a real bug: moduleFromGoMod had no detection at all for two
+// `require` directives naming the same module path at two different
+// versions — unlike the module/go/toolchain singleton directives (each
+// already Fataled on a repeat), `require` isn't a modfile.Parse-time
+// lexer error at all, so this slipped past every existing check in the
+// dispatch chain.
+//
+// Live-verified (2026-10-05, go1.26.8, GOPROXY=off, using local `replace`
+// targets so neither the proxy nor real network modules are involved): a
+// go.mod with `require example.com/dep v1.0.0` and `require
+// example.com/dep v1.1.0` — a realistic merge-conflict mistake, both lines
+// kept instead of one replacing the other — Fatals `go build`/`go list -m
+// all`/`go vet` immediately and entirely offline with `go: updates to
+// go.mod needed; to update it: go mod tidy`, confirmed identically whether
+// or not the duplicated module is ever imported, and for a hallucinated
+// module path that has never existed on any proxy (the build list is
+// checked before a single network request is made). Confirmed identically
+// for the same two lines written inside a `require (...)` block. Before
+// this fix, moduleFromGoMod extracted the module path normally and probed
+// the live proxy as if the file were ordinary — reporting a plain
+// statusReady ("a plain `go install` will work") for a go.mod that can
+// never build at all.
+func TestModuleFromGoMod_DuplicateRequireDifferentVersions(t *testing.T) {
+	for name, content := range map[string]string{
+		"single-line, different versions": "module example.com/foo\n\ngo 1.21\n\n" +
+			"require example.com/dep v1.0.0\nrequire example.com/dep v1.1.0\n",
+		"block form, different versions": "module example.com/foo\n\ngo 1.21\n\n" +
+			"require (\n\texample.com/dep v1.0.0\n\texample.com/dep v1.1.0\n)\n",
+		"one single-line, one block entry": "module example.com/foo\n\ngo 1.21\n\n" +
+			"require example.com/dep v1.0.0\n\nrequire (\n\texample.com/dep v1.1.0\n)\n",
+		"three lines, last disagrees": "module example.com/foo\n\ngo 1.21\n\n" +
+			"require example.com/dep v1.0.0\nrequire example.com/other v2.0.0\nrequire example.com/dep v1.1.0\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "go.mod")
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := moduleFromGoMod(path)
+			if err == nil {
+				t.Fatalf("expected an error for two 'require' directives disagreeing on version, got module %q", got)
+			}
+			if !strings.Contains(err.Error(), "go mod tidy") {
+				t.Errorf("error %q doesn't cite real go's own `go: updates to go.mod needed; to update it: go mod tidy` Fatal", err)
+			}
+			if !strings.Contains(err.Error(), "example.com/dep") {
+				t.Errorf("error %q doesn't name the conflicting module", err)
+			}
+		})
+	}
+}
+
+// TestModuleFromGoMod_DuplicateRequireNotOverTriggered confirms the above
+// fix stays narrowly scoped: two `require` lines for the same module at
+// the IDENTICAL version string (a plain, harmless repeat — live-verified
+// real go builds, vets, and `go list -m all`s this shape with zero
+// complaint, silently treating the repeat as a no-op), two `require` lines
+// for two different modules, and two `exclude` lines for the same module
+// (same or different versions — unlike `require`, which pins a single
+// desired version cmd/go must reconcile, `exclude` is a pure set of banned
+// versions with no possible internal conflict, live-verified to never
+// Fatal either way) must all still resolve normally.
+func TestModuleFromGoMod_DuplicateRequireNotOverTriggered(t *testing.T) {
+	for name, content := range map[string]string{
+		"identical duplicate require, single-line": "module example.com/foo\n\ngo 1.21\n\n" +
+			"require example.com/dep v1.0.0\nrequire example.com/dep v1.0.0\n",
+		"identical duplicate require, block form": "module example.com/foo\n\ngo 1.21\n\n" +
+			"require (\n\texample.com/dep v1.0.0\n\texample.com/dep v1.0.0\n)\n",
+		"two different modules, no overlap": "module example.com/foo\n\ngo 1.21\n\n" +
+			"require example.com/dep v1.0.0\nrequire example.com/other v2.0.0\n",
+		"duplicate exclude, different versions": "module example.com/foo\n\ngo 1.21\n\n" +
+			"exclude example.com/dep v1.0.0\nexclude example.com/dep v1.1.0\n",
+		"duplicate exclude, identical version": "module example.com/foo\n\ngo 1.21\n\n" +
+			"exclude example.com/dep v1.0.0\nexclude example.com/dep v1.0.0\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "go.mod")
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := moduleFromGoMod(path)
+			if err != nil {
+				t.Fatalf("unexpected error for a go.mod that real go accepts without complaint: %v", err)
+			}
+			if want := "example.com/foo"; got != want {
+				t.Errorf("got %q, want %q", got, want)
+			}
+		})
+	}
+}
+
 // TestModuleFromGoMod_ReplaceArgCount is a regression test for a real bug
 // (testing-practice technique #201): moduleFromGoMod had no model at all of
 // `replace`'s own argument grammar — real golang.org/x/mod/modfile's
