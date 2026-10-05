@@ -316,6 +316,22 @@ actually seeing:
   as a distinct `go-mod-unparseable` diagnosis (not `ready`) instead of
   missing the one signal that proves a plain `go install` can never work
   here no matter how long `--wait` polls.
+- `download goX.Y.Z for linux/amd64: toolchain not available` / `go.mod
+  requires go >= X.Y.Z (running go A.B.C; GOTOOLCHAIN=...)` — not a
+  proxy-availability problem at all: in no-argument mode, YOUR OWN go.mod's
+  `go` directive requires a toolchain that can't actually be resolved here
+  — either `GOTOOLCHAIN=auto`'s download couldn't be completed (no
+  network, `GOPROXY` can't serve `golang.org/toolchain`, or the version
+  simply isn't a real release) or `GOTOOLCHAIN` is restricted
+  (`local`/`path`) and the toolchain actually running is older than your
+  go.mod demands. Real `go list -m`/`go build`/`go install` resolves which
+  toolchain will even run as its very first step, before parsing a single
+  go.mod directive — so this Fatals entirely offline, before the
+  dependency `goproxycheck` would otherwise go probe against the proxy is
+  ever reached. Confirmed live (2026-10-05) this previously produced a
+  false `ready — a plain go install will work` for a directory where the
+  real `go install` never gets that far. `goproxycheck` checks this ahead
+  of probing anything and reports it as a local config issue instead.
 
 ## Install
 

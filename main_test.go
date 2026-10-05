@@ -1250,6 +1250,138 @@ func TestLeadingInt(t *testing.T) {
 	}
 }
 
+// --- goDirectiveUnsatisfiableError: can the go.mod's own `go` directive
+// even be satisfied by what's locally resolvable, independent of whether
+// ignore/tool/godebug are used at all ---
+//
+// Regression tests for a real bug: real cmd/go resolves which toolchain
+// will run a module-aware command (GOTOOLCHAIN, default "auto") as its
+// very first step, before parsing a single go.mod directive. A go.mod
+// whose own `go` line can't be satisfied here Fatals immediately and
+// entirely offline, for a reason that has nothing to do with
+// ignore/tool/godebug — but moduleFromGoMod's no-argument-mode callers had
+// no general-purpose check for this at all pre-fix, only the
+// directive-specific ignoreDirectiveTooOldError/toolDirectiveTooOldError/
+// godebugDirectiveTooOldError family below, none of which fire for a plain
+// go.mod with no such directive. Live-verified (2026-10-05): a go.mod
+// reading only `module golang.org/x/mod` / `go 1.99.0` (no
+// ignore/tool/godebug anywhere) makes real `go list -m`/`go build` Fatal
+// identically under both GOPROXY=off and the real default GOPROXY with
+// `go: download go1.99.0 for linux/amd64: toolchain not available`, and
+// under GOTOOLCHAIN=local with `go: go.mod requires go >= 1.99.0 (running
+// go 1.24.4; GOTOOLCHAIN=local)` — while pre-fix goproxycheck sailed past
+// both and reported `golang.org/x/mod@<tag> is live on both
+// proxy.golang.org and sum.golang.org — a plain go install will work` for
+// a directory where the user's own `go install` never even reaches that
+// module.
+
+// TestGoDirectiveUnsatisfiableError_NoGoDirective confirms a go.mod with no
+// `go` directive at all is never flagged — this check has nothing to say
+// about a file it doesn't apply to.
+func TestGoDirectiveUnsatisfiableError_NoGoDirective(t *testing.T) {
+	if err := goDirectiveUnsatisfiableError("module example.com/foo\n", "go1.24.4", "auto"); err != nil {
+		t.Errorf("unexpected error for a go.mod with no 'go' directive: %v", err)
+	}
+}
+
+// TestGoDirectiveUnsatisfiableError_LocalVersionSatisfies confirms the
+// ordinary case — the go.mod's own declared `go` version is at or below
+// what's locally selected — is never flagged.
+func TestGoDirectiveUnsatisfiableError_LocalVersionSatisfies(t *testing.T) {
+	if err := goDirectiveUnsatisfiableError("module example.com/foo\n\ngo 1.21\n", "go1.24.4", "auto"); err != nil {
+		t.Errorf("unexpected error when the locally selected toolchain (go1.24.4) already satisfies the declared go1.21: %v", err)
+	}
+}
+
+// TestGoDirectiveUnsatisfiableError_UnresolvableLocalVersion is a
+// regression test for the "GOTOOLCHAIN=auto couldn't obtain a toolchain new
+// enough" shape: an empty localVersion means `go env GOVERSION` itself
+// Fataled, which only happens when the go.mod's own `go` directive demands
+// a toolchain auto-switching couldn't resolve (no network, GOPROXY can't
+// serve golang.org/toolchain, or the version isn't real at all) — live-
+// verified (2026-10-05, go1.24.4) with a go.mod declaring `go 1.99.0`.
+func TestGoDirectiveUnsatisfiableError_UnresolvableLocalVersion(t *testing.T) {
+	err := goDirectiveUnsatisfiableError("module golang.org/x/mod\n\ngo 1.99.0\n", "", "auto")
+	if err == nil {
+		t.Fatal("expected an error when the go.mod's own `go` directive couldn't be resolved locally, got none")
+	}
+	if !strings.Contains(err.Error(), "toolchain not available") {
+		t.Errorf("error %q doesn't cite real go's own `toolchain not available` Fatal", err)
+	}
+}
+
+// TestGoDirectiveUnsatisfiableError_LocalVersionTooOld is a regression test
+// for the "GOTOOLCHAIN restricted (local/path), running toolchain too old"
+// shape: `go env GOVERSION` succeeds (no network attempted at all), but
+// reports a version strictly older than the go.mod's own declared minimum.
+// Live-verified (2026-10-05, GOTOOLCHAIN=local) real go Fatals with
+// `go.mod requires go >= 1.99.0 (running go 1.24.4; GOTOOLCHAIN=local)`.
+func TestGoDirectiveUnsatisfiableError_LocalVersionTooOld(t *testing.T) {
+	err := goDirectiveUnsatisfiableError("module golang.org/x/mod\n\ngo 1.99.0\n", "go1.24.4", "local")
+	if err == nil {
+		t.Fatal("expected an error when the locally selected toolchain is older than the go.mod's own declared minimum, got none")
+	}
+	if !strings.Contains(err.Error(), "go.mod requires go >= 1.99.0 (running go 1.24.4; GOTOOLCHAIN=local)") {
+		t.Errorf("error %q doesn't cite real go's own `go.mod requires go >= ...` Fatal verbatim", err)
+	}
+}
+
+// TestModuleFromGoMod_GoDirectiveUnresolvableToolchain is the
+// moduleFromGoMod-level counterpart of
+// TestGoDirectiveUnsatisfiableError_UnresolvableLocalVersion, confirming
+// the check is wired into the real no-argument CLI entry point. GOPROXY is
+// pinned to "off" so the real toolchain-switch attempt Fatals fast and
+// deterministically without depending on network access in this test run
+// (confirmed live that GOPROXY=off produces the identical `toolchain not
+// available` Fatal as a real, reachable GOPROXY would for an unreal
+// version like go1.99.0).
+func TestModuleFromGoMod_GoDirectiveUnresolvableToolchain(t *testing.T) {
+	t.Setenv("GOPROXY", "off")
+	dir := t.TempDir()
+	t.Chdir(dir)
+	path := filepath.Join(dir, "go.mod")
+	content := "module golang.org/x/mod\n\ngo 1.99.0\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := moduleFromGoMod(path)
+	if err == nil {
+		t.Fatalf("expected an error for a go.mod whose own `go` directive can't be resolved locally, got module %q", got)
+	}
+	if !strings.Contains(err.Error(), "toolchain not available") {
+		t.Errorf("error %q doesn't cite real go's own `toolchain not available` Fatal", err)
+	}
+}
+
+// TestModuleFromGoMod_GoDirectiveTooNewForRestrictedToolchain is the
+// moduleFromGoMod-level counterpart of
+// TestGoDirectiveUnsatisfiableError_LocalVersionTooOld, confirming the
+// "GOTOOLCHAIN restricted, running toolchain too old" shape is also wired
+// into the real entry point, with GOTOOLCHAIN=local pinned so this runs
+// fully offline (no toolchain-switch attempt at all).
+func TestModuleFromGoMod_GoDirectiveTooNewForRestrictedToolchain(t *testing.T) {
+	if systemPath := systemGoDir(t); systemPath != "" {
+		t.Setenv("PATH", systemPath+string(os.PathListSeparator)+os.Getenv("PATH"))
+	}
+	t.Setenv("GOTOOLCHAIN", "local")
+	dir := t.TempDir()
+	t.Chdir(dir)
+	path := filepath.Join(dir, "go.mod")
+	content := "module golang.org/x/mod\n\ngo 1.99.0\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := moduleFromGoMod(path)
+	if err == nil {
+		t.Fatalf("expected an error for a go.mod requiring a newer go than GOTOOLCHAIN=local allows, got module %q", got)
+	}
+	if !strings.Contains(err.Error(), "go.mod requires go >=") {
+		t.Errorf("error %q doesn't cite real go's own `go.mod requires go >= ...` Fatal", err)
+	}
+}
+
 // TestIgnoreDirectiveTooOldError_PrereleaseLocalToolchainSatisfies is a
 // regression test for the same real bug as TestGoVersionAtLeast's
 // "go1.25rc1"-shaped cases, exercised through ignoreDirectiveTooOldError

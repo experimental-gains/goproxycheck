@@ -1005,6 +1005,17 @@ func moduleFromGoMod(path string) (string, error) {
 		// whitespace/comments).
 		return "", fmt.Errorf("%s %s, entirely offline, before ever contacting the proxy, so this could never resolve regardless of the repo or proxy config", path, lineErr)
 	}
+	if lineErr := goDirectiveUnsatisfiableError(string(data), localGoVersion(), localGoToolchain()); lineErr != nil {
+		// Checked ahead of ignoreDirectiveTooOldError/toolDirectiveTooOldError/
+		// godebugDirectiveTooOldError just below: see
+		// goDirectiveUnsatisfiableError's doc comment for the live
+		// confirmation that real cmd/go resolves which toolchain will even
+		// run this file (GOTOOLCHAIN) before it ever gets to recognizing a
+		// single go.mod directive — so a go.mod whose own `go` line can't be
+		// satisfied locally Fatals for a reason that has nothing to do with
+		// whether it happens to use ignore/tool/godebug at all.
+		return "", fmt.Errorf("%s %s, entirely offline, before ever contacting the proxy, so this could never resolve regardless of the repo or proxy config", path, lineErr)
+	}
 	if lineErr := ignoreDirectiveTooOldError(string(data), localGoVersion()); lineErr != nil {
 		// Checked ahead of ignoreDirectiveArgCountError just below: see
 		// ignoreDirectiveTooOldError's doc comment for the live confirmation
@@ -1189,20 +1200,37 @@ func goDirectiveVersion(data string) string {
 // "this could never resolve" verdict from goproxycheck's own no-argument
 // CLI mode for a go.mod the real `go` command handles correctly right now.
 func goVersionAtLeast(version string, major, minor int) bool {
-	version = strings.TrimPrefix(strings.TrimSpace(version), "go")
-	parts := strings.SplitN(version, ".", 3)
-	if len(parts) < 2 {
-		return false
-	}
-	vMajor, ok1 := leadingInt(parts[0])
-	vMinor, ok2 := leadingInt(parts[1])
-	if !ok1 || !ok2 {
+	vMajor, vMinor, ok := parseGoVersionMajorMinor(version)
+	if !ok {
 		return false
 	}
 	if vMajor != major {
 		return vMajor > major
 	}
 	return vMinor >= minor
+}
+
+// parseGoVersionMajorMinor extracts the major and minor components from a
+// go version string, factored out of goVersionAtLeast (see its doc comment
+// for the accepted shapes — with or without a leading "go" prefix, and a
+// prerelease suffix glued directly onto the minor number with no
+// separating dot) so goDirectiveUnsatisfiableError can compare a go.mod's
+// own declared `go` directive version against the locally selected
+// toolchain at the SAME major/minor granularity, instead of every existing
+// caller hardcoding one side of the comparison as a literal major/minor
+// pair. ok is false for an empty or unparsable version.
+func parseGoVersionMajorMinor(version string) (major, minor int, ok bool) {
+	version = strings.TrimPrefix(strings.TrimSpace(version), "go")
+	parts := strings.SplitN(version, ".", 3)
+	if len(parts) < 2 {
+		return 0, 0, false
+	}
+	major, ok1 := leadingInt(parts[0])
+	minor, ok2 := leadingInt(parts[1])
+	if !ok1 || !ok2 {
+		return 0, 0, false
+	}
+	return major, minor, true
 }
 
 // leadingInt parses the longest leading run of ASCII digits in s as an
@@ -1242,6 +1270,103 @@ func localGoVersion() string {
 		return ""
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// localGoToolchain returns the value `go env GOTOOLCHAIN` reports (e.g.
+// "auto", "local", "path", or an explicit "go1.21.0"-style pin), or "auto"
+// — the real documented default (`go help goflags`/`go env -h`) — if the
+// command fails for any reason, matching the fail-toward-the-common-case
+// convention the rest of this file uses for an unresolvable go-env fact.
+// Used only by goDirectiveUnsatisfiableError, purely so its error message
+// can name the actual restriction in effect instead of a generic "local"/
+// "path" guess.
+func localGoToolchain() string {
+	out, err := exec.Command("go", "env", "GOTOOLCHAIN").Output()
+	if err != nil {
+		return "auto"
+	}
+	if v := strings.TrimSpace(string(out)); v != "" {
+		return v
+	}
+	return "auto"
+}
+
+// goDirectiveUnsatisfiableError reports an error if data's own `go`
+// directive can't actually be satisfied by what's locally resolvable in
+// this directory — a strictly more fundamental gate than
+// ignoreDirectiveTooOldError/toolDirectiveTooOldError/
+// godebugDirectiveTooOldError below, which only ask "is the toolchain that
+// ends up running this file new enough to recognize THIS ONE directive
+// verb." Real cmd/go resolves which toolchain will run a module-aware
+// command (GOTOOLCHAIN, default "auto") as its very first step, before
+// parsing a single go.mod directive — so a go.mod whose own `go` line
+// requires a version that can't actually be resolved here Fatals
+// immediately and entirely offline, regardless of whether the file uses
+// ignore/tool/godebug at all.
+//
+// Two distinct real-go failure shapes collapse into this one check,
+// because localVersion (localGoVersion's live result, taken as a
+// parameter for the same testability reason as every other check in this
+// file) already reflects which one happened:
+//
+//  1. GOTOOLCHAIN=auto (the default) tries to download a toolchain new
+//     enough and can't — no network, GOPROXY can't serve
+//     golang.org/toolchain (confirmed live, 2026-10-05: the exact same
+//     generic message fires under GOPROXY=off AND under a perfectly
+//     healthy, reachable default GOPROXY when the declared version simply
+//     hasn't been downloaded/cached yet), or the declared version isn't a
+//     real release at all. `go env GOVERSION` itself Fatals in this case:
+//     a go.mod reading only `module golang.org/x/mod` / `go 1.99.0` (no
+//     ignore/tool/godebug directive anywhere) makes `go env
+//     GOVERSION`/`go list -m`/`go build` all Fatal identically and
+//     entirely offline with `go: download go1.99.0 for linux/amd64:
+//     toolchain not available` — confirmed identical for a real, merely
+//     not-yet-locally-cached release (go1.25.0) under GOPROXY=off, not
+//     just a nonexistent version. localGoVersion() returns "" here, same
+//     fail-open-eligible convention as every other go-env-derived fact in
+//     this file.
+//  2. GOTOOLCHAIN is restricted (e.g. "local"/"path" — a realistic CI
+//     pinned-toolchain setup) so no download is attempted at all: `go env
+//     GOVERSION` succeeds and reports the actual running toolchain, but
+//     that version is older than the go.mod's own declared minimum. Real
+//     `go list -m`/`go build` Fatals with `go.mod requires go >= 1.99.0
+//     (running go 1.24.4; GOTOOLCHAIN=local)` — confirmed live
+//     (GOTOOLCHAIN=local, 2026-10-05) — even though `go env GOVERSION`
+//     itself exits clean in this mode.
+//
+// Before this check, moduleFromGoMod's no-argument-mode callers (the
+// shipped GitHub Action's default invocation) had no general-purpose
+// awareness of this at all: a go.mod with an unresolvable `go` directive
+// version sailed straight past every local check here and into a live
+// network probe of a completely unrelated module (the dependency the
+// no-argument invocation derives from this very go.mod), which can come
+// back a confident "ready — a plain `go install` will work" even though
+// the user's real `go install` in that exact directory Fatals immediately
+// on their own go.mod, before ever reaching the dependency this tool
+// diagnosed. Live-verified end-to-end, this exact false-positive shape
+// pre-fix: a scratch repo with go.mod reading `module golang.org/x/mod` /
+// `go 1.99.0` (no ignore/tool/godebug) reported `golang.org/x/mod@<tag> is
+// live on both proxy.golang.org and sum.golang.org — a plain go install
+// will work`, both under GOPROXY=off and under the real default GOPROXY —
+// while real `go list -m`/`go build` in that identical directory Fataled
+// offline on the toolchain switch alone, never reaching golang.org/x/mod
+// at all.
+func goDirectiveUnsatisfiableError(data, localVersion, localToolchain string) error {
+	declared := goDirectiveVersion(data)
+	if declared == "" {
+		return nil // no `go` directive at all: nothing to gate on
+	}
+	declaredMajor, declaredMinor, ok := parseGoVersionMajorMinor(declared)
+	if !ok {
+		return nil // unparsable `go` directive: a different check's job, not this one's
+	}
+	if localVersion == "" {
+		return fmt.Errorf("declares `go %s`, but the toolchain needed to satisfy that couldn't be resolved here (no network, GOPROXY can't serve golang.org/toolchain, or %s isn't a real release at all) — real `go list -m`/`go build`/`go install` Fatals immediately with `download go%s ...: toolchain not available`", declared, declared, declared)
+	}
+	if !goVersionAtLeast(localVersion, declaredMajor, declaredMinor) {
+		return fmt.Errorf("declares `go %s`, but the toolchain actually selected here is %s (GOTOOLCHAIN=%s, which doesn't auto-switch) — real `go list -m`/`go build`/`go install` Fatals immediately with `go.mod requires go >= %s (running go %s; GOTOOLCHAIN=%s)`", declared, localVersion, localToolchain, declared, strings.TrimPrefix(localVersion, "go"), localToolchain)
+	}
+	return nil
 }
 
 // ignoreDirectiveTooOldError reports an error if data's go.mod contains a
