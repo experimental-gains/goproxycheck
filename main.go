@@ -1005,6 +1005,23 @@ func moduleFromGoMod(path string) (string, error) {
 		// whitespace/comments).
 		return "", fmt.Errorf("%s %s, entirely offline, before ever contacting the proxy, so this could never resolve regardless of the repo or proxy config", path, lineErr)
 	}
+	if lineErr := goDirectiveRepeatedError(string(data)); lineErr != nil {
+		// See goDirectiveRepeatedError's doc comment for the live
+		// confirmation that a go.mod with more than one top-level `go`
+		// directive Fatals real `go list -m`/`go build` immediately and
+		// entirely offline -- at parse time, before the toolchain-
+		// satisfiability check just below (goDirectiveUnsatisfiableError)
+		// ever runs, confirmed live by the fact that even GOTOOLCHAIN=auto
+		// never attempts a network fetch for an unsatisfiable second `go`
+		// version in this shape.
+		return "", fmt.Errorf("%s %s, entirely offline, before ever contacting the proxy, so this could never resolve regardless of the repo or proxy config", path, lineErr)
+	}
+	if lineErr := toolchainDirectiveRepeatedError(string(data)); lineErr != nil {
+		// Same parse-time-repeated-statement family as the `go` check just
+		// above, for `toolchain` -- see toolchainDirectiveRepeatedError's
+		// doc comment for the live confirmation.
+		return "", fmt.Errorf("%s %s, entirely offline, before ever contacting the proxy, so this could never resolve regardless of the repo or proxy config", path, lineErr)
+	}
 	if lineErr := goDirectiveUnsatisfiableError(string(data), localGoVersion(), localGoToolchain()); lineErr != nil {
 		// Checked ahead of ignoreDirectiveTooOldError/toolDirectiveTooOldError/
 		// godebugDirectiveTooOldError just below: see
@@ -1166,6 +1183,86 @@ func goDirectiveVersion(data string) string {
 		}
 	}
 	return ""
+}
+
+// goDirectiveRepeatedError reports whether data — a go.mod file's raw body
+// — contains more than one top-level `go` directive line. Unlike `module`,
+// the `go` directive is never written in parenthesized block form
+// (confirmed in goDirectiveVersion's own doc comment), so this only needs
+// to track single-line occurrences, mirroring the matching logic
+// goDirectiveVersion itself already uses to find the first one.
+//
+// Confirmed live (2026-10-05, go1.24.4): a go.mod with two top-level `go`
+// lines (e.g. "go 1.21" followed later by "go 1.22") Fatals real `go
+// list -m`/`go build` immediately and entirely offline with `repeated go
+// statement` — and this fires at pure parse time, before any
+// toolchain-satisfiability logic: even a second `go` line naming a version
+// newer than any locally installed toolchain (e.g. "go 1.99") under
+// `GOTOOLCHAIN=auto` (which would otherwise attempt a network fetch for an
+// unsatisfiable requirement) still Fatals with the same offline parse
+// error and never attempts a fetch — proving the repeated-statement check
+// runs ahead of goDirectiveUnsatisfiableError just below it in
+// moduleFromGoMod's dispatch chain, the same ordering already established
+// for the block-comment check outranking everything but a leading BOM.
+//
+// Before this fix, moduleFromGoMod had no notion of this at all, despite
+// already detecting the exact same shape for a repeated `module`
+// directive (moduleDirective's own check, whose doc comment explicitly
+// but — as of the `go`-directive-satisfiability checks added since —
+// incorrectly asserted "a repeated 'go' or 'toolchain' directive already
+// Fatals this way (not goproxycheck's concern, it never parses those
+// directives itself)"; goDirectiveVersion now does parse the `go`
+// directive's content, for goDirectiveUnsatisfiableError/
+// ignoreDirectiveTooOldError/toolDirectiveTooOldError/
+// godebugDirectiveTooOldError, but always returns only the FIRST `go`
+// line found, silently ignoring a second, conflicting one. Without this
+// check, a go.mod with a repeated `go` directive sailed through
+// moduleFromGoMod's no-argument CLI mode and got probed against the real
+// proxy as if it were an ordinary, parseable file, instead of surfacing
+// the accurate, `go`-shaped answer that the real toolchain would Fatal
+// immediately, before ever resolving anything or contacting a proxy.
+func goDirectiveRepeatedError(data string) error {
+	found := ""
+	for _, raw := range strings.Split(data, "\n") {
+		line := strings.TrimSpace(raw)
+		rest, ok := strings.CutPrefix(line, "go")
+		if !ok || !(rest == "" || rest[0] == ' ' || rest[0] == '\t') {
+			continue
+		}
+		if found != "" {
+			return fmt.Errorf("has more than one 'go' directive (%q and %q) — real `go list -m`/`go build` Fatals immediately with `repeated go statement`", found, line)
+		}
+		found = line
+	}
+	return nil
+}
+
+// toolchainDirectiveRepeatedError is goDirectiveRepeatedError's exact
+// sibling for the `toolchain` directive — also never written in block
+// form, also only ever Fatal-checked as "known verb" by
+// goModUnknownDirectiveError's fixed verb set, never for its own
+// repeated-statement shape before this fix.
+//
+// Confirmed live (2026-10-05, go1.24.4): a go.mod with two top-level
+// `toolchain` lines (e.g. "toolchain go1.22.0" followed later by
+// "toolchain go1.23.0") Fatals real `go list -m`/`go build` immediately
+// and entirely offline with `repeated toolchain statement`, with the same
+// parse-time priority as the `go` case above (confirmed to preempt an
+// unrelated unknown-directive error elsewhere in the same file).
+func toolchainDirectiveRepeatedError(data string) error {
+	found := ""
+	for _, raw := range strings.Split(data, "\n") {
+		line := strings.TrimSpace(raw)
+		rest, ok := strings.CutPrefix(line, "toolchain")
+		if !ok || !(rest == "" || rest[0] == ' ' || rest[0] == '\t') {
+			continue
+		}
+		if found != "" {
+			return fmt.Errorf("has more than one 'toolchain' directive (%q and %q) — real `go list -m`/`go build` Fatals immediately with `repeated toolchain statement`", found, line)
+		}
+		found = line
+	}
+	return nil
 }
 
 // goVersionAtLeast reports whether a go version string (e.g. "1.26.8",
@@ -2533,10 +2630,12 @@ func retractArgCountError(content string, lineNo int) error {
 // path lines inside a single block — as "repeated module statement",
 // mirroring go/toolchain/module directive repeated-more-than-once being a
 // Fatal in sibling tool goprivaudit, confirmed to have the exact same shape
-// here: a repeated 'go' or 'toolchain' directive already Fatals this way
-// (not goproxycheck's concern, it never parses those directives itself),
-// and live testing (2026-10-01, go1.24.4) against a real go.mod shows a
-// repeated 'module' directive Fatals identically —
+// here: a repeated 'go' or 'toolchain' directive also Fatals this way (see
+// goDirectiveRepeatedError/toolchainDirectiveRepeatedError, their own
+// dedicated checks — NOT handled by this function, since `go`/`toolchain`
+// are never written in block form the way `module` can be), and live
+// testing (2026-10-01, go1.24.4) against a real go.mod shows a repeated
+// 'module' directive Fatals identically —
 //
 //	go: errors parsing go.mod:
 //	go.mod:3: repeated module statement

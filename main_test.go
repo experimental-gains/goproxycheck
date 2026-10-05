@@ -385,6 +385,66 @@ func TestModuleFromGoMod_RepeatedModuleDirective(t *testing.T) {
 	}
 }
 
+// TestModuleFromGoMod_RepeatedGoDirective is a regression test for a real
+// bug: moduleFromGoMod detected a repeated 'module' directive (see
+// TestModuleFromGoMod_RepeatedModuleDirective above) but had no equivalent
+// check for a repeated 'go' directive, even though real go Fatals on both
+// identically. Confirmed live (2026-10-05, go1.24.4): a go.mod with two
+// top-level `go` lines Fatals `go list -m`/`go build` immediately and
+// entirely offline with "go.mod:N: repeated go statement" — and this fires
+// at parse time, ahead of any toolchain-satisfiability logic: even a second
+// `go` line naming an unsatisfiable version (e.g. "go 1.99") under
+// GOTOOLCHAIN=auto, which would otherwise attempt a network fetch, still
+// Fatals with the same offline parse error and never attempts a fetch.
+// Before this fix, moduleDirective's own doc comment even asserted this was
+// "not goproxycheck's concern" since it allegedly never parsed `go`/
+// `toolchain` directives — a claim later invalidated by goDirectiveVersion
+// (added for goDirectiveUnsatisfiableError/ignoreDirectiveTooOldError/etc.),
+// which silently returns only the FIRST `go` line, ignoring a conflicting
+// second one; a go.mod this broken sailed straight through to probe() and
+// got a generic module-unknown-style verdict instead of the accurate,
+// `go`-shaped answer that it could never resolve regardless of repo or
+// proxy config.
+func TestModuleFromGoMod_RepeatedGoDirective(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "go.mod")
+	content := "module example.com/foo\n\ngo 1.21\n\ngo 1.22\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := moduleFromGoMod(path)
+	if err == nil {
+		t.Fatal("expected an error for a go.mod with more than one 'go' directive, got none")
+	}
+	if !strings.Contains(err.Error(), "repeated go statement") {
+		t.Errorf("error %q doesn't describe this as a repeated go statement", err)
+	}
+}
+
+// TestModuleFromGoMod_RepeatedToolchainDirective is
+// TestModuleFromGoMod_RepeatedGoDirective's exact sibling for the
+// 'toolchain' directive. Confirmed live (2026-10-05, go1.24.4): a go.mod
+// with two top-level `toolchain` lines Fatals `go list -m`/`go build`
+// immediately and entirely offline with "go.mod:N: repeated toolchain
+// statement".
+func TestModuleFromGoMod_RepeatedToolchainDirective(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "go.mod")
+	content := "module example.com/foo\n\ngo 1.21\n\ntoolchain go1.22.0\n\ntoolchain go1.23.0\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := moduleFromGoMod(path)
+	if err == nil {
+		t.Fatal("expected an error for a go.mod with more than one 'toolchain' directive, got none")
+	}
+	if !strings.Contains(err.Error(), "repeated toolchain statement") {
+		t.Errorf("error %q doesn't describe this as a repeated toolchain statement", err)
+	}
+}
+
 func TestModuleFromGoMod_Missing(t *testing.T) {
 	if _, err := moduleFromGoMod(filepath.Join(t.TempDir(), "go.mod")); err == nil {
 		t.Fatal("expected an error for a missing go.mod")
