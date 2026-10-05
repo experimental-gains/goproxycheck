@@ -3966,8 +3966,31 @@ func gitDescribeTag() (string, error) {
 	case 1:
 		return versionTags[0], nil
 	case 0:
+		// This fallback exists to treat a lone non-semver tag as a revision
+		// identifier (e.g. "nightly"), not just a version — real `go
+		// install module@<ref>` resolves plenty of non-version git refs
+		// fine. But it must still respect gitTagPrefix() the same way the
+		// versionTags loop above already does: a tag with no relation to
+		// this module's own subdirectory (prefix == "" requires nothing;
+		// prefix != "" requires the tag to actually carry it) belongs to a
+		// different module in the same repo (the root module, or a
+		// sibling), not this one, and must not be silently adopted —
+		// exactly the same risk
+		// TestResolveTarget_NestedModuleSubdirTag_IgnoresForeignRootTag
+		// already covers for the multiple-tag case, just reachable here
+		// too when that foreign tag happens to be the *only* tag at HEAD.
+		// Confirmed live (pre-fix): a repo-root module tagged "v1.0.0" with
+		// no "gopls/"-prefixed tag at HEAD at all made this fallback report
+		// module golang.org/x/tools/gopls at version "v1.0.0" — a version
+		// that module was never actually tagged with.
 		if len(tags) == 1 {
-			return tags[0], nil
+			if prefix == "" {
+				return tags[0], nil
+			}
+			if rest, ok := strings.CutPrefix(tags[0], prefix); ok {
+				return rest, nil
+			}
+			return "", fmt.Errorf("no tag points at HEAD (HEAD may not be tagged — pass module@version explicitly)")
 		}
 		return "", fmt.Errorf("HEAD has more than one tag (%s) and it's ambiguous which one is the release version — pass module@version explicitly", strings.Join(tags, ", "))
 	default:

@@ -2370,6 +2370,95 @@ func TestResolveTarget_NestedModuleSubdirTag_IgnoresForeignRootTag(t *testing.T)
 	}
 }
 
+// TestResolveTarget_NestedModuleSubdirTag_SoleForeignRootTagRejected is a
+// regression test for a real bug in gitDescribeTag's single-tag fallback
+// (the `case 0: if len(tags) == 1 { return tags[0], nil }` branch meant to
+// treat a lone non-version tag as a revision identifier, e.g. "nightly"):
+// that fallback ran unconditionally, with no awareness of gitTagPrefix()
+// at all — unlike the len(versionTags) >= 1 branches right above it, which
+// already require a tag to carry *this* module's own subdirectory prefix
+// (see TestResolveTarget_NestedModuleSubdirTag_IgnoresForeignRootTag right
+// above). So when HEAD's *only* tag is a sibling module's bare, unprefixed
+// release tag (e.g. the repo-root module's "v1.0.0", with no
+// "gopls/"-prefixed tag at HEAD at all — a realistic shape: the root
+// module tagged a release on a commit the nested module hasn't tagged
+// yet), the fallback silently treated that foreign tag as this module's own
+// version instead of erroring out, exactly the "ambiguous root module" risk
+// the sibling test already covers for the multiple-tag case — just via a
+// different code path this fallback left open.
+//
+// Confirmed live (pre-fix) with the actual built binary in this exact
+// layout: `goproxycheck --json` inside gopls/ reported `"version":
+// "v1.0.0"` — golang.org/x/tools/gopls was never tagged v1.0.0 (its real
+// release in the companion test is "gopls/v0.23.0"), so a real `go install
+// golang.org/x/tools/gopls@v1.0.0` could never have matched what this tool
+// just checked.
+func TestResolveTarget_NestedModuleSubdirTag_SoleForeignRootTagRejected(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	run := func(name string, args ...string) {
+		t.Helper()
+		if out, err := exec.Command(name, args...).CombinedOutput(); err != nil {
+			t.Fatalf("%s %v: %v\n%s", name, args, err, out)
+		}
+	}
+	run("git", "init", "-q")
+	run("git", "config", "user.email", "test@example.com")
+	run("git", "config", "user.name", "test")
+	if err := os.MkdirAll(filepath.Join(dir, "gopls"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module golang.org/x/tools\n\ngo 1.21\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "gopls", "go.mod"), []byte("module golang.org/x/tools/gopls\n\ngo 1.21\n"), 0o644)
+	run("git", "add", "go.mod", "gopls/go.mod")
+	run("git", "commit", "-q", "-m", "init")
+	run("git", "tag", "v1.0.0") // only the repo-root module's own tag — nothing "gopls/"-prefixed at all
+
+	t.Chdir(filepath.Join(dir, "gopls"))
+	_, _, err := resolveTarget(nil)
+	if err == nil {
+		t.Fatal("expected an error — HEAD's only tag belongs to a different module in this repo, not this one")
+	}
+}
+
+// TestResolveTarget_NestedModuleSubdirTag_SoleNonVersionOwnTagStripsPrefix
+// covers the legitimate counterpart to the regression test right above:
+// gitDescribeTag's single-tag fallback should still treat a lone
+// non-semver tag as a revision identifier for *this* module (the original,
+// still-valid intent the fallback exists for at all) when that tag does
+// carry this module's own subdirectory prefix — just with the prefix
+// stripped first, the same way every version-shaped tag already is,
+// instead of returning the raw, still-prefixed string.
+func TestResolveTarget_NestedModuleSubdirTag_SoleNonVersionOwnTagStripsPrefix(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	run := func(name string, args ...string) {
+		t.Helper()
+		if out, err := exec.Command(name, args...).CombinedOutput(); err != nil {
+			t.Fatalf("%s %v: %v\n%s", name, args, err, out)
+		}
+	}
+	run("git", "init", "-q")
+	run("git", "config", "user.email", "test@example.com")
+	run("git", "config", "user.name", "test")
+	if err := os.MkdirAll(filepath.Join(dir, "gopls"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(dir, "gopls", "go.mod"), []byte("module golang.org/x/tools/gopls\n\ngo 1.21\n"), 0o644)
+	run("git", "add", "gopls/go.mod")
+	run("git", "commit", "-q", "-m", "init")
+	run("git", "tag", "gopls/nightly") // this module's own tag, but not version-shaped
+
+	t.Chdir(filepath.Join(dir, "gopls"))
+	module, version, err := resolveTarget(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if module != "golang.org/x/tools/gopls" || version != "nightly" {
+		t.Errorf("got (%q, %q), want (%q, %q) — should have stripped this module's own prefix from its non-version tag", module, version, "golang.org/x/tools/gopls", "nightly")
+	}
+}
+
 // TestLocalGoproxyOff covers localGoproxyOff's parsing of `go env GOPROXY`
 // output, including the comma/pipe list case: confirmed live against the
 // real `go` command that "off" only disables lookup when it's the *first*
